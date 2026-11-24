@@ -13,6 +13,7 @@ export interface GeneratedPreset {
 }
 
 export const MCP_CLIENT_PRESETS: McpPresetOption[] = [
+  { id: "acp-zed", label: "Zed / JetBrains (ACP Agent --acp)" },
   { id: "gemini-web", label: "Gemini Web (Remote OAuth / URL)" },
   { id: "stdio-cli", label: "Local CLI Stdio Bridge (Claude / Cursor / Antigravity)" },
   { id: "claude-desktop", label: "Claude Desktop (mcpServers HTTP)" },
@@ -31,6 +32,24 @@ export function generateClientPreset(
   const localBase = `http://127.0.0.1:${snap.server_port}`;
   const tunnelBase = snap.tunnel_url ? snap.tunnel_url.replace(/\/+$/, "") : null;
   const activeBase = usePublicTunnel && tunnelBase ? tunnelBase : localBase;
+
+  if (presetId === "acp-zed") {
+    const payload = {
+      agent_servers: {
+        Airlock: {
+          command: "D:\\tauri-mcp-hub\\src-tauri\\target\\release\\tauri-mcp-hub.exe",
+          args: ["--acp"],
+        },
+      },
+    };
+    return {
+      title: "Zed / JetBrains — Agent Client Protocol (--acp)",
+      filename: "~/.config/zed/settings.json / ACP Agent Config",
+      instructions:
+        "Sesuaikan path 'command' ke binary tauri-mcp-hub.exe Anda. Mode --acp menjalankan Airlock Local Agent langsung di IDE dengan streaming session/update dan bridge HITL session/request_permission.",
+      content: JSON.stringify(payload, null, 2),
+    };
+  }
 
   if (presetId === "stdio-cli") {
     const payload = {

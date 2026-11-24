@@ -37,13 +37,17 @@
           </div>
 
           <div class="workspace-capsule">
-            <span class="ws-root-label">ROOT</span>
+            <span id="workspace-alias-pill" class="ws-alias-pill">@workspace</span>
+            <span id="workspace-mounted-badge" class="ws-mounted-badge" hidden>+0</span>
             <label for="workspace-input" class="sr-only">Jailed Workspace Root</label>
             <input
               id="workspace-input"
               type="text"
               class="ws-input"
               placeholder="C:\path\to\project"
+              autocomplete="off"
+              autocorrect="off"
+              autocapitalize="none"
               spellcheck="false"
             />
             <span id="workspace-git-branch" class="git-branch-pill" hidden></span>
@@ -76,8 +80,8 @@
               class="icon-btn"
               aria-expanded="false"
               aria-controls="workspace-dropdown"
-              aria-label="Recent and pinned workspaces"
-              title="Recent & Pinned Workspaces"
+              aria-label="Multi-Workspace Manager"
+              title="Multi-Workspace Manager"
             >
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                 <polyline points="6 9 12 15 18 9"></polyline>
@@ -87,8 +91,8 @@
               id="btn-pick-workspace"
               type="button"
               class="icon-btn"
-              aria-label="Browse workspace folder"
-              title="Browse Folder"
+              aria-label="Browse default workspace folder"
+              title="Browse Default Folder"
             >
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
                 <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
@@ -185,7 +189,7 @@
                 <line x1="13.5" y1="7.5" x2="17.5" y2="16.5"></line>
               </svg>
               <span class="rail-label">Hub &amp; Tools</span>
-              <span id="rail-hub-count" class="rail-pill">14</span>
+              <span id="rail-hub-count" class="rail-pill">17</span>
             </button>
 
             <button
@@ -266,20 +270,34 @@
                 <h1 id="heading-agent" class="view-title" tabindex="-1">Local Agent</h1>
                 <p class="view-subtitle">Agentic loop SSE langsung di localhost dengan Smart Tools &amp; Token Guard aktif.</p>
               </div>
-              <button
-                id="btn-toggle-drawer"
-                type="button"
-                class="provider-pill-btn"
-                aria-expanded="false"
-                aria-controls="agent-drawer"
-              >
-                <span id="provider-pill-dot" class="live-dot warn" aria-hidden="true"></span>
-                <span id="provider-pill-label">Gemini · gemini-2.5-flash</span>
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-                  <circle cx="12" cy="12" r="3"></circle>
-                  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.85 1 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-                </svg>
-              </button>
+              <div class="btn-row">
+                <button id="btn-hooks-trust" type="button" class="btn btn-secondary btn-xs badge-warn" hidden>
+                  Hooks: Untrusted
+                </button>
+                <button
+                  id="btn-toggle-artifacts"
+                  type="button"
+                  class="btn btn-secondary btn-xs"
+                  aria-expanded="false"
+                >
+                  Artifacts
+                  <span id="artifacts-count-badge" class="badge badge-muted">0</span>
+                </button>
+                <button
+                  id="btn-toggle-drawer"
+                  type="button"
+                  class="provider-pill-btn"
+                  aria-expanded="false"
+                  aria-controls="agent-drawer"
+                >
+                  <span id="provider-pill-dot" class="live-dot warn" aria-hidden="true"></span>
+                  <span id="provider-pill-label">Gemini · gemini-2.5-flash</span>
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                    <circle cx="12" cy="12" r="3"></circle>
+                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.85 1 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                  </svg>
+                </button>
+              </div>
             </div>
 
             <div id="agent-shell" class="agent-shell">
@@ -298,9 +316,19 @@
                   </div>
                 </div>
 
+                <div id="agent-runs-strip" class="runs-strip" hidden aria-label="Active Agent Runs"></div>
+
                 <div id="chat-messages" class="chat-transcript" aria-live="polite">
                   <div class="chat-empty">
                     Konfigurasi provider AI melalui tombol config di kanan atas (disimpan aman dengan Windows DPAPI), lalu ketik tugas coding untuk workspace aktif.
+                  </div>
+                </div>
+
+                <div id="agent-checkpoint-banner" class="checkpoint-banner" role="status" aria-live="polite" hidden>
+                  <span id="checkpoint-banner-text" class="checkpoint-text"></span>
+                  <div class="btn-row">
+                    <button id="btn-resume-checkpoint" type="button" class="btn btn-primary btn-xs">Resume Turn</button>
+                    <button id="btn-discard-checkpoint" type="button" class="btn btn-secondary btn-xs">Discard</button>
                   </div>
                 </div>
 
@@ -343,7 +371,10 @@
                       id="attach-file-path"
                       type="text"
                       class="mono-input attach-input"
-                      placeholder="@file: src/main.rs"
+                      placeholder="@alias:src/main.rs atau src/main.rs"
+                      autocomplete="off"
+                      autocorrect="off"
+                      autocapitalize="none"
                       spellcheck="false"
                     />
                     <button id="btn-attach-file" type="button" class="btn btn-secondary btn-xs">+ @File</button>
@@ -352,14 +383,29 @@
                     <span class="mono-muted attach-hint">Tip: tempel gambar (Ctrl+V) · Ctrl+Enter kirim</span>
                   </div>
 
-                  <label for="chat-input" class="sr-only">Perintah untuk Local Agent</label>
-                  <textarea
-                    id="chat-input"
-                    rows="2"
-                    placeholder="Contoh: Periksa struktur proyek ini, cari fungsi yang menangani autentikasi, dan perbaiki bug validasi... (Ctrl+Enter untuk kirim)"
-                  ></textarea>
+                  <div class="composer-mode-row">
+                    <div class="mode-pill-group" role="group" aria-label="Execution Mode">
+                      <button id="btn-mode-direct" type="button" class="mode-pill-btn active" data-exec-mode="direct" aria-pressed="true">
+                        Direct
+                      </button>
+                      <button id="btn-mode-plan" type="button" class="mode-pill-btn" data-exec-mode="plan_first" aria-pressed="false">
+                        Plan First
+                      </button>
+                    </div>
+                    <span class="mono-muted mode-hint">Ketik <code class="md-inline-code">/</code> untuk slash workflows</span>
+                  </div>
+
+                  <div class="composer-input-wrap">
+                    <div id="slash-popover" class="slash-popover" role="listbox" aria-label="Slash Workflows" hidden></div>
+                    <label for="chat-input" class="sr-only">Perintah untuk Local Agent</label>
+                    <textarea
+                      id="chat-input"
+                      rows="2"
+                      placeholder="Contoh: /plan refactor autentikasi, atau ketik perintah coding... (Ctrl+Enter untuk kirim)"
+                    ></textarea>
+                  </div>
                   <div class="composer-actions">
-                    <span id="agent-run-status" class="mono-status">Ready</span>
+                    <span id="agent-run-status" class="mono-status" aria-live="off">Ready</span>
                     <div class="btn-row">
                       <button id="btn-stop-agent" type="button" class="btn btn-danger btn-xs" hidden>Stop</button>
                       <button id="btn-send-chat" type="submit" class="btn btn-primary">
@@ -373,6 +419,52 @@
                   </div>
                 </form>
               </div>
+
+              <!-- Split-Pane Review Panel: Session Artifacts & Concurrent Runs -->
+              <aside id="artifacts-panel" class="artifacts-panel" inert aria-label="Artifacts Review Panel">
+                <div class="artifacts-header">
+                  <div>
+                    <h2 class="card-heading">Artifacts &amp; Runs</h2>
+                    <p id="artifacts-session-label" class="mono-muted" style="font-size: 11px">Session: -</p>
+                  </div>
+                  <button id="btn-close-artifacts" type="button" class="btn btn-secondary btn-xs" aria-label="Tutup panel Artifacts">
+                    Close
+                  </button>
+                </div>
+
+                <div class="art-tablist" role="tablist" aria-label="Artifacts sections">
+                  <button id="tab-art-plan" type="button" role="tab" class="art-tab" aria-selected="true" tabindex="0" data-art-tab="plan">
+                    Plan
+                  </button>
+                  <button id="tab-art-tasks" type="button" role="tab" class="art-tab" aria-selected="false" tabindex="-1" data-art-tab="tasks">
+                    Tasks
+                  </button>
+                  <button id="tab-art-walkthrough" type="button" role="tab" class="art-tab" aria-selected="false" tabindex="-1" data-art-tab="walkthrough">
+                    Walkthrough
+                  </button>
+                  <button id="tab-art-runs" type="button" role="tab" class="art-tab" aria-selected="false" tabindex="-1" data-art-tab="runs">
+                    Runs
+                  </button>
+                </div>
+
+                <div class="artifacts-body">
+                  <section id="panel-art-plan" role="tabpanel" aria-labelledby="tab-art-plan" class="art-tabpanel"></section>
+                  <section id="panel-art-tasks" role="tabpanel" aria-labelledby="tab-art-tasks" class="art-tabpanel" hidden></section>
+                  <section id="panel-art-walkthrough" role="tabpanel" aria-labelledby="tab-art-walkthrough" class="art-tabpanel" hidden></section>
+                  <section id="panel-art-runs" role="tabpanel" aria-labelledby="tab-art-runs" class="art-tabpanel" hidden></section>
+                </div>
+
+                <div id="artifacts-footer" class="art-approval-bar" hidden>
+                  <div class="btn-row">
+                    <button id="btn-art-copy" type="button" class="btn btn-secondary btn-xs">Copy MD</button>
+                    <button id="btn-art-export" type="button" class="btn btn-secondary btn-xs">Export</button>
+                  </div>
+                  <div class="btn-row">
+                    <button id="btn-art-request-changes" type="button" class="btn btn-secondary btn-xs" hidden>Request Changes</button>
+                    <button id="btn-art-approve" type="button" class="btn btn-primary btn-xs" hidden>Approve &amp; Execute</button>
+                  </div>
+                </div>
+              </aside>
 
               <!-- Collapsible Right Drawer: Provider Config & Smart Tools -->
               <aside id="agent-drawer" class="agent-drawer" inert aria-label="Konfigurasi Agent dan Smart Tools">
@@ -458,26 +550,78 @@
                     </label>
                   </div>
 
+                  <div id="gemini-thinking-group" class="form-group">
+                    <label for="agent-thinking-select">Gemini Thinking Mode</label>
+                    <select id="agent-thinking-select" name="gemini_thinking_mode" class="mono-select">
+                      <option value="auto">auto (Adaptive / Dynamic)</option>
+                      <option value="off">off (Tercepat / Hemat)</option>
+                      <option value="low">low (Ringan)</option>
+                      <option value="medium">medium (Seimbang)</option>
+                      <option value="high">high (Mendalam)</option>
+                    </select>
+                  </div>
+
+                  <div class="agent-tuning-grid">
+                    <div class="form-group">
+                      <label for="agent-max-steps-input">Max Steps</label>
+                      <input
+                        id="agent-max-steps-input"
+                        name="agent_max_steps"
+                        type="number"
+                        min="4"
+                        max="30"
+                        value="16"
+                        class="mono-input"
+                      />
+                    </div>
+                    <div class="form-group">
+                      <label for="agent-turn-timeout-input">Turn Budget (s)</label>
+                      <input
+                        id="agent-turn-timeout-input"
+                        name="agent_turn_timeout_secs"
+                        type="number"
+                        min="30"
+                        max="600"
+                        value="180"
+                        class="mono-input"
+                      />
+                    </div>
+                  </div>
+
                   <button id="btn-save-agent" type="button" class="btn btn-primary" style="width: 100%">Save Config</button>
                 </div>
 
                 <div class="card">
-                  <h2 id="active-tools-heading" class="card-heading">Smart Tools Aktif (14)</h2>
+                  <h2 id="active-tools-heading" class="card-heading">Smart Tools Aktif (23)</h2>
                   <ul class="tool-list">
+                    <li><code>list_workspaces</code> <span>Mounted repos</span></li>
                     <li><code>project_overview</code> <span>Tree + Git status</span></li>
                     <li><code>smart_search</code> <span>Ripgrep + 2-line ctx</span></li>
-                    <li><code>read_file_range</code> <span>Batch / line slice</span></li>
+                    <li><code>read_file_range</code> <span>Cross-repo slice</span></li>
+                    <li><code>batch_inspect</code> <span>Parallel inspect</span></li>
                     <li><code>surgical_edit</code> <span>Block diff replace</span></li>
-                    <li><code>patch_and_verify</code> <span>Edit + test 1 turn</span></li>
-                    <li><code>run_command_compressed</code> <span>Token Guard log</span></li>
+                    <li><code>multi_surgical_edit</code> <span>Atomic multi-file</span></li>
+                    <li><code>patch_and_verify</code> <span>Edit + async verify</span></li>
+                    <li><code>run_command_compressed</code> <span>Auto-promote log</span></li>
                     <li><code>write_file_jailed</code> <span>Snapshot rollback</span></li>
                     <li><code>find_files</code> <span>Glob / metadata</span></li>
                     <li><code>code_outline</code> <span>AST symbol map</span></li>
+                    <li><code>read_symbol</code> <span>AST symbol body</span></li>
+                    <li><code>lsp_diagnostics</code> <span>LSP errors / warnings</span></li>
+                    <li><code>lsp_definition</code> <span>Jump to definition</span></li>
+                    <li><code>lsp_references</code> <span>Cross-file references</span></li>
+                    <li><code>lsp_hover</code> <span>Type &amp; docs hover</span></li>
                     <li><code>git_ops</code> <span>Structured Git ops</span></li>
                     <li><code>file_ops</code> <span>Mkdir / Move / Delete</span></li>
                     <li><code>start_command_job</code> <span>Async bg job</span></li>
                     <li><code>poll_command_job</code> <span>Incremental job log</span></li>
                     <li><code>stop_command_job</code> <span>Terminate bg job</span></li>
+                    <li><code>list_skills</code> <span>Discover SKILL.md</span></li>
+                    <li><code>load_skill</code> <span>Progressive load</span></li>
+                    <li><code>read_skill_resource</code> <span>Skill references</span></li>
+                    <li><code>upsert_artifact</code> <span>Plan / Tasks / Walkthrough</span></li>
+                    <li><code>request_plan_approval</code> <span>Plan-First gate</span></li>
+                    <li><code>spawn_subagent</code> <span>Parallel RO research</span></li>
                   </ul>
                 </div>
               </aside>
@@ -683,12 +827,78 @@
             <div class="view-header">
               <div>
                 <h1 id="heading-hub" class="view-title" tabindex="-1">Hub &amp; Smart Tools</h1>
-                <p class="view-subtitle">Gabungkan downstream MCP servers (<code class="md-inline-code">namespace__tool</code>) dan uji 14 tool hemat token.</p>
+                <p id="hub-tools-subtitle" class="view-subtitle">Gabungkan downstream MCP servers (<code class="md-inline-code">namespace__tool</code>), kelola Agent Plugins &amp; Skills, dan uji 20 tool hemat token.</p>
               </div>
               <button id="btn-add-mcp" type="button" class="btn btn-primary">+ Add MCP Server</button>
             </div>
 
             <div class="scroll-grid">
+              <article class="card card-span-2">
+                <div class="card-header-row">
+                  <div>
+                    <h2 class="card-heading">Installed Plugins (Agent Plugins 1.0.0)</h2>
+                    <p class="card-desc">Paket plugin terintegrasi (<code class="md-inline-code">plugin.json</code> + <code class="md-inline-code">mcp.json</code> + <code class="md-inline-code">skills/</code>) dengan 2-step Security Review &amp; secret DPAPI.</p>
+                  </div>
+                  <button id="btn-install-plugin" type="button" class="btn btn-primary btn-xs">+ Install Plugin</button>
+                </div>
+                <div class="traffic-table-wrap" tabindex="0" role="region" aria-label="Installed plugins">
+                  <table class="traffic-table">
+                    <thead>
+                      <tr>
+                        <th scope="col">Plugin</th>
+                        <th scope="col">Source</th>
+                        <th scope="col">Assets</th>
+                        <th scope="col">Secrets</th>
+                        <th scope="col">Status</th>
+                        <th scope="col">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody id="plugins-body">
+                      <tr>
+                        <td colspan="6" class="traffic-empty">Belum ada Agent Plugin yang terinstal.</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+
+              <article class="card card-span-2">
+                <div class="card-header-row">
+                  <div>
+                    <h2 class="card-heading">Agent Skills Catalog (<code class="md-inline-code">SKILL.md</code>)</h2>
+                    <p class="card-desc">Progressive Disclosure (~30 tok katalog; isi penuh &amp; referensi dimuat on-demand lewat <code class="md-inline-code">load_skill</code> / <code class="md-inline-code">skill://</code>).</p>
+                  </div>
+                  <div class="filter-bar">
+                    <div class="skill-filter-group" role="group" aria-label="Filter scope skill">
+                      <button type="button" class="btn btn-secondary btn-xs skill-filter-btn active" data-skill-filter="all" aria-pressed="true">All</button>
+                      <button type="button" class="btn btn-secondary btn-xs skill-filter-btn" data-skill-filter="workspace" aria-pressed="false">Workspace</button>
+                      <button type="button" class="btn btn-secondary btn-xs skill-filter-btn" data-skill-filter="plugin" aria-pressed="false">Plugin</button>
+                      <button type="button" class="btn btn-secondary btn-xs skill-filter-btn" data-skill-filter="global" aria-pressed="false">Global</button>
+                    </div>
+                    <button id="btn-rescan-skills" type="button" class="btn btn-secondary btn-xs">Rescan Skills</button>
+                    <button id="btn-new-skill" type="button" class="btn btn-primary btn-xs">+ New Global Skill</button>
+                  </div>
+                </div>
+                <div class="traffic-table-wrap" tabindex="0" role="region" aria-label="Agent skills catalog">
+                  <table class="traffic-table">
+                    <thead>
+                      <tr>
+                        <th scope="col">Skill</th>
+                        <th scope="col">Scope</th>
+                        <th scope="col">Tokens</th>
+                        <th scope="col">Enabled</th>
+                        <th scope="col">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody id="skills-body">
+                      <tr>
+                        <td colspan="5" class="traffic-empty">Belum ada Agent Skill (<code class="md-inline-code">SKILL.md</code>) yang ditemukan.</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+
               <article class="card card-span-2">
                 <div class="card-header-row">
                   <div>
@@ -726,20 +936,34 @@
                   <div class="sim-controls">
                     <label for="sim-tool-select" class="sr-only">Pilih tool simulasi</label>
                     <select id="sim-tool-select" class="mono-select">
+                      <option value="list_workspaces">list_workspaces</option>
                       <option value="project_overview">project_overview</option>
                       <option value="smart_search">smart_search</option>
                       <option value="read_file_range">read_file_range</option>
+                      <option value="batch_inspect">batch_inspect</option>
                       <option value="surgical_edit">surgical_edit</option>
+                      <option value="multi_surgical_edit">multi_surgical_edit</option>
                       <option value="patch_and_verify">patch_and_verify</option>
                       <option value="run_command_compressed">run_command_compressed</option>
                       <option value="write_file_jailed">write_file_jailed</option>
                       <option value="find_files">find_files</option>
                       <option value="code_outline">code_outline</option>
+                      <option value="read_symbol">read_symbol</option>
+                      <option value="lsp_diagnostics">lsp_diagnostics</option>
+                      <option value="lsp_definition">lsp_definition</option>
+                      <option value="lsp_references">lsp_references</option>
+                      <option value="lsp_hover">lsp_hover</option>
                       <option value="git_ops">git_ops</option>
                       <option value="file_ops">file_ops</option>
                       <option value="start_command_job">start_command_job</option>
                       <option value="poll_command_job">poll_command_job</option>
                       <option value="stop_command_job">stop_command_job</option>
+                      <option value="list_skills">list_skills</option>
+                      <option value="load_skill">load_skill</option>
+                      <option value="read_skill_resource">read_skill_resource</option>
+                      <option value="upsert_artifact">upsert_artifact</option>
+                      <option value="request_plan_approval">request_plan_approval</option>
+                      <option value="spawn_subagent">spawn_subagent</option>
                     </select>
                     <button id="btn-copy-sim-rpc" type="button" class="btn btn-secondary">Copy JSON-RPC</button>
                     <button id="btn-run-sim" type="button" class="btn btn-primary">Execute Tool</button>
@@ -811,6 +1035,19 @@
                       </tr>
                     </tbody>
                   </table>
+                </div>
+              </article>
+
+              <article class="card card-span-2">
+                <div class="card-header-row">
+                  <div>
+                    <h2 class="card-heading">Active LSP Servers (On-Demand)</h2>
+                    <p class="card-desc">Maksimum 2 language server aktif (LRU + auto-idle reap 5 menit) untuk tool <code class="md-inline-code">lsp_*</code>.</p>
+                  </div>
+                  <button id="btn-stop-all-lsp" type="button" class="btn btn-secondary btn-xs">Stop All LSP</button>
+                </div>
+                <div id="lsp-servers-list" class="lsp-strip-list">
+                  <div class="traffic-empty">Belum ada LSP server aktif (lazy spawn saat tool <code class="md-inline-code">lsp_*</code> dipanggil).</div>
                 </div>
               </article>
 
@@ -1080,6 +1317,34 @@
       </div>
     </dialog>
 
+    <!-- Downstream MCP Elicitation Modal (closedby="none") -->
+    <dialog id="mcp-elicitation-dialog" closedby="none" class="modal-dialog modal-dialog-wide" aria-labelledby="mcp-elic-title">
+      <form id="mcp-elic-form" novalidate>
+        <div class="modal-header">
+          <h2 id="mcp-elic-title" class="card-heading">Downstream MCP Meminta Input</h2>
+          <p id="mcp-elic-message" class="card-desc">-</p>
+        </div>
+        <div class="modal-body">
+          <div class="kv-grid">
+            <div class="kv-item">
+              <span class="kv-label">MCP Server</span>
+              <code id="mcp-elic-server" class="kv-value">-</code>
+            </div>
+            <div class="kv-item">
+              <span class="kv-label">Request ID</span>
+              <code id="mcp-elic-req-id" class="kv-value">-</code>
+            </div>
+          </div>
+          <div id="mcp-elic-fields" class="elic-fields"></div>
+        </div>
+        <div class="modal-footer">
+          <button id="btn-elic-cancel" type="button" class="btn btn-secondary">Cancel</button>
+          <button id="btn-elic-decline" type="button" class="btn btn-danger">Decline</button>
+          <button id="btn-elic-accept" type="submit" class="btn btn-primary">Submit</button>
+        </div>
+      </form>
+    </dialog>
+
     <!-- Background Job Logs Modal -->
     <dialog id="job-logs-dialog" closedby="any" class="modal-dialog modal-dialog-wide" aria-labelledby="job-logs-title">
       <div class="modal-header">
@@ -1145,6 +1410,193 @@
           <button id="btn-save-add-mcp" type="submit" class="btn btn-primary">Connect &amp; Save</button>
         </div>
       </form>
+    </dialog>
+
+    <!-- Install Agent Plugin 1.0.0 Modal (2-Step Security Review: closedby="none") -->
+    <dialog id="install-plugin-dialog" closedby="none" class="modal-dialog modal-dialog-wide" aria-labelledby="install-plugin-title">
+      <div class="modal-header">
+        <h2 id="install-plugin-title" class="card-heading">Install Agent Plugin (1.0.0)</h2>
+        <p id="install-plugin-subtitle" class="card-desc">Periksa manifest <code class="md-inline-code">mcp.json</code> &amp; skills sebelum menyetujui eksekusi.</p>
+      </div>
+      <div id="plugin-step-1" class="modal-body">
+        <div class="plugin-source-tabs" role="group" aria-label="Sumber plugin">
+          <button id="btn-plg-src-local" type="button" class="btn btn-secondary btn-xs active" aria-pressed="true">Local Folder</button>
+          <button id="btn-plg-src-git" type="button" class="btn btn-secondary btn-xs" aria-pressed="false">Git URL</button>
+        </div>
+        <div id="plugin-local-group" class="form-group">
+          <label for="plugin-local-path">Local Plugin Folder</label>
+          <div class="input-action-row">
+            <input
+              id="plugin-local-path"
+              type="text"
+              class="mono-input"
+              placeholder="D:\plugins\my-agent-plugin"
+              spellcheck="false"
+              autocomplete="off"
+              autocapitalize="none"
+            />
+            <button id="btn-browse-plugin-dir" type="button" class="btn btn-secondary btn-xs">Browse...</button>
+          </div>
+        </div>
+        <div id="plugin-git-group" class="form-group" hidden>
+          <label for="plugin-git-url">Git Repository URL (HTTPS / SSH)</label>
+          <input
+            id="plugin-git-url"
+            type="url"
+            class="mono-input"
+            placeholder="https://github.com/org/agent-plugin.git"
+            spellcheck="false"
+            autocomplete="off"
+            autocapitalize="none"
+          />
+        </div>
+        <div class="form-group">
+          <label for="plugin-subdir">Subfolder (Opsional, untuk monorepo)</label>
+          <input
+            id="plugin-subdir"
+            type="text"
+            class="mono-input"
+            placeholder="packages/my-plugin"
+            spellcheck="false"
+            autocomplete="off"
+            autocapitalize="none"
+          />
+        </div>
+      </div>
+      <div id="plugin-step-2" class="modal-body" hidden>
+        <div id="plugin-prev-meta" class="kv-grid"></div>
+        <div class="plugin-security-box">
+          <div class="bar-label">Security Review Gate</div>
+          <ul id="plugin-prev-warnings" class="plugin-warning-list"></ul>
+        </div>
+        <div class="insp-section">
+          <div class="bar-label">Bundled MCP Servers &amp; Skills</div>
+          <ul id="plugin-prev-assets" class="diag-notes"></ul>
+        </div>
+        <div id="plugin-prev-secrets-wrap" class="insp-section" hidden>
+          <div class="bar-label">Secrets Diperlukan (<code class="md-inline-code">DPAPI Vault</code>)</div>
+          <div id="plugin-prev-secrets-inputs" class="plugin-secrets-grid"></div>
+        </div>
+        <label for="plugin-enable-immediately" class="inline-check">
+          <input id="plugin-enable-immediately" type="checkbox" checked />
+          <span>Langsung aktifkan MCP server &amp; skills plugin setelah di-trust</span>
+        </label>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-plg-back" type="button" class="btn btn-secondary" hidden>Back</button>
+        <button id="btn-plg-cancel" type="button" class="btn btn-secondary">Cancel</button>
+        <button id="btn-plg-inspect" type="button" class="btn btn-primary">Inspect Plugin</button>
+        <button id="btn-plg-confirm" type="button" class="btn btn-primary" hidden>Trust &amp; Install</button>
+      </div>
+    </dialog>
+
+    <!-- Plugin DPAPI Secrets Modal (closedby="none") -->
+    <dialog id="plugin-secrets-dialog" closedby="none" class="modal-dialog" aria-labelledby="plugin-secrets-title">
+      <form id="plugin-secrets-form">
+        <div class="modal-header">
+          <h2 id="plugin-secrets-title" class="card-heading">Plugin Secrets (DPAPI Vault)</h2>
+          <p id="plugin-secrets-meta" class="card-desc">-</p>
+        </div>
+        <div class="modal-body">
+          <div id="plugin-secrets-fields" class="plugin-secrets-grid"></div>
+        </div>
+        <div class="modal-footer">
+          <button id="btn-cancel-plugin-secrets" type="button" class="btn btn-secondary">Cancel</button>
+          <button id="btn-save-plugin-secrets" type="submit" class="btn btn-primary">Save Secrets</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- Inspect Skill Modal -->
+    <dialog id="skill-detail-dialog" closedby="any" class="modal-dialog modal-dialog-wide" aria-labelledby="skill-detail-title">
+      <div class="modal-header">
+        <h2 id="skill-detail-title" class="card-heading">SKILL.md Inspector</h2>
+        <p id="skill-detail-meta" class="card-desc">-</p>
+      </div>
+      <div class="modal-body">
+        <div id="skill-detail-resources" class="skill-detail-badges"></div>
+        <div id="skill-detail-md" class="skill-md-preview"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-close-skill-detail" type="button" class="btn btn-primary">Close</button>
+      </div>
+    </dialog>
+
+    <!-- Create Global Skill Modal (closedby="none") -->
+    <dialog id="create-skill-dialog" closedby="none" class="modal-dialog" aria-labelledby="create-skill-title">
+      <form id="create-skill-form">
+        <div class="modal-header">
+          <h2 id="create-skill-title" class="card-heading">Buat Global Skill Baru</h2>
+          <p class="card-desc">Disimpan di <code class="md-inline-code">~/.smart-tauri-hub/skills/&lt;name&gt;/SKILL.md</code>.</p>
+        </div>
+        <div class="modal-body">
+          <div class="form-group">
+            <label for="new-skill-name">Nama Skill (kebab-case a-z, 0-9, '-')</label>
+            <input
+              id="new-skill-name"
+              type="text"
+              class="mono-input"
+              required
+              placeholder="tauri-security-audit"
+              spellcheck="false"
+              autocomplete="off"
+              autocapitalize="none"
+            />
+          </div>
+          <div class="form-group">
+            <label for="new-skill-desc">Deskripsi Katalog (~25-40 token)</label>
+            <input
+              id="new-skill-desc"
+              type="text"
+              class="mono-input"
+              required
+              placeholder="Audit Tauri v2 IPC commands, CSP config, and filesystem boundaries."
+            />
+          </div>
+          <div class="form-group">
+            <label for="new-skill-body">Instruksi Markdown (<code class="md-inline-code">SKILL.md</code> body)</label>
+            <textarea
+              id="new-skill-body"
+              class="mono-textarea"
+              rows="8"
+              placeholder="# Instructions&#10;1. Inspect IPC handlers..."
+            ></textarea>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button id="btn-cancel-create-skill" type="button" class="btn btn-secondary">Cancel</button>
+          <button id="btn-submit-create-skill" type="submit" class="btn btn-primary">Create Global Skill</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- Workspace Hooks Trust Modal (Security Gate: closedby="none") -->
+    <dialog id="hooks-trust-dialog" closedby="none" class="modal-dialog modal-dialog-wide" aria-labelledby="hooks-trust-title">
+      <div class="modal-header">
+        <h2 id="hooks-trust-title" class="card-heading">Workspace Lifecycle Hooks Review</h2>
+        <p id="hooks-trust-meta" class="card-desc">Periksa perintah di <code class="md-inline-code">.airlock/hooks.json</code> sebelum mengizinkan eksekusi otomatis.</p>
+      </div>
+      <div class="modal-body">
+        <div id="hooks-trust-warning" class="plugin-security-box" hidden></div>
+        <div class="kv-grid" style="margin-top: 8px">
+          <div class="kv-item">
+            <span class="kv-label">Workspace Path</span>
+            <code id="hooks-trust-path" class="mono-inline">-</code>
+          </div>
+          <div class="kv-item">
+            <span class="kv-label">SHA-256 Digest</span>
+            <code id="hooks-trust-sha" class="mono-inline">-</code>
+          </div>
+        </div>
+        <div class="insp-section">
+          <span class="bar-label">Hook Definitions</span>
+          <div id="hooks-trust-list" class="hooks-trust-list"></div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-cancel-hooks-trust" type="button" class="btn btn-secondary">Cancel</button>
+        <button id="btn-confirm-hooks-trust" type="button" class="btn btn-primary">Trust &amp; Enable Hooks</button>
+      </div>
     </dialog>
 
     <script type="module" src="/src/main.ts"></script>

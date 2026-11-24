@@ -3,14 +3,27 @@ import { $, setToast } from "../dom";
 import { renderMarkdownInto } from "../markdown";
 import type {
   AgentAttachment,
+  AgentChunkV2Payload,
   AgentProvider,
+  AgentRunSummary,
+  AgentStepV2Payload,
+  AgentThoughtV2Payload,
   AgentTurnResponse,
   ChatMessage,
   ChatSession,
   DashboardSnapshot,
+  ExecutionMode,
   GeminiModelInfo,
+  GeminiThinkingMode,
   StoredChatMessage,
+  WorkflowSummary,
 } from "../types";
+import {
+  isArtifactsPanelOpen,
+  loadSessionArtifacts,
+  openRunsTab,
+  toggleArtifactsPanel,
+} from "./artifacts";
 
 const LEGACY_STORAGE_KEYS = [
   "smart_mcp_hub_gemini_api_key",
@@ -42,6 +55,10 @@ const DEFAULT_MODELS: Record<AgentProvider, Array<{ id: string; label: string }>
   ],
 };
 
+function generateSessionId(): string {
+  return `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+}
+
 const fetchedModelsByProvider: Partial<Record<AgentProvider, GeminiModelInfo[]>> = {};
 const chatHistory: ChatMessage[] = [];
 const pendingAttachments: AgentAttachment[] = [];
@@ -49,9 +66,18 @@ const pendingAttachments: AgentAttachment[] = [];
 let lastSnap: DashboardSnapshot | null = null;
 let loadedWorkspaceForSessions: string | null = null;
 let workspaceSessions: ChatSession[] = [];
-let currentSessionId: string | null = null;
+let workspaceWorkflows: WorkflowSummary[] = [];
+let currentSessionId: string = generateSessionId();
 let currentSessionCreatedAt: string | null = null;
 let lastRenderedProvider: AgentProvider | null = null;
+let activeExecutionMode: ExecutionMode = "direct";
+let activeTurnSessionId: string | null = null;
+let activeTurnRunId: string | null = null;
+let slashMatches: WorkflowSummary[] = [];
+let selectedSlashIdx = 0;
+let runTurnFlowRef:
+  | ((isResume: boolean, payload?: { prompt: string; attachments: AgentAttachment[] }) => Promise<void>)
+  | null = null;
 
 let activeStreamState: {
   thoughtText: string;
@@ -62,6 +88,141 @@ let activeStreamState: {
   transcriptEl: HTMLElement;
 } | null = null;
 let isTurnActive = false;
+let turnStartedAt: number | null = null;
+let turnTimerId: number | null = null;
+let lastStepStatus = "Ready";
+
+export function getActiveSessionId(): string {
+  return currentSessionId;
+}
+
+export function setExecutionMode(mode: ExecutionMode): void {
+  activeExecutionMode = mode;
+  const directBtn = document.getElementById("btn-mode-direct");
+  const planBtn = document.getElementById("btn-mode-plan");
+  if (directBtn && planBtn) {
+    const isPlan = mode === "plan_first";
+    directBtn.classList.toggle("active", !isPlan);
+    directBtn.setAttribute("aria-pressed", isPlan ? "false" : "true");
+    planBtn.classList.toggle("active", isPlan);
+    planBtn.setAttribute("aria-pressed", isPlan ? "true" : "false");
+  }
+}
+
+export async function runProgrammaticTurn(
+  prompt: string,
+  modeOverride?: ExecutionMode
+): Promise<void> {
+  if (modeOverride) {
+    setExecutionMode(modeOverride);
+  }
+  if (runTurnFlowRef) {
+    await runTurnFlowRef(false, { prompt, attachments: [] });
+  }
+}
+
+function renderElapsedRunStatus(): void {
+  const statusEl = $("agent-run-status");
+  if (isTurnActive && turnStartedAt !== null) {
+    const secs = Math.max(0, Math.floor((Date.now() - turnStartedAt) / 1000));
+    statusEl.textContent = `${lastStepStatus} · ${secs}s`;
+  } else {
+    statusEl.textContent = lastStepStatus;
+  }
+}
+
+export function updateAgentStepStatus(text: string): void {
+  lastStepStatus = text;
+  renderElapsedRunStatus();
+}
+
+export function updateAgentStepStatusV2(payload: AgentStepV2Payload): void {
+  if (activeTurnSessionId && payload.session_id !== activeTurnSessionId) return;
+  if (!activeTurnRunId && payload.run_id) {
+    activeTurnRunId = payload.run_id;
+  }
+  updateAgentStepStatus(payload.text);
+}
+
+export function appendAgentThoughtChunkV2(payload: AgentThoughtV2Payload): void {
+  if (!activeStreamState || !payload.delta) return;
+  if (activeTurnSessionId && payload.session_id !== activeTurnSessionId) return;
+  activeStreamState.thoughtText += payload.delta;
+  activeStreamState.thoughtBox.hidden = false;
+  activeStreamState.thoughtPre.textContent = activeStreamState.thoughtText;
+  activeStreamState.transcriptEl.scrollTop = activeStreamState.transcriptEl.scrollHeight;
+}
+
+export function appendAgentTextChunkV2(payload: AgentChunkV2Payload): void {
+  if (!activeStreamState || !payload.delta) return;
+  if (activeTurnSessionId && payload.session_id !== activeTurnSessionId) return;
+  activeStreamState.bodyText += payload.delta;
+  activeStreamState.bodyEl.textContent = activeStreamState.bodyText;
+  activeStreamState.transcriptEl.scrollTop = activeStreamState.transcriptEl.scrollHeight;
+}
+
+export function renderRunsStrip(runs: AgentRunSummary[]): void {
+  if (activeTurnSessionId) {
+    const mine = runs.find(
+      (r) => !r.parent_run_id && r.session_id === activeTurnSessionId && r.status === "running"
+    );
+    if (mine) {
+      activeTurnRunId = mine.run_id;
+    }
+  }
+
+  const strip = document.getElementById("agent-runs-strip");
+  if (!strip) return;
+
+  const visible = runs.filter(
+    (r) => r.status === "running" || r.status === "awaiting_approval"
+  );
+  if (visible.length === 0) {
+    strip.hidden = true;
+    strip.replaceChildren();
+    return;
+  }
+
+  strip.hidden = false;
+  const nodes: HTMLElement[] = [];
+  for (const run of visible) {
+    const chip = document.createElement("div");
+    chip.className = `run-chip ${run.parent_run_id ? "run-chip-sub" : ""}`;
+
+    const infoBtn = document.createElement("button");
+    infoBtn.type = "button";
+    infoBtn.className = "run-chip-btn";
+    infoBtn.title = `${run.provider}/${run.model} · ${run.last_activity_text}`;
+
+    const dot = document.createElement("span");
+    dot.className = `live-dot ${run.status === "running" ? "online" : "warn"}`;
+    dot.setAttribute("aria-hidden", "true");
+
+    const text = document.createElement("span");
+    const shortLabel = run.label.length > 26 ? `${run.label.slice(0, 26)}…` : run.label;
+    text.textContent = `@${run.workspace_alias} · ${shortLabel} (${run.current_step}/${run.max_steps} · ${run.elapsed_secs}s)`;
+
+    infoBtn.append(dot, text);
+    infoBtn.addEventListener("click", () => openRunsTab());
+    chip.appendChild(infoBtn);
+
+    if (run.status === "running") {
+      const stop = document.createElement("button");
+      stop.type = "button";
+      stop.className = "run-chip-stop";
+      stop.setAttribute("aria-label", `Stop run ${run.label}`);
+      stop.textContent = "×";
+      stop.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        stop.disabled = true;
+        await invoke("cancel_agent_run", { runId: run.run_id }).catch(() => {});
+      });
+      chip.appendChild(stop);
+    }
+    nodes.push(chip);
+  }
+  strip.replaceChildren(...nodes);
+}
 
 function getSelectedProvider(): AgentProvider {
   const val = ($("agent-provider") as HTMLSelectElement).value;
@@ -116,6 +277,7 @@ function populateModelSelect(prov: AgentProvider, preferredModel?: string): void
 
 function syncProviderFieldsUi(prov: AgentProvider, snap: DashboardSnapshot | null): void {
   $("openai-compat-fields").hidden = prov !== "openai_compat";
+  $("gemini-thinking-group").hidden = prov !== "gemini";
 
   const keyInput = $("agent-api-key") as HTMLInputElement;
   const hasKey = hasSavedKeyForProvider(snap, prov);
@@ -181,7 +343,12 @@ function renderAttachmentChips(): void {
   pendingAttachments.forEach((att, idx) => {
     const chip = document.createElement("span");
     chip.className = "attach-chip";
-    chip.textContent = att.kind === "file" ? `@${att.path ?? att.name}` : `[img] ${att.name}`;
+    chip.textContent =
+      att.kind === "file"
+        ? (att.path ?? att.name).startsWith("@")
+          ? (att.path ?? att.name)
+          : `@${att.path ?? att.name}`
+        : `[img] ${att.name}`;
 
     const rm = document.createElement("button");
     rm.type = "button";
@@ -355,11 +522,18 @@ async function loadWorkspaceSessions(): Promise<void> {
   }
 }
 
+async function loadWorkspaceWorkflows(): Promise<void> {
+  try {
+    workspaceWorkflows = await invoke<WorkflowSummary[]>("list_workflows");
+  } catch {
+    workspaceWorkflows = [];
+  }
+}
+
 async function persistActiveChatSession(): Promise<void> {
   if (chatHistory.length === 0) return;
   const nowIso = new Date().toISOString();
-  if (!currentSessionId) {
-    currentSessionId = `chat-${Date.now().toString(36)}`;
+  if (!currentSessionCreatedAt) {
     currentSessionCreatedAt = nowIso;
   }
   const firstUser = chatHistory.find((m) => m.role === "user")?.content ?? "Sesi Coding";
@@ -378,7 +552,7 @@ async function persistActiveChatSession(): Promise<void> {
   const session: ChatSession = {
     id: currentSessionId,
     title: cleanTitle,
-    created_at: currentSessionCreatedAt ?? nowIso,
+    created_at: currentSessionCreatedAt,
     updated_at: nowIso,
     messages: storedMsgs,
   };
@@ -392,19 +566,37 @@ async function persistActiveChatSession(): Promise<void> {
 }
 
 export async function startNewChatSession(): Promise<void> {
-  currentSessionId = null;
+  const prevSid = currentSessionId;
+  currentSessionId = generateSessionId();
   currentSessionCreatedAt = null;
   chatHistory.length = 0;
   pendingAttachments.length = 0;
   renderAttachmentChips();
   renderChat();
   renderSessionSelector();
-  await invoke("clear_agent_history").catch(() => {});
+  await invoke("clear_agent_history", { sessionId: prevSid }).catch(() => {});
+  await loadSessionArtifacts(currentSessionId);
+}
+
+function formatCheckpointReason(reason: string): string {
+  switch (reason) {
+    case "turn_budget_timeout":
+      return "Turn budget timeout";
+    case "stream_idle_timeout":
+      return "Stream idle timeout";
+    case "max_steps":
+      return "Max steps tercapai";
+    case "cancelled":
+      return "Dibatalkan user";
+    default:
+      return reason;
+  }
 }
 
 export function renderAgentView(snap: DashboardSnapshot): void {
   lastSnap = snap;
-  $("active-tools-heading").textContent = `Smart Tools Aktif (${14 + (snap.aggregated_tools_count ?? 0)})`;
+  const builtinCount = snap.builtin_tools_count ?? 28;
+  $("active-tools-heading").textContent = `Smart Tools Aktif (${builtinCount + (snap.aggregated_tools_count ?? 0)})`;
 
   const providerSel = $("agent-provider") as HTMLSelectElement;
   const prov = snap.agent_provider ?? "gemini";
@@ -418,6 +610,32 @@ export function renderAgentView(snap: DashboardSnapshot): void {
   }
 
   ($("toggle-auto-rules") as HTMLInputElement).checked = snap.auto_inject_project_rules;
+
+  const thinkingSel = $("agent-thinking-select") as HTMLSelectElement;
+  if (document.activeElement !== thinkingSel) {
+    thinkingSel.value = snap.gemini_thinking_mode ?? "auto";
+  }
+
+  const maxStepsInput = $("agent-max-steps-input") as HTMLInputElement;
+  if (document.activeElement !== maxStepsInput) {
+    maxStepsInput.value = String(snap.agent_max_steps ?? 16);
+  }
+
+  const turnTimeoutInput = $("agent-turn-timeout-input") as HTMLInputElement;
+  if (document.activeElement !== turnTimeoutInput) {
+    turnTimeoutInput.value = String(snap.agent_turn_timeout_secs ?? 180);
+  }
+
+  const cpBanner = $("agent-checkpoint-banner");
+  const cp = snap.pending_checkpoint;
+  if (cp && cp.can_resume && !isTurnActive) {
+    const lastToolPart = cp.last_tool ? ` · last tool: ${cp.last_tool}` : "";
+    $("checkpoint-banner-text").textContent =
+      `Checkpoint siap dilanjutkan (${formatCheckpointReason(cp.reason)} · ${cp.completed_steps} step${lastToolPart})`;
+    cpBanner.hidden = false;
+  } else {
+    cpBanner.hidden = true;
+  }
 
   const modelSel = $("agent-model") as HTMLSelectElement;
   const activeProv = getSelectedProvider();
@@ -447,13 +665,14 @@ export function renderAgentView(snap: DashboardSnapshot): void {
     const switchedFromAnother = loadedWorkspaceForSessions !== null;
     loadedWorkspaceForSessions = snap.workspace_root;
     if (switchedFromAnother) {
-      currentSessionId = null;
+      currentSessionId = generateSessionId();
       currentSessionCreatedAt = null;
       chatHistory.length = 0;
       renderChat();
-      void invoke("clear_agent_history").catch(() => {});
     }
     void loadWorkspaceSessions();
+    void loadWorkspaceWorkflows();
+    void loadSessionArtifacts(currentSessionId);
   }
 }
 
@@ -526,6 +745,10 @@ export async function initAgentView(
       baseUrl: null,
       model: legacyModel,
       autoInjectProjectRules: null,
+      geminiThinkingMode: null,
+      agentMaxSteps: null,
+      agentTurnTimeoutSecs: null,
+      streamIdleTimeoutSecs: null,
     }).catch(() => {});
   }
   for (const k of LEGACY_STORAGE_KEYS) {
@@ -538,10 +761,16 @@ export async function initAgentView(
   const toggleDrawerBtn = $("btn-toggle-drawer");
   toggleDrawerBtn.addEventListener("click", () => {
     const shell = $("agent-shell");
+    if (isArtifactsPanelOpen()) {
+      toggleArtifactsPanel(false);
+    }
     const open = shell.classList.toggle("drawer-open");
     toggleDrawerBtn.setAttribute("aria-expanded", open ? "true" : "false");
     $("agent-drawer").toggleAttribute("inert", !open);
   });
+
+  $("btn-mode-direct").addEventListener("click", () => setExecutionMode("direct"));
+  $("btn-mode-plan").addEventListener("click", () => setExecutionMode("plan_first"));
 
   providerSel.addEventListener("change", () => {
     const prov = getSelectedProvider();
@@ -585,6 +814,11 @@ export async function initAgentView(
         : null;
     const targetModel = getSelectedModelId();
     const autoRules = ($("toggle-auto-rules") as HTMLInputElement).checked;
+    const thinkingMode = ($("agent-thinking-select") as HTMLSelectElement).value as GeminiThinkingMode;
+    const parsedSteps = Number.parseInt(($("agent-max-steps-input") as HTMLInputElement).value, 10);
+    const maxSteps = Number.isFinite(parsedSteps) ? Math.min(30, Math.max(4, parsedSteps)) : 16;
+    const parsedBudget = Number.parseInt(($("agent-turn-timeout-input") as HTMLInputElement).value, 10);
+    const turnBudget = Number.isFinite(parsedBudget) ? Math.min(600, Math.max(30, parsedBudget)) : 180;
 
     const snap = await invoke<DashboardSnapshot>("configure_agent_provider", {
       provider: prov,
@@ -592,6 +826,10 @@ export async function initAgentView(
       baseUrl,
       model: targetModel,
       autoInjectProjectRules: autoRules,
+      geminiThinkingMode: thinkingMode,
+      agentMaxSteps: maxSteps,
+      agentTurnTimeoutSecs: turnBudget,
+      streamIdleTimeoutSecs: null,
     });
     if (overrideApiKey === undefined && apiKey.length > 0) {
       keyEl.value = "";
@@ -677,14 +915,15 @@ export async function initAgentView(
     }
     renderChat();
     renderSessionSelector();
-    await invoke("clear_agent_history").catch(() => {});
+    await loadSessionArtifacts(currentSessionId);
   });
 
   $("btn-delete-session").addEventListener("click", async () => {
-    if (!currentSessionId) return;
+    const targetToDelete = currentSessionId;
+    if (!workspaceSessions.some((s) => s.id === targetToDelete)) return;
     try {
       workspaceSessions = await invoke<ChatSession[]>("delete_chat_session", {
-        sessionId: currentSessionId,
+        sessionId: targetToDelete,
       });
       await startNewChatSession();
       setToast("Sesi chat dihapus.");
@@ -696,12 +935,18 @@ export async function initAgentView(
   // File & Image Attachments
   const addPathAttachment = (): void => {
     const input = $("attach-file-path") as HTMLInputElement;
-    const raw = input.value.trim().replace(/^@+/, "");
+    const raw = input.value.trim();
     if (!raw) return;
+    // Keep @alias:rel/path intact while stripping stray leading '@' from plain paths
+    const normalized =
+      raw.startsWith("@") && raw.slice(1).includes(":")
+        ? raw
+        : raw.replace(/^@+/, "");
+    if (!normalized) return;
     pendingAttachments.push({
       kind: "file",
-      name: raw,
-      path: raw,
+      name: normalized,
+      path: normalized,
     });
     input.value = "";
     renderAttachmentChips();
@@ -709,6 +954,7 @@ export async function initAgentView(
 
   $("btn-attach-file").addEventListener("click", addPathAttachment);
   ($("attach-file-path") as HTMLInputElement).addEventListener("keydown", (e) => {
+    if (e.isComposing) return;
     if (e.key === "Enter") {
       e.preventDefault();
       addPathAttachment();
@@ -729,6 +975,82 @@ export async function initAgentView(
   });
 
   const chatInput = $("chat-input") as HTMLTextAreaElement;
+  const slashPopover = $("slash-popover");
+
+  const closeSlashPopover = (): void => {
+    slashPopover.hidden = true;
+    slashPopover.replaceChildren();
+    slashMatches = [];
+    selectedSlashIdx = 0;
+  };
+
+  const applySlashSelection = (wf: WorkflowSummary): void => {
+    chatInput.value = `${wf.slash} `;
+    if (wf.execution_mode === "plan_first") {
+      setExecutionMode("plan_first");
+    }
+    closeSlashPopover();
+    chatInput.focus();
+  };
+
+  const renderSlashPopover = (): void => {
+    if (slashMatches.length === 0) {
+      closeSlashPopover();
+      return;
+    }
+    slashPopover.hidden = false;
+    const nodes: HTMLElement[] = [];
+    slashMatches.forEach((wf, idx) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.role = "option";
+      btn.className = `slash-item ${idx === selectedSlashIdx ? "selected" : ""}`;
+      btn.setAttribute("aria-selected", idx === selectedSlashIdx ? "true" : "false");
+
+      const top = document.createElement("div");
+      top.className = "slash-item-top";
+      const code = document.createElement("code");
+      code.textContent = wf.slash;
+      const src = document.createElement("span");
+      src.className = "badge badge-muted";
+      src.textContent = wf.source;
+      top.append(code, src);
+
+      const desc = document.createElement("div");
+      desc.className = "slash-item-desc";
+      desc.textContent = `${wf.title} — ${wf.description}`;
+
+      btn.append(top, desc);
+      btn.addEventListener("mousedown", (ev) => {
+        ev.preventDefault();
+        applySlashSelection(wf);
+      });
+      nodes.push(btn);
+    });
+    slashPopover.replaceChildren(...nodes);
+  };
+
+  chatInput.addEventListener("input", () => {
+    const val = chatInput.value;
+    if (val.startsWith("/") && !val.includes("\n") && !val.slice(1).includes(" ")) {
+      const q = val.slice(1).toLowerCase();
+      slashMatches = workspaceWorkflows.filter(
+        (w) =>
+          w.name.toLowerCase().includes(q) ||
+          w.title.toLowerCase().includes(q) ||
+          w.slash.toLowerCase().startsWith(val.toLowerCase())
+      );
+      selectedSlashIdx = 0;
+      renderSlashPopover();
+    } else {
+      closeSlashPopover();
+    }
+  });
+
+  chatInput.addEventListener("blur", () => {
+    window.setTimeout(closeSlashPopover, 120);
+  });
+
   chatInput.addEventListener("paste", async (e) => {
     const items = e.clipboardData?.items;
     if (!items) return;
@@ -748,6 +1070,7 @@ export async function initAgentView(
     chip.addEventListener("click", () => {
       const tmpl = chip.dataset.prompt ?? "";
       chatInput.value = tmpl;
+      closeSlashPopover();
       chatInput.focus();
     });
   });
@@ -755,28 +1078,53 @@ export async function initAgentView(
   const stopBtn = $("btn-stop-agent") as HTMLButtonElement;
   stopBtn.addEventListener("click", async () => {
     stopBtn.disabled = true;
-    await invoke("cancel_local_agent").catch(() => {});
-    $("agent-run-status").textContent = "Membatalkan...";
+    await invoke("cancel_local_agent", {
+      runId: activeTurnRunId,
+    }).catch(() => {});
+    updateAgentStepStatus("Membatalkan...");
   });
 
   const chatForm = $("chat-form") as HTMLFormElement;
   chatInput.addEventListener("keydown", (e) => {
+    if (e.isComposing) return;
+    if (!slashPopover.hidden && slashMatches.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        selectedSlashIdx = (selectedSlashIdx + 1) % slashMatches.length;
+        renderSlashPopover();
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        selectedSlashIdx = (selectedSlashIdx - 1 + slashMatches.length) % slashMatches.length;
+        renderSlashPopover();
+        return;
+      }
+      if (e.key === "Tab" || (e.key === "Enter" && !e.ctrlKey && !e.metaKey && !e.shiftKey)) {
+        e.preventDefault();
+        const chosen = slashMatches[selectedSlashIdx];
+        if (chosen) applySlashSelection(chosen);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeSlashPopover();
+        return;
+      }
+    }
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
       e.preventDefault();
       chatForm.requestSubmit();
     }
   });
 
-  chatForm.addEventListener("submit", async (e) => {
-    e.preventDefault();
+  const runTurnFlow = async (
+    isResume: boolean,
+    payload?: { prompt: string; displayPrompt?: string; attachments: AgentAttachment[] }
+  ): Promise<void> => {
     if (isTurnActive) return;
 
-    const prompt = chatInput.value.trim();
-    if (!prompt) return;
-
-    const attachmentsToSend = [...pendingAttachments];
     const targetModel = getSelectedModelId();
-
     try {
       await saveAgentConfig();
     } catch (err) {
@@ -784,34 +1132,65 @@ export async function initAgentView(
       return;
     }
 
-    const attSuffix =
-      attachmentsToSend.length > 0
-        ? `\n\n[Attachments: ${attachmentsToSend.map((a) => (a.kind === "file" ? `@${a.path ?? a.name}` : a.name)).join(", ")}]`
-        : "";
+    const turnSessionId = currentSessionId;
+    activeTurnSessionId = turnSessionId;
+    activeTurnRunId = null;
 
-    chatHistory.push({
-      role: "user",
-      content: `${prompt}${attSuffix}`,
-      timestamp: new Date().toLocaleTimeString(),
-    });
-    chatInput.value = "";
-    pendingAttachments.length = 0;
-    renderAttachmentChips();
-    renderChat();
+    if (!isResume && payload) {
+      const attSuffix =
+        payload.attachments.length > 0
+          ? `\n\n[Attachments: ${payload.attachments
+              .map((a) => {
+                if (a.kind !== "file") return a.name;
+                const p = a.path ?? a.name;
+                return p.startsWith("@") ? p : `@${p}`;
+              })
+              .join(", ")}]`
+          : "";
+      chatHistory.push({
+        role: "user",
+        content: `${payload.displayPrompt ?? payload.prompt}${attSuffix}`,
+        timestamp: new Date().toLocaleTimeString(),
+      });
+      chatInput.value = "";
+      closeSlashPopover();
+      pendingAttachments.length = 0;
+      renderAttachmentChips();
+      renderChat();
+    }
+
     createStreamingCard();
 
     const sendBtn = $("btn-send-chat") as HTMLButtonElement;
+    const resumeBtn = $("btn-resume-checkpoint") as HTMLButtonElement;
+    const discardBtn = $("btn-discard-checkpoint") as HTMLButtonElement;
     isTurnActive = true;
     sendBtn.disabled = true;
+    resumeBtn.disabled = true;
+    discardBtn.disabled = true;
     stopBtn.hidden = false;
     stopBtn.disabled = false;
-    $("agent-run-status").textContent = `Streaming ${targetModel}...`;
+    $("agent-checkpoint-banner").hidden = true;
+
+    turnStartedAt = Date.now();
+    lastStepStatus = isResume ? `Resuming ${targetModel}...` : `Streaming ${targetModel}...`;
+    renderElapsedRunStatus();
+    if (turnTimerId !== null) {
+      window.clearInterval(turnTimerId);
+    }
+    turnTimerId = window.setInterval(renderElapsedRunStatus, 1000);
 
     try {
-      const res = await invoke<AgentTurnResponse>("run_local_agent_turn", {
-        prompt,
-        attachments: attachmentsToSend,
-      });
+      const res = isResume
+        ? await invoke<AgentTurnResponse>("resume_local_agent_turn", {
+            sessionId: turnSessionId,
+          })
+        : await invoke<AgentTurnResponse>("run_local_agent_turn", {
+            prompt: payload?.prompt ?? "",
+            attachments: payload?.attachments ?? [],
+            sessionId: turnSessionId,
+            executionMode: activeExecutionMode,
+          });
       const capturedThought = activeStreamState?.thoughtText ?? "";
       activeStreamState = null;
 
@@ -825,11 +1204,19 @@ export async function initAgentView(
         timestamp: new Date().toLocaleTimeString(),
       });
       renderChat();
+      isTurnActive = false;
       onSnapshot(res.snapshot);
       await persistActiveChatSession();
-      $("agent-run-status").textContent = res.cancelled
-        ? "Dibatalkan"
-        : `Selesai (${res.steps.length} tool step)`;
+      void loadSessionArtifacts(turnSessionId);
+      const totalElapsed =
+        turnStartedAt !== null ? Math.max(0, Math.floor((Date.now() - turnStartedAt) / 1000)) : 0;
+      lastStepStatus = res.awaiting_approval
+        ? `Awaiting Plan Approval (${totalElapsed}s)`
+        : res.cancelled
+          ? `Dibatalkan (${totalElapsed}s)`
+          : res.checkpoint?.can_resume
+            ? `Checkpoint (${res.steps.length} tool step · ${totalElapsed}s)`
+            : `Selesai (${res.steps.length} tool step · ${totalElapsed}s)`;
     } catch (err) {
       const capturedThought = activeStreamState?.thoughtText ?? "";
       activeStreamState = null;
@@ -841,12 +1228,77 @@ export async function initAgentView(
       });
       renderChat();
       await persistActiveChatSession();
-      $("agent-run-status").textContent = "Error";
+      lastStepStatus = "Error";
     } finally {
+      if (turnTimerId !== null) {
+        window.clearInterval(turnTimerId);
+        turnTimerId = null;
+      }
+      turnStartedAt = null;
       isTurnActive = false;
+      activeTurnRunId = null;
+      activeTurnSessionId = null;
       sendBtn.disabled = false;
+      resumeBtn.disabled = false;
+      discardBtn.disabled = false;
       stopBtn.hidden = true;
       stopBtn.disabled = false;
+      renderElapsedRunStatus();
+      if (lastSnap) {
+        renderAgentView(lastSnap);
+      }
     }
+  };
+  runTurnFlowRef = runTurnFlow;
+
+  $("btn-resume-checkpoint").addEventListener("click", () => {
+    void runTurnFlow(true);
+  });
+
+  $("btn-discard-checkpoint").addEventListener("click", async () => {
+    try {
+      const next = await invoke<DashboardSnapshot>("discard_agent_checkpoint", {
+        sessionId: currentSessionId,
+      });
+      onSnapshot(next);
+      setToast("Checkpoint dibuang.");
+    } catch (err) {
+      setToast(`Gagal membuang checkpoint: ${String(err)}`);
+    }
+  });
+
+  chatForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (isTurnActive) return;
+
+    const rawPrompt = chatInput.value.trim();
+    if (!rawPrompt) return;
+
+    let effectivePrompt = rawPrompt;
+    const slashMatch = /^\/([a-zA-Z0-9_-]+)(?:\s+([\s\S]*))?$/.exec(rawPrompt);
+    if (slashMatch) {
+      const wfName = slashMatch[1].toLowerCase();
+      const tailInput = (slashMatch[2] ?? "").trim();
+      const wf = workspaceWorkflows.find((w) => w.name.toLowerCase() === wfName);
+      if (wf) {
+        if (wf.execution_mode === "plan_first") {
+          setExecutionMode("plan_first");
+        }
+        if (wf.prompt_template.includes("{{input}}")) {
+          effectivePrompt = wf.prompt_template.replaceAll("{{input}}", tailInput || "(workspace aktif)");
+        } else {
+          effectivePrompt = tailInput
+            ? `${wf.prompt_template}\n\nKonteks Tambahan User:\n${tailInput}`
+            : wf.prompt_template;
+        }
+      }
+    }
+
+    const attachmentsToSend = [...pendingAttachments];
+    await runTurnFlow(false, {
+      prompt: effectivePrompt,
+      displayPrompt: rawPrompt,
+      attachments: attachmentsToSend,
+    });
   });
 }

@@ -2,6 +2,7 @@ import "@fontsource-variable/plus-jakarta-sans";
 import "@fontsource-variable/jetbrains-mono";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   $,
   copyToClipboard,
@@ -13,24 +14,42 @@ import {
   syncRailIndicator,
 } from "./dom";
 import type {
+  AgentChunkV2Payload,
+  AgentRunSummary,
+  AgentStepV2Payload,
+  AgentThoughtV2Payload,
+  ArtifactDocument,
   AuditAddedPayload,
   CommandPaletteAction,
   DashboardSnapshot,
   DiagnosticReport,
   GuardrailMode,
+  HooksStatusSummary,
   HttpTrafficEntry,
   JobSummary,
+  PendingElicitation,
   PendingOAuthInfo,
   PendingToolApproval,
 } from "./types";
 import {
-  appendAgentTextChunk,
-  appendAgentThoughtChunk,
+  appendAgentTextChunkV2,
+  appendAgentThoughtChunkV2,
+  getActiveSessionId,
   initAgentView,
   isAgentTurnActive,
   renderAgentView,
+  renderRunsStrip,
+  runProgrammaticTurn,
+  setExecutionMode,
   startNewChatSession,
+  updateAgentStepStatusV2,
 } from "./views/agent";
+import {
+  handleArtifactUpdatedEvent,
+  initArtifactsView,
+  renderRunsTab,
+  toggleArtifactsPanel,
+} from "./views/artifacts";
 import { appendAuditIncremental, initAuditView, renderAuditList } from "./views/audit";
 import {
   appendTrafficIncremental,
@@ -40,15 +59,24 @@ import {
   updateJobIncremental,
 } from "./views/bridge";
 import {
+  enqueueMcpElicitation,
   enqueueOAuthConsent,
   enqueueToolApproval,
+  handleMcpElicitationResolvedEvent,
   handleOAuthResolvedEvent,
   handleToolApprovalResolvedEvent,
   initModals,
   openAddMcpModal,
   openCommandPalette,
   openDiagnosticModal,
+  openHooksTrustModal,
 } from "./views/modals";
+import {
+  initPluginsView,
+  openCreateSkillModal,
+  openInstallPluginModal,
+  renderPluginsView,
+} from "./views/plugins";
 import { initWorkspaceView, renderWorkspaceView } from "./views/workspace";
 
 let currentSnapshot: DashboardSnapshot | null = null;
@@ -60,7 +88,8 @@ function getSnap(): DashboardSnapshot | null {
 function renderStatusbarMeta(snap: DashboardSnapshot): void {
   const srv = snap.server_running ? "ONLINE" : "OFFLINE";
   const guard = snap.allow_sensitive_reads ? "OFF" : "ON";
-  const toolsTotal = 14 + (snap.aggregated_tools_count ?? 0);
+  const builtinCount = snap.builtin_tools_count ?? 28;
+  const toolsTotal = builtinCount + (snap.aggregated_tools_count ?? 0);
   $("statusbar-meta").textContent =
     `Port ${snap.server_port} · Server ${srv} · Mode ${snap.guardrail_mode} · Sensitive Guard ${guard} · ${toolsTotal} tools`;
 }
@@ -102,8 +131,9 @@ function renderSnapshot(snap: DashboardSnapshot): void {
   $("metric-tokens-saved").textContent = snap.metrics.tokens_saved_total.toLocaleString("en-US");
   $("metric-turns-saved").textContent = snap.metrics.turns_saved_total.toLocaleString("en-US");
 
+  const builtinCount = snap.builtin_tools_count ?? 28;
   const aggCount = snap.aggregated_tools_count ?? 0;
-  $("rail-hub-count").textContent = aggCount > 0 ? `14+${aggCount}` : "14";
+  $("rail-hub-count").textContent = aggCount > 0 ? `${builtinCount}+${aggCount}` : String(builtinCount);
   $("rail-monitor-count").textContent = String((snap.http_traffic ?? []).length);
   $("audit-count-badge").textContent = String(snap.audit_logs.length);
 
@@ -111,13 +141,30 @@ function renderSnapshot(snap: DashboardSnapshot): void {
   renderWorkspaceView(snap, renderSnapshot);
   renderAgentView(snap);
   renderBridgeView(snap, renderSnapshot);
+  renderPluginsView(snap, renderSnapshot);
   renderAuditList(snap.audit_logs, getSnap);
+
+  const runs = snap.active_runs ?? [];
+  renderRunsStrip(runs);
+  renderRunsTab(runs);
+
+  const hooksBtn = $("btn-hooks-trust") as HTMLButtonElement;
+  const hs = snap.hooks_status;
+  if (hs && hs.hooks_file_exists && !hs.trusted) {
+    hooksBtn.hidden = false;
+    hooksBtn.textContent = hs.hash_changed ? "Hooks: Changed" : "Hooks: Untrusted";
+  } else {
+    hooksBtn.hidden = true;
+  }
 
   for (const pending of snap.pending_oauth_requests ?? []) {
     enqueueOAuthConsent(pending);
   }
   for (const pendingTool of snap.pending_tool_approvals ?? []) {
     enqueueToolApproval(pendingTool);
+  }
+  for (const pendingElic of snap.pending_elicitations ?? []) {
+    enqueueMcpElicitation(pendingElic);
   }
 }
 
@@ -303,6 +350,34 @@ function buildPaletteActions(): CommandPaletteAction[] {
       },
     },
     {
+      id: "install-agent-plugin",
+      label: "Install Agent Plugin (1.0.0)",
+      hint: "Hub & Plugins",
+      run: () => {
+        switchTab("hub");
+        openInstallPluginModal();
+      },
+    },
+    {
+      id: "rescan-agent-skills",
+      label: "Rescan Agent Skills (SKILL.md)",
+      hint: "Skills Catalog",
+      run: async () => {
+        const next = await invoke<DashboardSnapshot>("rescan_skills");
+        renderSnapshot(next);
+        setToast(`Skills dipindai ulang (${next.skills.length} ditemukan).`);
+      },
+    },
+    {
+      id: "new-global-skill",
+      label: "Buat Global Skill Baru (SKILL.md)",
+      hint: "Skills Catalog",
+      run: () => {
+        switchTab("hub");
+        openCreateSkillModal();
+      },
+    },
+    {
       id: "new-chat-session",
       label: "Mulai Sesi Chat Local Agent Baru",
       hint: "Local Agent",
@@ -311,7 +386,83 @@ function buildPaletteActions(): CommandPaletteAction[] {
         await startNewChatSession();
       },
     },
+    {
+      id: "toggle-artifacts-panel",
+      label: "Toggle Artifacts & Runs Panel",
+      hint: "Local Agent",
+      run: () => {
+        switchTab("agent");
+        toggleArtifactsPanel();
+      },
+    },
+    {
+      id: "exec-mode-plan-first",
+      label: "Switch Execution Mode -> Plan First",
+      hint: "Artifacts Gate",
+      run: () => {
+        switchTab("agent");
+        setExecutionMode("plan_first");
+        setToast("Execution Mode: Plan First (butuh approval sebelum edit)");
+      },
+    },
+    {
+      id: "exec-mode-direct",
+      label: "Switch Execution Mode -> Direct",
+      hint: "Fast Coding",
+      run: () => {
+        switchTab("agent");
+        setExecutionMode("direct");
+        setToast("Execution Mode: Direct");
+      },
+    },
+    {
+      id: "inspect-workspace-hooks",
+      label: "Inspect Workspace Lifecycle Hooks (.airlock/hooks.json)",
+      hint: "Trust Gate",
+      run: async () => {
+        const status = await invoke<HooksStatusSummary>("get_workspace_hooks_status");
+        openHooksTrustModal(status, renderSnapshot);
+      },
+    },
   ];
+
+  actions.push({
+    id: "add-mounted-workspace",
+    label: "Add Mounted Workspace Folder...",
+    hint: "Multi-Workspace",
+    run: async () => {
+      const picked = await open({
+        directory: true,
+        multiple: false,
+        title: "Tambah Mounted Workspace Folder",
+      });
+      if (typeof picked === "string") {
+        const next = await invoke<DashboardSnapshot>("add_workspace", {
+          path: picked,
+          alias: null,
+          guardrailOverride: null,
+          setDefault: false,
+        });
+        renderSnapshot(next);
+        setToast(`Mounted: ${picked}`);
+      }
+    },
+  });
+
+  for (const ws of snap?.workspaces ?? []) {
+    if (ws.enabled && !ws.is_default) {
+      actions.push({
+        id: `switch-default-ws-${ws.id}`,
+        label: `Switch Default Workspace -> @${ws.alias}`,
+        hint: ws.path,
+        run: async () => {
+          const next = await invoke<DashboardSnapshot>("set_default_workspace", { id: ws.id });
+          renderSnapshot(next);
+          setToast(`Default workspace: @${ws.alias}`);
+        },
+      });
+    }
+  }
 
   for (const ws of snap?.pinned_workspaces ?? []) {
     actions.push({
@@ -396,10 +547,26 @@ async function init(): Promise<void> {
 
   $("btn-open-palette").addEventListener("click", () => openCommandPalette());
 
+  $("btn-hooks-trust").addEventListener("click", async () => {
+    try {
+      const status =
+        currentSnapshot?.hooks_status ??
+        (await invoke<HooksStatusSummary>("get_workspace_hooks_status"));
+      openHooksTrustModal(status, renderSnapshot);
+    } catch (err) {
+      setToast(`Gagal membaca status hooks: ${String(err)}`, "warn");
+    }
+  });
+
   initModals(renderSnapshot, buildPaletteActions);
   initWorkspaceView(getSnap, renderSnapshot);
   initBridgeView(getSnap, renderSnapshot, refreshDashboard);
+  initPluginsView(getSnap, renderSnapshot);
   initAuditView(getSnap, refreshDashboard);
+  initArtifactsView({
+    getSessionId: getActiveSessionId,
+    onRunPrompt: runProgrammaticTurn,
+  });
   await initAgentView(renderSnapshot);
 
   document.addEventListener("keydown", (e) => {
@@ -436,7 +603,9 @@ async function init(): Promise<void> {
         const wsDropdown = $("workspace-dropdown");
         if (!wsDropdown.hidden) {
           wsDropdown.hidden = true;
-          $("btn-recent-workspaces").setAttribute("aria-expanded", "false");
+          const toggleBtn = $("btn-recent-workspaces");
+          toggleBtn.setAttribute("aria-expanded", "false");
+          toggleBtn.focus();
           return;
         }
         if (isAgentTurnActive()) {
@@ -483,20 +652,47 @@ async function init(): Promise<void> {
     handleToolApprovalResolvedEvent(event.payload);
   });
 
+  await listen<PendingElicitation>("mcp-elicitation-request", (event) => {
+    enqueueMcpElicitation(event.payload);
+  });
+
+  await listen<string>("mcp-elicitation-resolved", (event) => {
+    handleMcpElicitationResolvedEvent(event.payload);
+  });
+
   await listen<JobSummary>("job-updated", (event) => {
     updateJobIncremental(currentSnapshot, event.payload, renderSnapshot);
   });
 
-  await listen<string>("agent-step", (event) => {
-    $("agent-run-status").textContent = event.payload;
+  await listen<AgentStepV2Payload>("agent-step-v2", (event) => {
+    updateAgentStepStatusV2(event.payload);
   });
 
-  await listen<string>("agent-thought-chunk", (event) => {
-    appendAgentThoughtChunk(event.payload);
+  await listen<AgentThoughtV2Payload>("agent-thought-v2", (event) => {
+    appendAgentThoughtChunkV2(event.payload);
   });
 
-  await listen<string>("agent-text-chunk", (event) => {
-    appendAgentTextChunk(event.payload);
+  await listen<AgentChunkV2Payload>("agent-chunk-v2", (event) => {
+    appendAgentTextChunkV2(event.payload);
+  });
+
+  await listen<ArtifactDocument>("artifact-updated", (event) => {
+    handleArtifactUpdatedEvent(event.payload);
+  });
+
+  await listen<AgentRunSummary[]>("agent-runs-updated", (event) => {
+    renderRunsStrip(event.payload);
+    renderRunsTab(event.payload);
+  });
+
+  await listen<HooksStatusSummary>("hooks-trust-required", (event) => {
+    const hooksBtn = $("btn-hooks-trust") as HTMLButtonElement;
+    hooksBtn.hidden = false;
+    hooksBtn.textContent = event.payload.hash_changed ? "Hooks: Changed" : "Hooks: Untrusted";
+    setToast(
+      `Hooks @${event.payload.workspace_alias} belum di-trust. Klik tombol Hooks untuk inspeksi.`,
+      "warn"
+    );
   });
 
   await refreshDashboard();

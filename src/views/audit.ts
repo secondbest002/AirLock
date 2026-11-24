@@ -18,7 +18,7 @@ function matchesAuditFilter(entry: AuditEntry): boolean {
   }
   const q = auditSearchQuery.trim().toLowerCase();
   if (!q) return true;
-  const hay = `${entry.tool_name} ${entry.source} ${entry.target_path ?? ""} ${entry.summary}`.toLowerCase();
+  const hay = `${entry.tool_name} ${entry.source} ${entry.workspace_alias ?? ""} ${entry.target_path ?? ""} ${entry.summary}`.toLowerCase();
   return hay.includes(q);
 }
 
@@ -57,11 +57,22 @@ function buildAuditItem(
   summary.textContent = entry.target_path ? `${entry.target_path} — ${entry.summary}` : entry.summary;
 
   btn.append(top, summary);
-  if (entry.group_id) {
-    const pill = document.createElement("span");
-    pill.className = "group-pill";
-    pill.textContent = entry.group_id;
-    btn.appendChild(pill);
+  if (entry.workspace_alias || entry.group_id) {
+    const pillsRow = document.createElement("div");
+    pillsRow.className = "audit-pills-row";
+    if (entry.workspace_alias) {
+      const wsPill = document.createElement("span");
+      wsPill.className = "audit-ws-pill";
+      wsPill.textContent = `@${entry.workspace_alias}`;
+      pillsRow.appendChild(wsPill);
+    }
+    if (entry.group_id) {
+      const pill = document.createElement("span");
+      pill.className = "group-pill";
+      pill.textContent = entry.group_id;
+      pillsRow.appendChild(pill);
+    }
+    btn.appendChild(pillsRow);
   }
   return btn;
 }
@@ -93,10 +104,11 @@ export function renderDiffInspector(entry: AuditEntry | null): void {
     return;
   }
 
+  const wsPrefix = entry.workspace_alias ? `@${entry.workspace_alias} · ` : "";
   titleEl.textContent = entry.target_path
     ? `${entry.tool_name}: ${entry.target_path}`
     : entry.tool_name;
-  metaEl.textContent = `${entry.timestamp} · ${entry.summary} · Hemat ~${entry.tokens_saved} token`;
+  metaEl.textContent = `${wsPrefix}${entry.timestamp} · ${entry.summary} · Hemat ~${entry.tokens_saved} token`;
   revertBtn.disabled = !(entry.can_revert && !entry.reverted);
 
   if (entry.group_id) {
@@ -324,8 +336,15 @@ export function initAuditView(
     const snap = getSnap();
     const selected = snap?.audit_logs.find((e) => e.id === selectedAuditId) ?? null;
     const relPath = selected?.target_path ?? null;
+    const workspaceAlias = selected?.workspace_alias ?? null;
+    const workspaceRoot = selected?.workspace_root ?? null;
     try {
-      const msg = await invoke<string>("open_in_editor", { relPath, mode });
+      const msg = await invoke<string>("open_in_editor", {
+        relPath,
+        mode,
+        workspaceAlias,
+        workspaceRoot,
+      });
       setToast(msg);
     } catch (err) {
       setToast(String(err));

@@ -7,6 +7,7 @@ import type {
   DownstreamMcpSummary,
   HttpTrafficEntry,
   JobSummary,
+  LspServerSummary,
   OAuthClientSummary,
 } from "../types";
 import {
@@ -18,13 +19,34 @@ import {
 } from "./modals";
 
 const SIM_DEFAULTS: Record<string, string> = {
+  list_workspaces: JSON.stringify({}, null, 2),
   project_overview: JSON.stringify({}, null, 2),
   smart_search: JSON.stringify({ query: "fn main", max_results: 20 }, null, 2),
   read_file_range: JSON.stringify({ path: "package.json", start_line: 1, end_line: 40 }, null, 2),
+  batch_inspect: JSON.stringify(
+    {
+      include_overview: true,
+      overview_depth: 2,
+      outline_paths: ["src/main.ts"],
+      searches: [{ query: "renderSnapshot", max_results: 10 }],
+    },
+    null,
+    2
+  ),
   surgical_edit: JSON.stringify(
     {
       path: "README.md",
       edits: [{ search: "old text", replace: "new text" }],
+    },
+    null,
+    2
+  ),
+  multi_surgical_edit: JSON.stringify(
+    {
+      files: [
+        { path: "README.md", edits: [{ search: "old", replace: "new" }] },
+        { path: "notes/a.txt", edits: [{ search: "v1", replace: "v2" }] },
+      ],
     },
     null,
     2
@@ -49,11 +71,42 @@ const SIM_DEFAULTS: Record<string, string> = {
   ),
   find_files: JSON.stringify({ pattern: "*.rs", max_results: 40 }, null, 2),
   code_outline: JSON.stringify({ path: "src/main.ts", max_symbols: 80 }, null, 2),
+  read_symbol: JSON.stringify({ path: "src/main.ts", symbol: "init", include_docs: true }, null, 2),
+  lsp_diagnostics: JSON.stringify({ path: "src/main.ts", severity: "all" }, null, 2),
+  lsp_definition: JSON.stringify({ path: "src/main.ts", line: 1, character: 1 }, null, 2),
+  lsp_references: JSON.stringify({ path: "src/main.ts", line: 1, character: 1, max_results: 20 }, null, 2),
+  lsp_hover: JSON.stringify({ path: "src/main.ts", line: 1, character: 1 }, null, 2),
   git_ops: JSON.stringify({ op: "status" }, null, 2),
   file_ops: JSON.stringify({ action: "mkdir", path: "notes/tmp" }, null, 2),
   start_command_job: JSON.stringify({ command: "npm run build", label: "Frontend Build" }, null, 2),
   poll_command_job: JSON.stringify({ job_id: "job-..." }, null, 2),
   stop_command_job: JSON.stringify({ job_id: "job-..." }, null, 2),
+  list_skills: JSON.stringify({}, null, 2),
+  load_skill: JSON.stringify({ name: "tauri-security-audit" }, null, 2),
+  read_skill_resource: JSON.stringify(
+    { name: "tauri-security-audit", path: "references/checklist.md" },
+    null,
+    2
+  ),
+  upsert_artifact: JSON.stringify(
+    {
+      kind: "implementation_plan",
+      title: "Architecture Plan",
+      content_md: "# Plan\n1. Inspect codebase\n2. Implement fix\n",
+    },
+    null,
+    2
+  ),
+  request_plan_approval: JSON.stringify(
+    { summary: "Ready for review and approval" },
+    null,
+    2
+  ),
+  spawn_subagent: JSON.stringify(
+    { goal: "Inspect security boundaries and error handling", max_steps: 4 },
+    null,
+    2
+  ),
 };
 
 let secretsVisible = false;
@@ -317,7 +370,24 @@ function renderBackgroundJobs(
 
     const tdCmd = document.createElement("td");
     tdCmd.className = "mono-cell";
-    tdCmd.textContent = job.label ? `${job.label} (${job.command})` : job.command;
+    const cmdText = job.label ? `${job.label} (${job.command})` : job.command;
+    if (job.mcp_task_id) {
+      const taskBadge = document.createElement("span");
+      taskBadge.className = "badge badge-info mcp-task-badge";
+      taskBadge.textContent = "MCP Task";
+      taskBadge.title = `MCP Task: ${job.mcp_task_id}`;
+      tdCmd.appendChild(taskBadge);
+      tdCmd.appendChild(document.createTextNode(" "));
+    }
+    if (job.workspace_alias) {
+      const wsPill = document.createElement("span");
+      wsPill.className = "audit-ws-pill";
+      wsPill.textContent = `@${job.workspace_alias}`;
+      tdCmd.appendChild(wsPill);
+      tdCmd.appendChild(document.createTextNode(` ${cmdText}`));
+    } else {
+      tdCmd.appendChild(document.createTextNode(cmdText));
+    }
 
     const tdStatus = document.createElement("td");
     const badge = document.createElement("span");
@@ -370,6 +440,69 @@ function renderBackgroundJobs(
   }
 }
 
+function renderActiveLspServers(
+  servers: LspServerSummary[],
+  onSnapshot: (snap: DashboardSnapshot) => void
+): void {
+  const host = $("lsp-servers-list");
+  host.replaceChildren();
+  const stopAllBtn = $("btn-stop-all-lsp") as HTMLButtonElement;
+  stopAllBtn.disabled = servers.length === 0;
+
+  if (servers.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "traffic-empty";
+    empty.textContent = "Belum ada LSP server aktif (lazy spawn saat tool lsp_* dipanggil).";
+    host.appendChild(empty);
+    return;
+  }
+
+  for (const srv of servers) {
+    const chip = document.createElement("div");
+    chip.className = "lsp-chip-card";
+
+    const main = document.createElement("div");
+    main.className = "lsp-chip-main";
+
+    const wsPill = document.createElement("span");
+    wsPill.className = "audit-ws-pill";
+    wsPill.textContent = `@${srv.workspace_alias}`;
+
+    const langCode = document.createElement("code");
+    langCode.className = "md-inline-code";
+    langCode.textContent = `${srv.lang_id} (${srv.command})`;
+
+    const statusBadge = document.createElement("span");
+    statusBadge.className = `badge ${srv.status === "indexing" ? "badge-warn" : "badge-ok"}`;
+    statusBadge.textContent = srv.status;
+
+    main.append(wsPill, langCode, statusBadge);
+
+    const meta = document.createElement("div");
+    meta.className = "lsp-chip-meta mono-muted";
+    meta.textContent = `idle ${srv.idle_secs}s · ${srv.open_docs_count} docs · ${srv.diagnostics_count} diags`;
+
+    const stopBtn = document.createElement("button");
+    stopBtn.type = "button";
+    stopBtn.className = "btn btn-danger btn-xs";
+    stopBtn.textContent = "Stop LSP";
+    stopBtn.addEventListener("click", async () => {
+      stopBtn.disabled = true;
+      try {
+        const snap = await invoke<DashboardSnapshot>("stop_lsp_server", { key: srv.key });
+        onSnapshot(snap);
+        setToast(`LSP '${srv.lang_id}' (@${srv.workspace_alias}) dihentikan.`);
+      } catch (err) {
+        setToast(`Gagal menghentikan LSP: ${String(err)}`);
+        stopBtn.disabled = false;
+      }
+    });
+
+    chip.append(main, meta, stopBtn);
+    host.appendChild(chip);
+  }
+}
+
 export function updateJobIncremental(
   snap: DashboardSnapshot | null,
   job: JobSummary,
@@ -409,6 +542,13 @@ function renderDownstreamMcps(
     const nameTitle = document.createElement("div");
     nameTitle.className = "client-name";
     nameTitle.textContent = srv.name;
+    if (srv.plugin_id) {
+      const plgBadge = document.createElement("span");
+      plgBadge.className = "plugin-managed-pill";
+      plgBadge.textContent = "Plugin";
+      nameTitle.appendChild(document.createTextNode(" "));
+      nameTitle.appendChild(plgBadge);
+    }
     tdName.appendChild(nameTitle);
     const endpointSub = document.createElement("div");
     endpointSub.className = "client-sub";
@@ -471,15 +611,20 @@ function renderDownstreamMcps(
     delBtn.type = "button";
     delBtn.className = "btn btn-danger btn-xs";
     delBtn.textContent = "Remove";
-    delBtn.addEventListener("click", async () => {
-      try {
-        const next = await invoke<DashboardSnapshot>("remove_downstream_mcp", { id: srv.id });
-        onSnapshot(next);
-        setToast(`Server '${srv.name}' dihapus.`);
-      } catch (err) {
-        setToast(`Remove gagal: ${String(err)}`);
-      }
-    });
+    if (srv.plugin_id) {
+      delBtn.disabled = true;
+      delBtn.title = "Dikelola oleh plugin — hapus lewat panel Plugins";
+    } else {
+      delBtn.addEventListener("click", async () => {
+        try {
+          const next = await invoke<DashboardSnapshot>("remove_downstream_mcp", { id: srv.id });
+          onSnapshot(next);
+          setToast(`Server '${srv.name}' dihapus.`);
+        } catch (err) {
+          setToast(`Remove gagal: ${String(err)}`);
+        }
+      });
+    }
 
     actWrap.append(refBtn, delBtn);
     tdAct.appendChild(actWrap);
@@ -492,6 +637,19 @@ export function renderBridgeView(
   snap: DashboardSnapshot,
   onSnapshot: (snap: DashboardSnapshot) => void
 ): void {
+  const hubSub = document.getElementById("hub-tools-subtitle");
+  if (hubSub) {
+    const nsCode = document.createElement("code");
+    nsCode.className = "md-inline-code";
+    nsCode.textContent = "namespace__tool";
+    hubSub.replaceChildren(
+      document.createTextNode("Gabungkan downstream MCP servers ("),
+      nsCode,
+      document.createTextNode(
+        `), kelola Agent Plugins & Skills, dan uji ${snap.builtin_tools_count ?? 20} tool hemat token.`
+      )
+    );
+  }
   $("local-mcp-url").textContent = `http://127.0.0.1:${snap.server_port}/mcp`;
 
   const portInput = $("server-port-input") as HTMLInputElement;
@@ -535,6 +693,7 @@ export function renderBridgeView(
   ($("toggle-sensitive-guard") as HTMLInputElement).checked = !snap.allow_sensitive_reads;
 
   renderOAuthClients(snap.oauth_clients ?? [], onSnapshot);
+  renderActiveLspServers(snap.active_lsp_servers ?? [], onSnapshot);
   renderBackgroundJobs(snap.background_jobs ?? [], onSnapshot);
   renderDownstreamMcps(snap.downstream_mcps ?? [], onSnapshot);
   renderHttpTraffic(snap.http_traffic ?? []);
@@ -755,6 +914,16 @@ export function initBridgeView(
       setToast("Daftar background job yang selesai dibersihkan.");
     } catch (err) {
       setToast(`Gagal membersihkan job: ${String(err)}`);
+    }
+  });
+
+  $("btn-stop-all-lsp").addEventListener("click", async () => {
+    try {
+      const snap = await invoke<DashboardSnapshot>("stop_lsp_server", { key: null });
+      onSnapshot(snap);
+      setToast("Seluruh LSP server aktif telah dihentikan.");
+    } catch (err) {
+      setToast(`Gagal menghentikan LSP servers: ${String(err)}`);
     }
   });
 

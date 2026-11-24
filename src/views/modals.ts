@@ -6,16 +6,30 @@ import type {
   DashboardSnapshot,
   DiagnosticReport,
   DownstreamMcpConfigInput,
+  ElicitationAction,
+  HooksStatusSummary,
   HttpTrafficEntry,
   JobSummary,
+  PendingElicitation,
   PendingOAuthInfo,
   PendingToolApproval,
 } from "../types";
+
+interface ElicitationFieldBinding {
+  key: string;
+  focusTarget: HTMLElement;
+  validate: (forceShow: boolean) => boolean;
+  readValue: () => { present: boolean; value: unknown };
+}
 
 let activeOAuthRequestId: string | null = null;
 const pendingOAuthQueue: PendingOAuthInfo[] = [];
 let activeToolRequestId: string | null = null;
 const pendingToolQueue: PendingToolApproval[] = [];
+let activeElicitationRequestId: string | null = null;
+const pendingElicitationQueue: PendingElicitation[] = [];
+let activeElicitationBindings: ElicitationFieldBinding[] = [];
+let elicitationSubmitting = false;
 let activeLogJobId: string | null = null;
 let pendingForceRevertAuditId: string | null = null;
 let revertConflictConfirmHandler: ((auditId: string) => Promise<void>) | null = null;
@@ -180,6 +194,535 @@ async function submitToolDecision(
   showNextToolApproval();
 }
 
+function isPlainRecord(val: unknown): val is Record<string, unknown> {
+  return typeof val === "object" && val !== null && !Array.isArray(val);
+}
+
+function parseEnumChoices(
+  prop: Record<string, unknown>
+): Array<{ value: string | number; label: string }> {
+  if (Array.isArray(prop.enum)) {
+    const names = Array.isArray(prop.enumNames) ? prop.enumNames : [];
+    const out: Array<{ value: string | number; label: string }> = [];
+    prop.enum.forEach((item, idx) => {
+      if (typeof item === "string" || typeof item === "number") {
+        const lbl = typeof names[idx] === "string" ? String(names[idx]) : String(item);
+        out.push({ value: item, label: lbl });
+      }
+    });
+    return out;
+  }
+  if (Array.isArray(prop.oneOf)) {
+    const out: Array<{ value: string | number; label: string }> = [];
+    for (const item of prop.oneOf) {
+      if (isPlainRecord(item) && (typeof item.const === "string" || typeof item.const === "number")) {
+        const lbl = typeof item.title === "string" ? item.title : String(item.const);
+        out.push({ value: item.const, label: lbl });
+      }
+    }
+    return out;
+  }
+  return [];
+}
+
+function syncFieldDescribedBy(
+  control: HTMLElement,
+  descId: string,
+  errId: string,
+  showError: boolean
+): void {
+  const tokens = [descId, showError ? errId : ""].filter(Boolean);
+  if (tokens.length > 0) {
+    control.setAttribute("aria-describedby", tokens.join(" "));
+  } else {
+    control.removeAttribute("aria-describedby");
+  }
+}
+
+function renderElicitationFields(
+  container: HTMLElement,
+  schema: Record<string, unknown> | null
+): ElicitationFieldBinding[] {
+  container.replaceChildren();
+  const bindings: ElicitationFieldBinding[] = [];
+
+  const properties = schema && isPlainRecord(schema.properties) ? schema.properties : {};
+  const requiredSet = new Set(
+    schema && Array.isArray(schema.required)
+      ? schema.required.filter((x): x is string => typeof x === "string")
+      : []
+  );
+
+  const entries = Object.entries(properties);
+  if (entries.length === 0) {
+    const note = document.createElement("p");
+    note.className = "mono-muted";
+    note.textContent =
+      "Server tidak meminta field form tambahan. Tekan Submit untuk menyetujui, Decline untuk menolak, atau Cancel untuk membatalkan.";
+    container.appendChild(note);
+    return bindings;
+  }
+
+  entries.forEach(([key, rawProp], idx) => {
+    const prop = isPlainRecord(rawProp) ? rawProp : {};
+    const slug = `${key.replace(/[^a-zA-Z0-9_-]/g, "_")}_${idx}`;
+    const errId = `elic-err-${slug}`;
+    const descId = typeof prop.description === "string" && prop.description.trim() ? `elic-desc-${slug}` : "";
+    const title = typeof prop.title === "string" && prop.title.trim() ? prop.title.trim() : key;
+    const isRequired = requiredSet.has(key);
+    const labelText = isRequired ? `${title} *` : title;
+    const rawType = typeof prop.type === "string" ? prop.type : "string";
+    const choices = parseEnumChoices(prop);
+
+    const errEl = document.createElement("p");
+    errEl.id = errId;
+    errEl.className = "elic-field-error";
+    errEl.hidden = true;
+
+    const appendDesc = (parent: HTMLElement): void => {
+      if (!descId) return;
+      const descEl = document.createElement("p");
+      descEl.id = descId;
+      descEl.className = "elic-field-desc";
+      descEl.textContent = String(prop.description).trim();
+      parent.appendChild(descEl);
+    };
+
+    if (rawType === "boolean") {
+      const wrap = document.createElement("div");
+      wrap.className = "elic-field";
+
+      const row = document.createElement("div");
+      row.className = "elic-check-row";
+
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.id = `elic-in-${slug}`;
+      checkbox.name = key;
+      checkbox.checked = prop.default === true;
+      checkbox.required = prop.const === true;
+      checkbox.setAttribute("aria-invalid", "false");
+      if (descId) checkbox.setAttribute("aria-describedby", descId);
+
+      const label = document.createElement("label");
+      label.htmlFor = checkbox.id;
+      label.textContent = prop.const === true ? `${title} *` : title;
+
+      // Label placed inline immediately after checkbox control per accessible forms guidance.
+      row.append(checkbox, label);
+      wrap.appendChild(row);
+      appendDesc(wrap);
+      wrap.appendChild(errEl);
+      container.appendChild(wrap);
+
+      let interacted = false;
+      let validatedOnce = false;
+      const validate = (forceShow: boolean): boolean => {
+        if (!forceShow && !interacted && !validatedOnce) return true;
+        validatedOnce = true;
+        checkbox.setCustomValidity("");
+        if (prop.const === true && !checkbox.checked) {
+          checkbox.setCustomValidity("Opsi ini wajib dicentang sebelum melanjutkan.");
+        }
+        const ok = checkbox.checkValidity();
+        checkbox.setAttribute("aria-invalid", ok ? "false" : "true");
+        checkbox.classList.toggle("user-invalid-fallback", !ok);
+        errEl.hidden = ok;
+        errEl.textContent = ok ? "" : checkbox.validationMessage;
+        syncFieldDescribedBy(checkbox, descId, errId, !ok);
+        return ok;
+      };
+
+      checkbox.addEventListener("change", () => {
+        interacted = true;
+        if (validatedOnce) validate(false);
+      });
+      checkbox.addEventListener("blur", () => {
+        if (interacted) validate(false);
+      });
+
+      bindings.push({
+        key,
+        focusTarget: checkbox,
+        validate,
+        readValue: () => ({ present: true, value: checkbox.checked }),
+      });
+      return;
+    }
+
+    if (choices.length >= 2 && choices.length <= 5) {
+      const fieldset = document.createElement("fieldset");
+      fieldset.className = "elic-field elic-radio-group";
+      fieldset.setAttribute("aria-invalid", "false");
+      if (descId) fieldset.setAttribute("aria-describedby", descId);
+
+      const legend = document.createElement("legend");
+      legend.textContent = labelText;
+      fieldset.appendChild(legend);
+      appendDesc(fieldset);
+
+      const groupName = `elic_radio_${slug}`;
+      const radios: HTMLInputElement[] = [];
+
+      choices.forEach((choice, cIdx) => {
+        const row = document.createElement("div");
+        row.className = "elic-radio-row";
+
+        const radio = document.createElement("input");
+        radio.type = "radio";
+        radio.id = `elic-in-${slug}-${cIdx}`;
+        radio.name = groupName;
+        radio.value = String(choice.value);
+        if (cIdx === 0 && isRequired) {
+          radio.required = true;
+        }
+        if (prop.default !== undefined && String(prop.default) === String(choice.value)) {
+          radio.checked = true;
+        }
+        radio.setAttribute("aria-invalid", "false");
+
+        const label = document.createElement("label");
+        label.htmlFor = radio.id;
+        label.textContent = choice.label;
+
+        // Label placed inline immediately after radio input for alignment and click target clarity.
+        row.append(radio, label);
+        fieldset.appendChild(row);
+        radios.push(radio);
+      });
+
+      fieldset.appendChild(errEl);
+      container.appendChild(fieldset);
+
+      let interacted = false;
+      let validatedOnce = false;
+      const validate = (forceShow: boolean): boolean => {
+        if (!forceShow && !interacted && !validatedOnce) return true;
+        validatedOnce = true;
+        const selected = radios.find((r) => r.checked);
+        const ok = !isRequired || Boolean(selected);
+        fieldset.setAttribute("aria-invalid", ok ? "false" : "true");
+        fieldset.classList.toggle("user-invalid-fallback", !ok);
+        radios.forEach((r) => r.setAttribute("aria-invalid", ok ? "false" : "true"));
+        errEl.hidden = ok;
+        errEl.textContent = ok ? "" : `Pilih salah satu opsi untuk ${title}.`;
+        syncFieldDescribedBy(fieldset, descId, errId, !ok);
+        return ok;
+      };
+
+      radios.forEach((r) => {
+        r.addEventListener("change", () => {
+          interacted = true;
+          if (validatedOnce) validate(false);
+        });
+      });
+      fieldset.addEventListener("focusout", (e) => {
+        const nextFocus = e.relatedTarget as Node | null;
+        if (!fieldset.contains(nextFocus) && interacted) {
+          validate(false);
+        }
+      });
+
+      bindings.push({
+        key,
+        focusTarget: radios[0],
+        validate,
+        readValue: () => {
+          const picked = radios.find((r) => r.checked);
+          if (!picked) return { present: false, value: undefined };
+          const matched = choices.find((c) => String(c.value) === picked.value);
+          return { present: true, value: matched ? matched.value : picked.value };
+        },
+      });
+      return;
+    }
+
+    if (choices.length > 0) {
+      const wrap = document.createElement("div");
+      wrap.className = "form-group elic-field";
+
+      const label = document.createElement("label");
+      label.htmlFor = `elic-in-${slug}`;
+      label.textContent = labelText;
+
+      const select = document.createElement("select");
+      select.id = `elic-in-${slug}`;
+      select.className = "mono-select";
+      select.required = isRequired;
+      select.setAttribute("aria-invalid", "false");
+      if (descId) select.setAttribute("aria-describedby", descId);
+
+      const placeholderOpt = document.createElement("option");
+      placeholderOpt.value = "";
+      placeholderOpt.textContent = isRequired ? "-- Pilih opsi (wajib) --" : "-- Opsional --";
+      select.appendChild(placeholderOpt);
+
+      choices.forEach((choice) => {
+        const opt = document.createElement("option");
+        opt.value = String(choice.value);
+        opt.textContent = choice.label;
+        if (prop.default !== undefined && String(prop.default) === String(choice.value)) {
+          opt.selected = true;
+        }
+        select.appendChild(opt);
+      });
+
+      wrap.append(label, select);
+      appendDesc(wrap);
+      wrap.appendChild(errEl);
+      container.appendChild(wrap);
+
+      let interacted = false;
+      let validatedOnce = false;
+      const validate = (forceShow: boolean): boolean => {
+        if (!forceShow && !interacted && !validatedOnce) return true;
+        validatedOnce = true;
+        select.setCustomValidity("");
+        const ok = select.checkValidity();
+        select.setAttribute("aria-invalid", ok ? "false" : "true");
+        select.classList.toggle("user-invalid-fallback", !ok);
+        errEl.hidden = ok;
+        errEl.textContent = ok ? "" : select.validationMessage || `Pilih nilai untuk ${title}.`;
+        syncFieldDescribedBy(select, descId, errId, !ok);
+        return ok;
+      };
+
+      select.addEventListener("change", () => {
+        interacted = true;
+        if (validatedOnce) validate(false);
+      });
+      select.addEventListener("blur", () => {
+        if (interacted) validate(false);
+      });
+
+      bindings.push({
+        key,
+        focusTarget: select,
+        validate,
+        readValue: () => {
+          if (!select.value) return { present: false, value: undefined };
+          const matched = choices.find((c) => String(c.value) === select.value);
+          return { present: true, value: matched ? matched.value : select.value };
+        },
+      });
+      return;
+    }
+
+    const wrap = document.createElement("div");
+    wrap.className = "form-group elic-field";
+
+    const label = document.createElement("label");
+    label.htmlFor = `elic-in-${slug}`;
+    label.textContent = labelText;
+
+    const input = document.createElement("input");
+    input.id = `elic-in-${slug}`;
+    input.className = "mono-input";
+    input.required = isRequired;
+    input.setAttribute("aria-invalid", "false");
+    if (descId) input.setAttribute("aria-describedby", descId);
+
+    if (rawType === "integer" || rawType === "number") {
+      input.type = "number";
+      input.step = rawType === "integer" ? "1" : "any";
+      if (typeof prop.minimum === "number") input.min = String(prop.minimum);
+      if (typeof prop.maximum === "number") input.max = String(prop.maximum);
+      if (typeof prop.default === "number") input.value = String(prop.default);
+    } else {
+      const fmt = typeof prop.format === "string" ? prop.format : "";
+      input.type = fmt === "email" ? "email" : fmt === "uri" || fmt === "url" ? "url" : fmt === "date" ? "date" : "text";
+      if (typeof prop.minLength === "number") input.minLength = prop.minLength;
+      if (typeof prop.maxLength === "number") input.maxLength = prop.maxLength;
+      if (typeof prop.pattern === "string") input.pattern = prop.pattern;
+      if (typeof prop.default === "string") input.value = prop.default;
+      input.spellcheck = false;
+    }
+
+    wrap.append(label, input);
+    appendDesc(wrap);
+    wrap.appendChild(errEl);
+    container.appendChild(wrap);
+
+    let interacted = false;
+    let validatedOnce = false;
+    const validate = (forceShow: boolean): boolean => {
+      if (!forceShow && !interacted && !validatedOnce) return true;
+      validatedOnce = true;
+      input.setCustomValidity("");
+      const trimmed = input.value.trim();
+      if (rawType === "integer" && trimmed !== "") {
+        const parsed = Number(trimmed);
+        if (!Number.isInteger(parsed)) {
+          input.setCustomValidity("Masukkan bilangan bulat (integer) yang valid.");
+        }
+      }
+      if (rawType === "string" && isRequired && trimmed === "" && input.value.length > 0) {
+        input.setCustomValidity("Field ini tidak boleh hanya berisi spasi.");
+      }
+      const ok = input.checkValidity();
+      input.setAttribute("aria-invalid", ok ? "false" : "true");
+      input.classList.toggle("user-invalid-fallback", !ok);
+      errEl.hidden = ok;
+      errEl.textContent = ok ? "" : input.validationMessage || "Nilai tidak valid.";
+      syncFieldDescribedBy(input, descId, errId, !ok);
+      return ok;
+    };
+
+    input.addEventListener("input", () => {
+      interacted = true;
+      if (validatedOnce) validate(false);
+    });
+    input.addEventListener("blur", () => {
+      if (interacted) validate(false);
+    });
+
+    bindings.push({
+      key,
+      focusTarget: input,
+      validate,
+      readValue: () => {
+        if (rawType === "integer" || rawType === "number") {
+          const raw = input.value.trim();
+          if (raw === "") return { present: false, value: undefined };
+          return { present: true, value: Number(raw) };
+        }
+        const val = input.value;
+        if (!isRequired && val === "") return { present: false, value: undefined };
+        return { present: true, value: val };
+      },
+    });
+  });
+
+  return bindings;
+}
+
+export function enqueueMcpElicitation(info: PendingElicitation): void {
+  if (
+    activeElicitationRequestId === info.request_id ||
+    pendingElicitationQueue.some((q) => q.request_id === info.request_id)
+  ) {
+    return;
+  }
+  pendingElicitationQueue.push(info);
+  if (!activeElicitationRequestId) {
+    showNextMcpElicitation();
+  }
+}
+
+export function handleMcpElicitationResolvedEvent(resolvedId: string): void {
+  const idx = pendingElicitationQueue.findIndex((q) => q.request_id === resolvedId);
+  if (idx !== -1) {
+    pendingElicitationQueue.splice(idx, 1);
+  }
+  if (activeElicitationRequestId === resolvedId) {
+    activeElicitationRequestId = null;
+    activeElicitationBindings = [];
+    const dialog = $("mcp-elicitation-dialog") as HTMLDialogElement;
+    if (dialog.open) {
+      dialog.close();
+    }
+    showNextMcpElicitation();
+  }
+}
+
+function showNextMcpElicitation(): void {
+  const dialog = $("mcp-elicitation-dialog") as HTMLDialogElement;
+  if (activeElicitationRequestId || pendingElicitationQueue.length === 0) {
+    return;
+  }
+  const next = pendingElicitationQueue.shift()!;
+  activeElicitationRequestId = next.request_id;
+  $("mcp-elic-server").textContent = `${next.server_name} (${next.server_id})`;
+  $("mcp-elic-req-id").textContent = next.request_id;
+  $("mcp-elic-message").textContent = next.message;
+  activeElicitationBindings = renderElicitationFields($("mcp-elic-fields"), next.requested_schema);
+
+  if (!dialog.open) {
+    dialog.showModal();
+  }
+  if (activeElicitationBindings.length > 0) {
+    activeElicitationBindings[0].focusTarget.focus();
+  }
+}
+
+async function submitElicitationDecision(
+  action: ElicitationAction,
+  onSnapshot: (snap: DashboardSnapshot) => void
+): Promise<void> {
+  if (elicitationSubmitting || !activeElicitationRequestId) return;
+
+  let content: Record<string, unknown> | null = null;
+  if (action === "accept") {
+    let firstInvalid: ElicitationFieldBinding | null = null;
+    for (const binding of activeElicitationBindings) {
+      const ok = binding.validate(true);
+      if (!ok && !firstInvalid) {
+        firstInvalid = binding;
+      }
+    }
+    if (firstInvalid) {
+      firstInvalid.focusTarget.focus();
+      return;
+    }
+    content = {};
+    for (const binding of activeElicitationBindings) {
+      const res = binding.readValue();
+      if (res.present) {
+        content[binding.key] = res.value;
+      }
+    }
+  }
+
+  const reqId = activeElicitationRequestId;
+  const dialog = $("mcp-elicitation-dialog") as HTMLDialogElement;
+  const acceptBtn = $("btn-elic-accept") as HTMLButtonElement;
+  const declineBtn = $("btn-elic-decline") as HTMLButtonElement;
+  const cancelBtn = $("btn-elic-cancel") as HTMLButtonElement;
+
+  elicitationSubmitting = true;
+  acceptBtn.disabled = true;
+  declineBtn.disabled = true;
+  cancelBtn.disabled = true;
+
+  try {
+    const snap = await invoke<DashboardSnapshot>("resolve_mcp_elicitation", {
+      requestId: reqId,
+      action,
+      content,
+    });
+    activeElicitationRequestId = null;
+    activeElicitationBindings = [];
+    if (dialog.open) {
+      dialog.close();
+    }
+    onSnapshot(snap);
+    const toastMsg =
+      action === "accept"
+        ? "Input MCP Elicitation dikirim ke downstream server."
+        : action === "decline"
+          ? "Permintaan MCP Elicitation ditolak (Decline)."
+          : "Permintaan MCP Elicitation dibatalkan (Cancel).";
+    setToast(toastMsg);
+    showNextMcpElicitation();
+  } catch (err) {
+    const msg = String(err);
+    setToast(`MCP Elicitation: ${msg}`, "warn");
+    if (msg.includes("kadaluarsa") || msg.includes("tidak ditemukan")) {
+      activeElicitationRequestId = null;
+      activeElicitationBindings = [];
+      if (dialog.open) {
+        dialog.close();
+      }
+      showNextMcpElicitation();
+    }
+  } finally {
+    elicitationSubmitting = false;
+    acceptBtn.disabled = false;
+    declineBtn.disabled = false;
+    cancelBtn.disabled = false;
+  }
+}
+
 export function openRevertConflictModal(
   auditId: string,
   message: string,
@@ -225,6 +768,79 @@ export function openPresetPreviewModal(
   renderPresetContent();
 
   ($("preset-preview-dialog") as HTMLDialogElement).showModal();
+}
+
+let pendingHooksTrustStatus: HooksStatusSummary | null = null;
+let hooksTrustOnSnapshot: ((snap: DashboardSnapshot) => void) | null = null;
+
+export function openHooksTrustModal(
+  status: HooksStatusSummary,
+  onSnapshot: (snap: DashboardSnapshot) => void
+): void {
+  pendingHooksTrustStatus = status;
+  hooksTrustOnSnapshot = onSnapshot;
+  const dialog = $("hooks-trust-dialog") as HTMLDialogElement;
+
+  $("hooks-trust-meta").textContent =
+    `Workspace @${status.workspace_alias} memiliki konfigurasi .airlock/hooks.json (${status.hooks.length} hook).`;
+  $("hooks-trust-path").textContent = status.workspace_path;
+  $("hooks-trust-sha").textContent = status.current_sha256 ?? "-";
+
+  const warnBox = $("hooks-trust-warning");
+  if (status.parse_error) {
+    warnBox.hidden = false;
+    warnBox.textContent = `Format .airlock/hooks.json bermasalah: ${status.parse_error}`;
+  } else if (status.hash_changed) {
+    warnBox.hidden = false;
+    warnBox.textContent =
+      "PERINGATAN: Isi .airlock/hooks.json berubah sejak terakhir di-trust (SHA-256 mismatch). Kepercayaan sebelumnya otomatis dicabut.";
+  } else if (!status.trusted && status.hooks_file_exists) {
+    warnBox.hidden = false;
+    warnBox.textContent =
+      "Hooks workspace ini belum di-trust. Perintah shell di bawah hanya akan berjalan setelah Anda menyetujui SHA-256 digest saat ini.";
+  } else {
+    warnBox.hidden = true;
+    warnBox.textContent = "";
+  }
+
+  const list = $("hooks-trust-list");
+  if (status.hooks.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "mono-muted";
+    empty.textContent = "Tidak ada hook terdefinisi di .airlock/hooks.json.";
+    list.replaceChildren(empty);
+  } else {
+    const rows: HTMLElement[] = [];
+    for (const h of status.hooks) {
+      const card = document.createElement("div");
+      card.className = "hook-def-card";
+
+      const top = document.createElement("div");
+      top.className = "hook-def-top";
+      const idCode = document.createElement("code");
+      idCode.textContent = h.id;
+      const meta = document.createElement("span");
+      meta.className = "badge badge-muted";
+      meta.textContent = `${h.event}${h.file_glob ? ` (${h.file_glob})` : ""} · ${h.timeout_secs}s · ${h.on_failure}`;
+      top.append(idCode, meta);
+
+      const cmdPre = document.createElement("pre");
+      cmdPre.className = "mono-pre hook-cmd-pre";
+      cmdPre.textContent = h.command;
+
+      card.append(top, cmdPre);
+      rows.push(card);
+    }
+    list.replaceChildren(...rows);
+  }
+
+  const confirmBtn = $("btn-confirm-hooks-trust") as HTMLButtonElement;
+  confirmBtn.disabled = !status.current_sha256 || Boolean(status.parse_error) || status.trusted;
+  confirmBtn.textContent = status.trusted ? "Already Trusted" : "Trust & Enable Hooks";
+
+  if (!dialog.open) {
+    dialog.showModal();
+  }
 }
 
 export function openDiagnosticModal(report: DiagnosticReport): void {
@@ -456,6 +1072,25 @@ export function initModals(
     void submitToolDecision("deny", onSnapshot);
   });
 
+  const elicDialog = $("mcp-elicitation-dialog") as HTMLDialogElement;
+  const elicForm = $("mcp-elic-form") as HTMLFormElement;
+  elicForm.addEventListener("submit", (e) => {
+    e.preventDefault();
+    void submitElicitationDecision("accept", onSnapshot);
+  });
+  $("btn-elic-decline").addEventListener(
+    "click",
+    () => void submitElicitationDecision("decline", onSnapshot)
+  );
+  $("btn-elic-cancel").addEventListener(
+    "click",
+    () => void submitElicitationDecision("cancel", onSnapshot)
+  );
+  elicDialog.addEventListener("cancel", (e) => {
+    e.preventDefault();
+    void submitElicitationDecision("cancel", onSnapshot);
+  });
+
   const jobLogsDialog = $("job-logs-dialog") as HTMLDialogElement;
   $("btn-refresh-job-logs").addEventListener("click", () => void refreshActiveJobLogs());
   $("btn-copy-job-logs").addEventListener("click", () => {
@@ -557,6 +1192,40 @@ export function initModals(
       e.preventDefault();
       const target = filteredPaletteActions[selectedPaletteIdx];
       if (target) executePaletteAction(target);
+    }
+  });
+
+  const hooksDialog = $("hooks-trust-dialog") as HTMLDialogElement;
+  hooksDialog.addEventListener("cancel", (e) => {
+    e.preventDefault();
+    pendingHooksTrustStatus = null;
+    void closeTopLayer(hooksDialog);
+  });
+  $("btn-cancel-hooks-trust").addEventListener("click", () => {
+    pendingHooksTrustStatus = null;
+    void closeTopLayer(hooksDialog);
+  });
+  $("btn-confirm-hooks-trust").addEventListener("click", async () => {
+    const target = pendingHooksTrustStatus;
+    if (!target || !target.current_sha256) return;
+    const btn = $("btn-confirm-hooks-trust") as HTMLButtonElement;
+    btn.disabled = true;
+    try {
+      const nextStatus = await invoke<HooksStatusSummary>("trust_workspace_hooks", {
+        workspaceAlias: target.workspace_alias,
+        expectedSha256: target.current_sha256,
+      });
+      pendingHooksTrustStatus = null;
+      void closeTopLayer(hooksDialog);
+      if (hooksTrustOnSnapshot) {
+        const snap = await invoke<DashboardSnapshot>("get_dashboard_state");
+        hooksTrustOnSnapshot(snap);
+      }
+      setToast(`Hooks @${nextStatus.workspace_alias} di-trust & diaktifkan.`);
+    } catch (err) {
+      setToast(`Gagal memverifikasi trust hooks: ${String(err)}`, "warn");
+    } finally {
+      btn.disabled = false;
     }
   });
 }
