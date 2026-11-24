@@ -1,13 +1,28 @@
+use crate::process_util::kill_pid_tree;
 use crate::state::AppState;
 use regex::Regex;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
+
+static TRYCLOUDFLARE_URL_RE: OnceLock<Regex> = OnceLock::new();
+static TAILSCALE_URL_RE: OnceLock<Regex> = OnceLock::new();
+
+fn trycloudflare_url_regex() -> &'static Regex {
+    TRYCLOUDFLARE_URL_RE.get_or_init(|| {
+        Regex::new(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com").expect("valid tunnel regex")
+    })
+}
+
+fn tailscale_url_regex() -> &'static Regex {
+    TAILSCALE_URL_RE
+        .get_or_init(|| Regex::new(r"https://[a-zA-Z0-9.-]+\.ts\.net").expect("valid ts regex"))
+}
 
 fn find_binary(name: &str, extra_candidates: &[PathBuf]) -> Option<PathBuf> {
     if let Ok(path_var) = std::env::var("PATH") {
@@ -207,13 +222,14 @@ async fn start_tailscale_funnel(state: Arc<AppState>) -> Result<(), String> {
 }
 
 async fn start_cloudflare_named(state: Arc<AppState>) -> Result<(), String> {
-    let (token, raw_public_url) = {
-        let cfg = state.config.read().await;
-        (
-            cfg.cloudflare_tunnel_token.trim().to_string(),
-            cfg.cloudflare_public_url.clone(),
-        )
-    };
+    let token = state
+        .provider_secrets
+        .read()
+        .await
+        .cloudflare_tunnel_token
+        .trim()
+        .to_string();
+    let raw_public_url = state.config.read().await.cloudflare_public_url.clone();
 
     if token.is_empty() {
         return Err(
@@ -310,12 +326,11 @@ async fn start_cloudflare_http2(state: Arc<AppState>) -> Result<(), String> {
     state.touch_activity().await;
     state.emit_dashboard().await;
 
-    let url_re =
-        Regex::new(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com").expect("valid tunnel regex");
+    let url_re = trycloudflare_url_regex();
 
     if let Some(out) = stdout {
         let st = state.clone();
-        let re = url_re.clone();
+        let re = url_re;
         tokio::spawn(async move {
             let mut lines = BufReader::new(out).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -386,6 +401,9 @@ pub async fn stop_tunnel(state: &Arc<AppState>) {
     };
 
     if let Some(mut child) = child_opt {
+        if let Some(pid) = child.id() {
+            kill_pid_tree(pid);
+        }
         let _ = child.kill().await;
     }
 
@@ -422,7 +440,7 @@ pub async fn sync_existing_tailscale_funnel(state: Arc<AppState>) {
         return;
     }
 
-    let ts_re = Regex::new(r"https://[a-zA-Z0-9.-]+\.ts\.net").expect("valid ts regex");
+    let ts_re = tailscale_url_regex();
     if let Some(m) = ts_re.find(&stdout) {
         *state.tunnel_provider.write().await = "tailscale".to_string();
         state.tunnel_running.store(true, Ordering::SeqCst);

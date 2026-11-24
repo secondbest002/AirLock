@@ -1,5 +1,50 @@
 use regex::Regex;
+use sha2::{Digest, Sha256};
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
+use subtle::ConstantTimeEq;
+
+static ANSI_RE: OnceLock<Regex> = OnceLock::new();
+
+pub fn ansi_regex() -> &'static Regex {
+    ANSI_RE.get_or_init(|| Regex::new(r"\x1B\[[0-9;?]*[ -/]*[@-~]").expect("valid ANSI regex"))
+}
+
+pub fn secure_token_eq(a: &str, b: &str) -> bool {
+    let ha = Sha256::digest(a.as_bytes());
+    let hb = Sha256::digest(b.as_bytes());
+    bool::from(ha.as_slice().ct_eq(hb.as_slice()))
+}
+
+pub fn hash_oauth_token(raw_token: &str) -> String {
+    let digest = Sha256::digest(raw_token.as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!("sha256:{hex}")
+}
+
+pub fn is_airlock_internal_path(path: &Path) -> bool {
+    let full_slash = path.to_string_lossy().replace('\\', "/").to_lowercase();
+    if full_slash.contains("/.smart-tauri-hub/")
+        || full_slash.ends_with("/.smart-tauri-hub")
+        || full_slash == ".smart-tauri-hub"
+        || full_slash.starts_with(".smart-tauri-hub/")
+    {
+        return true;
+    }
+
+    let data_dir = crate::snapshots::default_data_dir();
+    if let Ok(canon_data_dir) = std::fs::canonicalize(&data_dir) {
+        if path.starts_with(&canon_data_dir) {
+            return true;
+        }
+        if let Ok(canon_path) = std::fs::canonicalize(path) {
+            if canon_path.starts_with(&canon_data_dir) {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 pub fn wildcard_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.to_lowercase().chars().collect();
@@ -33,12 +78,10 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
 
 /// Checks if `path` matches sensitive credential/secret file patterns.
 pub fn is_sensitive_path(path: &Path, patterns: &[String]) -> Option<String> {
-    let full_slash = path.to_string_lossy().replace('\\', "/").to_lowercase();
-    if full_slash.contains("/.smart-tauri-hub/auth.json")
-        || full_slash.ends_with(".smart-tauri-hub/auth.json")
-    {
-        return Some(".smart-tauri-hub/auth.json".to_string());
+    if is_airlock_internal_path(path) {
+        return Some(".smart-tauri-hub".to_string());
     }
+    let full_slash = path.to_string_lossy().replace('\\', "/").to_lowercase();
 
     let file_name = path
         .file_name()
@@ -226,15 +269,16 @@ pub fn validate_command(cmd: &str) -> Result<(), String> {
 /// Strips ANSI escapes and progress-bar overwrites, then compresses long outputs to save tokens.
 pub fn compress_output(stdout: &str, stderr: &str, max_lines: usize) -> (String, usize) {
     let raw_len = stdout.len() + stderr.len();
-    let ansi_re = Regex::new(r"\x1B\[[0-9;?]*[ -/]*[@-~]").expect("valid ANSI regex");
+    let ansi_re = ansi_regex();
 
     let clean_text = |input: &str| -> Vec<String> {
         let stripped = ansi_re.replace_all(input, "");
         stripped
             .split('\n')
             .map(|line| {
+                let no_crlf = line.strip_suffix('\r').unwrap_or(line);
                 // Keep only final carriage-return segment (collapses progress bar spam)
-                let final_seg = line.rsplit('\r').next().unwrap_or("");
+                let final_seg = no_crlf.rsplit('\r').next().unwrap_or("");
                 final_seg.trim_end().to_string()
             })
             .filter(|l| !l.is_empty())
@@ -386,5 +430,32 @@ mod tests {
         assert!(compressed.contains("error[E0308]: mismatched types"));
         assert!(!compressed.contains("\x1B[31m"));
         assert!(saved > 10_000, "Expected substantial byte savings, got {saved}");
+    }
+
+    #[test]
+    fn test_secure_token_eq() {
+        assert!(secure_token_eq("secret-abc-123", "secret-abc-123"));
+        assert!(secure_token_eq("", ""));
+        assert!(!secure_token_eq("secret-abc-123", "secret-abc-124"));
+        assert!(!secure_token_eq("secret-abc-123", "secret-abc"));
+        assert!(!secure_token_eq("secret-abc-123", ""));
+        assert_ne!(
+            hash_oauth_token("token-1"),
+            hash_oauth_token("token-2")
+        );
+        assert!(hash_oauth_token("token-1").starts_with("sha256:"));
+    }
+
+    #[test]
+    fn test_is_airlock_internal_path() {
+        assert!(is_airlock_internal_path(Path::new(".smart-tauri-hub/auth.json")));
+        assert!(is_airlock_internal_path(Path::new(
+            r"C:\Users\me\.smart-tauri-hub\config.json"
+        )));
+        assert!(is_airlock_internal_path(Path::new(
+            r"C:\Users\me\.smart-tauri-hub\secrets.dpapi"
+        )));
+        assert!(is_airlock_internal_path(Path::new(".smart-tauri-hub")));
+        assert!(!is_airlock_internal_path(Path::new("src/main.rs")));
     }
 }

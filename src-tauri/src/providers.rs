@@ -1,12 +1,21 @@
+use crate::agent_manager::{AgentRunStatus, RunContext};
 use crate::local_agent::{GeminiModelInfo, TokenUsage, ToolStepTrace};
 use crate::security::resolve_jailed_path;
-use crate::state::AppState;
-use crate::tools::{check_sensitive_guard, execute_tool, mcp_tools_list, ToolOutput};
+use crate::state::{AppState, TurnCheckpointInfo};
+use crate::tools::{
+    check_sensitive_guard_for_workspace, enforce_run_mode_gate, execute_tool_with_run_context,
+    is_tool_read_only, mcp_tools_list, ToolOutput,
+};
+use crate::workspace::resolve_workspace;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tauri::Emitter;
+use tokio::sync::{watch, Semaphore};
+use tokio::task::JoinSet;
 
 fn is_local_url(raw: &str) -> bool {
     let Ok(parsed) = url::Url::parse(raw.trim()) else {
@@ -23,6 +32,8 @@ pub struct AgentAttachment {
     pub kind: String, // "file" | "image"
     pub name: String,
     #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
     pub path: Option<String>,
     #[serde(default)]
     pub mime_type: Option<String>,
@@ -35,6 +46,484 @@ pub struct ProviderTurnOutcome {
     pub steps: Vec<ToolStepTrace>,
     pub usage: TokenUsage,
     pub cancelled: bool,
+    pub awaiting_approval: bool,
+    pub checkpoint: Option<TurnCheckpointInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchdogInterrupt {
+    Cancelled,
+    TurnBudgetTimeout,
+    StreamIdleTimeout,
+}
+
+impl WatchdogInterrupt {
+    pub fn reason_str(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::TurnBudgetTimeout => "turn_budget_timeout",
+            Self::StreamIdleTimeout => "stream_idle_timeout",
+        }
+    }
+
+    pub fn display_note(self, turn_budget_secs: u64, stream_idle_secs: u64) -> String {
+        match self {
+            Self::Cancelled => "Dibatalkan oleh user".to_string(),
+            Self::TurnBudgetTimeout => format!(
+                "Batas waktu giliran ({turn_budget_secs}s) tercapai — checkpoint tersimpan"
+            ),
+            Self::StreamIdleTimeout => format!(
+                "Stream idle timeout ({stream_idle_secs}s tanpa data) — checkpoint tersimpan"
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WatchdogSettings {
+    pub max_steps: usize,
+    pub turn_budget_secs: u64,
+    pub stream_idle_secs: u64,
+    pub ttfb_timeout_secs: u64,
+}
+
+pub async fn load_watchdog_settings(state: &AppState) -> WatchdogSettings {
+    let cfg = state.config.read().await;
+    WatchdogSettings {
+        max_steps: cfg.agent_max_steps.clamp(4, 30),
+        turn_budget_secs: cfg.agent_turn_timeout_secs.clamp(30, 600),
+        stream_idle_secs: cfg.stream_idle_timeout_secs.clamp(10, 120),
+        ttfb_timeout_secs: 45,
+    }
+}
+
+pub async fn await_with_watchdog<F, T>(
+    fut: F,
+    cancel_rx: &mut watch::Receiver<bool>,
+    op_timeout_secs: u64,
+    timeout_kind: WatchdogInterrupt,
+    turn_start: Instant,
+    turn_budget_secs: u64,
+) -> Result<T, WatchdogInterrupt>
+where
+    F: std::future::Future<Output = T>,
+{
+    if *cancel_rx.borrow() {
+        return Err(WatchdogInterrupt::Cancelled);
+    }
+    let remaining_budget =
+        Duration::from_secs(turn_budget_secs).saturating_sub(turn_start.elapsed());
+    if remaining_budget.is_zero() {
+        return Err(WatchdogInterrupt::TurnBudgetTimeout);
+    }
+    let op_dur = Duration::from_secs(op_timeout_secs.max(1));
+    let (limit, kind) = if remaining_budget < op_dur {
+        (remaining_budget, WatchdogInterrupt::TurnBudgetTimeout)
+    } else {
+        (op_dur, timeout_kind)
+    };
+    tokio::select! {
+        res = cancel_rx.wait_for(|&c| c) => {
+            match res {
+                Ok(_) | Err(_) => Err(WatchdogInterrupt::Cancelled),
+            }
+        }
+        _ = tokio::time::sleep(limit) => Err(kind),
+        val = fut => Ok(val),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingToolCall {
+    pub id: String,
+    pub name: String,
+    pub args: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutedToolCall {
+    pub id: String,
+    pub name: String,
+    pub output: ToolOutput,
+    pub tokens_saved: usize,
+}
+
+pub async fn is_safe_parallel_call(state: &AppState, name: &str, args: &Value) -> bool {
+    if name.contains("__") {
+        let cfgs = state.resolved_downstream_mcps().await;
+        state.mcp_hub.is_tool_read_only(&cfgs, name).await
+    } else {
+        is_tool_read_only(name, args)
+    }
+}
+
+async fn latest_tokens_saved(state: &AppState, tool_name: &str) -> usize {
+    let logs = state.audit_logs.read().await;
+    logs.iter()
+        .rev()
+        .take(24)
+        .find(|l| l.tool_name == tool_name)
+        .map(|l| l.tokens_saved)
+        .unwrap_or(0)
+}
+
+pub fn emit_stream_thought(
+    app_handle: &Option<tauri::AppHandle>,
+    run_ctx: &RunContext,
+    delta: &str,
+) {
+    if delta.is_empty() {
+        return;
+    }
+    if run_ctx.depth == 0 {
+        if let Some(tx) = &run_ctx.acp_event_tx {
+            let _ = tx.send(crate::acp_server::AcpStreamEvent::ThoughtChunk {
+                session_id: run_ctx.session_id.clone(),
+                text: delta.to_string(),
+            });
+        }
+    }
+    if let Some(app) = app_handle {
+        let _ = app.emit(
+            "agent-thought-v2",
+            json!({
+                "run_id": run_ctx.run_id,
+                "session_id": run_ctx.session_id,
+                "delta": delta
+            }),
+        );
+        if run_ctx.depth == 0 {
+            let _ = app.emit("agent-thought-chunk", delta);
+        }
+    }
+}
+
+pub fn emit_stream_chunk(
+    app_handle: &Option<tauri::AppHandle>,
+    run_ctx: &RunContext,
+    delta: &str,
+) {
+    if delta.is_empty() {
+        return;
+    }
+    if run_ctx.depth == 0 {
+        if let Some(tx) = &run_ctx.acp_event_tx {
+            let _ = tx.send(crate::acp_server::AcpStreamEvent::MessageChunk {
+                session_id: run_ctx.session_id.clone(),
+                text: delta.to_string(),
+            });
+        }
+    }
+    if let Some(app) = app_handle {
+        let _ = app.emit(
+            "agent-chunk-v2",
+            json!({
+                "run_id": run_ctx.run_id,
+                "session_id": run_ctx.session_id,
+                "delta": delta
+            }),
+        );
+        if run_ctx.depth == 0 {
+            let _ = app.emit("agent-text-chunk", delta);
+        }
+    }
+}
+
+pub async fn emit_stream_step(
+    app_handle: &Option<tauri::AppHandle>,
+    state: &AppState,
+    run_ctx: &RunContext,
+    step: usize,
+    max_steps: usize,
+    text: &str,
+) {
+    state
+        .agent_manager
+        .update_run_step(&run_ctx.run_id, step, max_steps, text.to_string())
+        .await;
+    if let Some(app) = app_handle {
+        let _ = app.emit(
+            "agent-step-v2",
+            json!({
+                "run_id": run_ctx.run_id,
+                "session_id": run_ctx.session_id,
+                "step": step,
+                "max_steps": max_steps,
+                "text": text
+            }),
+        );
+        if run_ctx.depth == 0 {
+            let _ = app.emit("agent-step", text);
+        }
+    }
+}
+
+fn acp_tool_kind(name: &str) -> &'static str {
+    match name {
+        "run_command_compressed" | "start_command_job" | "poll_command_job" | "stop_command_job" => {
+            "execute"
+        }
+        "surgical_edit"
+        | "multi_surgical_edit"
+        | "patch_and_verify"
+        | "write_file_jailed"
+        | "file_ops" => "edit",
+        "smart_search" | "find_files" => "search",
+        "read_file_range"
+        | "read_symbol"
+        | "code_outline"
+        | "batch_inspect"
+        | "project_overview"
+        | "lsp_diagnostics"
+        | "lsp_definition"
+        | "lsp_references"
+        | "lsp_hover" => "read",
+        _ => "other",
+    }
+}
+
+fn maybe_emit_acp_plan(ctx: Option<&RunContext>, tool_name: &str, args: &Value, output: &ToolOutput) {
+    let Some(c) = ctx else { return };
+    if c.depth != 0 || output.is_error || tool_name != "upsert_artifact" {
+        return;
+    }
+    let Some(tx) = &c.acp_event_tx else { return };
+    let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    if !matches!(kind, "task_list" | "tasks" | "task") {
+        return;
+    }
+    if let Some(md) = args.get("content_md").and_then(|v| v.as_str()) {
+        let entries = crate::acp_server::extract_plan_entries_from_markdown(md);
+        if !entries.is_empty() {
+            let _ = tx.send(crate::acp_server::AcpStreamEvent::PlanUpdate {
+                session_id: c.session_id.clone(),
+                entries,
+            });
+        }
+    }
+}
+
+/// Executes contiguous read-only tool calls in parallel (bounded concurrency = 6) while preserving
+/// original call order, and runs mutative tool calls strictly sequentially.
+pub async fn execute_tool_calls_hybrid(
+    state: Arc<AppState>,
+    source: &str,
+    calls: Vec<PendingToolCall>,
+    cancel_rx: &mut watch::Receiver<bool>,
+    turn_start: Instant,
+    turn_budget_secs: u64,
+    app_handle: &Option<tauri::AppHandle>,
+    run_ctx: Option<&RunContext>,
+) -> Result<Vec<ExecutedToolCall>, WatchdogInterrupt> {
+    if calls.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut tagged: Vec<(bool, PendingToolCall)> = Vec::with_capacity(calls.len());
+    for call in calls {
+        let ro = is_safe_parallel_call(&state, &call.name, &call.args).await;
+        tagged.push((ro, call));
+    }
+
+    let mut segments: Vec<(bool, Vec<PendingToolCall>)> = Vec::new();
+    for (is_ro, call) in tagged {
+        if let Some((last_ro, vec)) = segments.last_mut() {
+            if *last_ro == is_ro {
+                vec.push(call);
+                continue;
+            }
+        }
+        segments.push((is_ro, vec![call]));
+    }
+
+    let mut all_results: Vec<ExecutedToolCall> = Vec::with_capacity(
+        segments.iter().map(|(_, v)| v.len()).sum(),
+    );
+
+    for (is_ro, seg) in segments {
+        if is_ro && seg.len() > 1 {
+            if let Some(ctx) = run_ctx {
+                let names: Vec<&str> = seg.iter().map(|c| c.name.as_str()).collect();
+                emit_stream_step(
+                    app_handle,
+                    &state,
+                    ctx,
+                    0,
+                    0,
+                    &format!(
+                        "Menjalankan {} tool read-only paralel: {}...",
+                        seg.len(),
+                        names.join(", ")
+                    ),
+                )
+                .await;
+            } else if let Some(app) = app_handle {
+                let names: Vec<&str> = seg.iter().map(|c| c.name.as_str()).collect();
+                let _ = app.emit(
+                    "agent-step",
+                    format!(
+                        "Menjalankan {} tool read-only paralel: {}...",
+                        seg.len(),
+                        names.join(", ")
+                    ),
+                );
+            }
+
+            let sem = Arc::new(Semaphore::new(6));
+            let mut join_set: JoinSet<(usize, String, String, Value, ToolOutput)> = JoinSet::new();
+            for (idx, call) in seg.into_iter().enumerate() {
+                if let Some(ctx) = run_ctx.filter(|c| c.depth == 0) {
+                    if let Some(tx) = &ctx.acp_event_tx {
+                        let _ = tx.send(crate::acp_server::AcpStreamEvent::ToolCallStart {
+                            session_id: ctx.session_id.clone(),
+                            call_id: call.id.clone(),
+                            title: call.name.clone(),
+                            kind: acp_tool_kind(&call.name).to_string(),
+                            raw_input: call.args.clone(),
+                        });
+                    }
+                }
+                let st = state.clone();
+                let sem_c = sem.clone();
+                let src = source.to_string();
+                let ctx_owned = run_ctx.cloned();
+                join_set.spawn(async move {
+                    let _permit = sem_c.acquire_owned().await;
+                    let args_clone = call.args.clone();
+                    let out =
+                        execute_any_tool(st, &src, &call.name, call.args, ctx_owned.as_ref()).await;
+                    (idx, call.id, call.name, args_clone, out)
+                });
+            }
+
+            let mut seg_results: Vec<(usize, ExecutedToolCall)> = Vec::new();
+            loop {
+                let next_res = await_with_watchdog(
+                    join_set.join_next(),
+                    cancel_rx,
+                    turn_budget_secs,
+                    WatchdogInterrupt::TurnBudgetTimeout,
+                    turn_start,
+                    turn_budget_secs,
+                )
+                .await;
+
+                match next_res {
+                    Ok(Some(Ok((idx, id, name, args_val, output)))) => {
+                        if let Some(ctx) = run_ctx.filter(|c| c.depth == 0) {
+                            if let Some(tx) = &ctx.acp_event_tx {
+                                let _ = tx.send(crate::acp_server::AcpStreamEvent::ToolCallUpdate {
+                                    session_id: ctx.session_id.clone(),
+                                    call_id: id.clone(),
+                                    status: if output.is_error {
+                                        "failed".to_string()
+                                    } else {
+                                        "completed".to_string()
+                                    },
+                                    text: output.text.chars().take(1500).collect(),
+                                });
+                            }
+                            maybe_emit_acp_plan(Some(ctx), &name, &args_val, &output);
+                        }
+                        let tokens_saved = latest_tokens_saved(&state, &name).await;
+                        seg_results.push((
+                            idx,
+                            ExecutedToolCall {
+                                id,
+                                name,
+                                output,
+                                tokens_saved,
+                            },
+                        ));
+                    }
+                    Ok(Some(Err(_))) => {}
+                    Ok(None) => break,
+                    Err(interrupt) => {
+                        join_set.abort_all();
+                        return Err(interrupt);
+                    }
+                }
+            }
+            seg_results.sort_by_key(|(idx, _)| *idx);
+            all_results.extend(seg_results.into_iter().map(|(_, item)| item));
+        } else {
+            for call in seg {
+                if let Some(ctx) = run_ctx {
+                    emit_stream_step(
+                        app_handle,
+                        &state,
+                        ctx,
+                        0,
+                        0,
+                        &format!("Menjalankan tool: {}...", call.name),
+                    )
+                    .await;
+                    if ctx.depth == 0 {
+                        if let Some(tx) = &ctx.acp_event_tx {
+                            let _ = tx.send(crate::acp_server::AcpStreamEvent::ToolCallStart {
+                                session_id: ctx.session_id.clone(),
+                                call_id: call.id.clone(),
+                                title: call.name.clone(),
+                                kind: acp_tool_kind(&call.name).to_string(),
+                                raw_input: call.args.clone(),
+                            });
+                        }
+                    }
+                } else if let Some(app) = app_handle {
+                    let _ = app.emit("agent-step", format!("Menjalankan tool: {}...", call.name));
+                }
+                let tname = call.name.clone();
+                let args_clone = call.args.clone();
+                let output = await_with_watchdog(
+                    execute_any_tool(state.clone(), source, &tname, call.args, run_ctx),
+                    cancel_rx,
+                    turn_budget_secs,
+                    WatchdogInterrupt::TurnBudgetTimeout,
+                    turn_start,
+                    turn_budget_secs,
+                )
+                .await?;
+                if let Some(ctx) = run_ctx.filter(|c| c.depth == 0) {
+                    if let Some(tx) = &ctx.acp_event_tx {
+                        let _ = tx.send(crate::acp_server::AcpStreamEvent::ToolCallUpdate {
+                            session_id: ctx.session_id.clone(),
+                            call_id: call.id.clone(),
+                            status: if output.is_error {
+                                "failed".to_string()
+                            } else {
+                                "completed".to_string()
+                            },
+                            text: output.text.chars().take(1500).collect(),
+                        });
+                    }
+                    maybe_emit_acp_plan(Some(ctx), &tname, &args_clone, &output);
+                }
+                let tokens_saved = latest_tokens_saved(&state, &tname).await;
+                all_results.push(ExecutedToolCall {
+                    id: call.id,
+                    name: tname,
+                    output,
+                    tokens_saved,
+                });
+            }
+        }
+    }
+
+    Ok(all_results)
+}
+
+pub fn format_interrupted_reply(
+    partial_text: &str,
+    interrupt: WatchdogInterrupt,
+    turn_budget_secs: u64,
+    stream_idle_secs: u64,
+) -> String {
+    let note = interrupt.display_note(turn_budget_secs, stream_idle_secs);
+    if partial_text.trim().is_empty() {
+        format!("({note})")
+    } else {
+        format!("{}\n\n[{note}]", partial_text.trim_end())
+    }
 }
 
 fn truncate_str_chars(s: &str, max_chars: usize) -> String {
@@ -137,61 +626,87 @@ pub fn sanitize_schema_for_gemini(val: &Value) -> Value {
 
 pub async fn all_mcp_tools(state: &AppState) -> Vec<Value> {
     let mut tools = mcp_tools_list().as_array().cloned().unwrap_or_default();
-    let cfgs = state.config.read().await.downstream_mcps.clone();
+    let cfgs = state.resolved_downstream_mcps().await;
     let aggregated = state.mcp_hub.list_aggregated_tools(&cfgs).await;
     tools.extend(aggregated);
     tools
 }
 
 pub async fn execute_any_tool(
-    state: &AppState,
+    state: Arc<AppState>,
     source: &str,
     name: &str,
     args: Value,
+    run_ctx: Option<&RunContext>,
 ) -> ToolOutput {
     if name.contains("__") {
+        let cfgs = state.resolved_downstream_mcps().await;
+        let is_ro = state.mcp_hub.is_tool_read_only(&cfgs, name).await;
+        if let Err(err) = enforce_run_mode_gate(&state, run_ctx, name, is_ro).await {
+            return ToolOutput {
+                text: err,
+                is_error: true,
+            };
+        }
         state
             .mcp_hub
-            .call_downstream_tool(state, source, name, args)
+            .call_downstream_tool(&state, source, name, args)
             .await
     } else {
-        execute_tool(state, source, name, args).await
+        execute_tool_with_run_context(state, source, name, args, None, run_ctx).await
     }
+}
+
+fn split_workspace_attachment_ref(att: &AgentAttachment) -> (Option<String>, String) {
+    let raw = att.path.as_deref().unwrap_or(&att.name).trim();
+    if let Some(explicit_ws) = att.workspace.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return (Some(explicit_ws.to_string()), raw.to_string());
+    }
+    if let Some(after_at) = raw.strip_prefix('@') {
+        if let Some((alias, rest)) = after_at.split_once(':') {
+            if !alias.is_empty() && !alias.contains('/') && !alias.contains('\\') {
+                return (Some(alias.to_string()), rest.trim().to_string());
+            }
+        }
+    }
+    (None, raw.to_string())
 }
 
 pub async fn build_attachment_text_context(
     state: &AppState,
     attachments: &[AgentAttachment],
 ) -> Result<String, String> {
-    let root = state.workspace_root.read().await.clone();
     let mut sections = Vec::new();
 
     for att in attachments {
         if att.kind != "file" {
             continue;
         }
-        let rel = att
-            .path
-            .as_deref()
-            .unwrap_or(&att.name)
-            .trim();
+        let (ws_req, rel) = split_workspace_attachment_ref(att);
         if rel.is_empty() {
             continue;
         }
-        let target = resolve_jailed_path(&root, rel)?;
-        check_sensitive_guard(state, &root, &target, rel).await?;
+        let ws = resolve_workspace(state, ws_req.as_deref(), None).await?;
+        let target = resolve_jailed_path(&ws.canon_root, &rel)?;
+        check_sensitive_guard_for_workspace(state, &ws, &target, &rel).await?;
         let bytes = std::fs::read(&target)
             .map_err(|e| format!("Gagal membaca lampiran '{rel}': {e}"))?;
         let text = String::from_utf8(bytes)
             .map_err(|_| format!("Lampiran '{rel}' bukan file teks UTF-8 yang valid."))?;
         let clipped = truncate_str_chars(&text, 12_000);
-        sections.push(format!("### Attached File: {rel}\n```\n{clipped}\n```"));
+        let label = if ws_req.is_some() {
+            format!("@{}:{}", ws.alias, rel)
+        } else {
+            rel
+        };
+        sections.push(format!("### Attached File: {label}\n```\n{clipped}\n```"));
     }
 
     Ok(sections.join("\n\n"))
 }
 
 pub async fn fetch_openai_compat_models(
+    client: &reqwest::Client,
     base_url: String,
     api_key: String,
 ) -> Result<Vec<GeminiModelInfo>, String> {
@@ -200,12 +715,10 @@ pub async fn fetch_openai_compat_models(
         return Err("Base URL OpenAI-compatible belum diisi.".to_string());
     }
     let endpoint = format!("{clean_base}/models");
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("HTTP client error: {e}"))?;
 
-    let mut req = client.get(&endpoint);
+    let mut req = client
+        .get(&endpoint)
+        .timeout(std::time::Duration::from_secs(15));
     if !api_key.trim().is_empty() {
         req = req.bearer_auth(api_key.trim());
     }
@@ -397,6 +910,7 @@ fn process_openai_sse_raw_line(
     acc: &mut OpenAiSseAccumulator,
     raw_line: &[u8],
     app_handle: &Option<tauri::AppHandle>,
+    run_ctx: &RunContext,
 ) {
     let line_str = String::from_utf8_lossy(raw_line);
     let trimmed = line_str.trim_end_matches(&['\r', '\n'][..]);
@@ -405,16 +919,8 @@ fn process_openai_sse_raw_line(
         if !data_trimmed.is_empty() && data_trimmed != "[DONE]" {
             if let Ok((text_delta, thought_delta)) = process_openai_sse_data_line(acc, data_trimmed)
             {
-                if !thought_delta.is_empty() {
-                    if let Some(app) = app_handle {
-                        let _ = app.emit("agent-thought-chunk", &thought_delta);
-                    }
-                }
-                if !text_delta.is_empty() {
-                    if let Some(app) = app_handle {
-                        let _ = app.emit("agent-text-chunk", &text_delta);
-                    }
-                }
+                emit_stream_thought(app_handle, run_ctx, &thought_delta);
+                emit_stream_chunk(app_handle, run_ctx, &text_delta);
             }
         }
     }
@@ -436,12 +942,15 @@ fn prune_openai_history(history: &mut Vec<Value>, max_entries: usize) {
 }
 
 pub async fn run_openai_compat_turn(
-    state: &AppState,
+    state: Arc<AppState>,
     prompt: String,
     attachments: Vec<AgentAttachment>,
     system_prompt: String,
     tools: Vec<Value>,
     app_handle: Option<tauri::AppHandle>,
+    mut cancel_rx: watch::Receiver<bool>,
+    is_resume: bool,
+    run_ctx: RunContext,
 ) -> Result<ProviderTurnOutcome, String> {
     let (base_url, model) = {
         let cfg = state.config.read().await;
@@ -462,39 +971,83 @@ pub async fn run_openai_compat_turn(
         return Err("API Key untuk provider OpenAI-Compatible belum diisi.".to_string());
     }
 
-    let attachment_text = build_attachment_text_context(state, &attachments).await?;
-    let full_prompt = if attachment_text.is_empty() {
-        prompt.clone()
+    let mut history = if run_ctx.depth > 0 {
+        Vec::new()
     } else {
-        format!("{prompt}\n\n{attachment_text}")
+        let per_sess = state
+            .agent_manager
+            .get_history("openai_compat", &run_ctx.session_id)
+            .await;
+        if per_sess.is_empty() && run_ctx.session_id == "default" {
+            state.openai_history.read().await.clone()
+        } else {
+            per_sess
+        }
     };
-
-    let image_parts: Vec<Value> = attachments
-        .iter()
-        .filter(|a| a.kind == "image")
-        .filter_map(|a| {
-            let b64 = a.data_base64.as_ref()?.trim();
-            if b64.is_empty() {
-                return None;
-            }
-            let mime = a.mime_type.as_deref().unwrap_or("image/png");
-            Some(json!({
-                "type": "image_url",
-                "image_url": { "url": format!("data:{mime};base64,{b64}") }
-            }))
-        })
-        .collect();
-
-    let user_msg = if image_parts.is_empty() {
-        json!({ "role": "user", "content": full_prompt })
+    if is_resume {
+        let needs_continue_prompt = history
+            .last()
+            .and_then(|m| m.get("role"))
+            .and_then(|r| r.as_str())
+            == Some("assistant")
+            || history.is_empty();
+        if needs_continue_prompt {
+            history.push(json!({
+                "role": "user",
+                "content": "Continue from the last completed step and finish the task."
+            }));
+        }
     } else {
-        let mut content = vec![json!({ "type": "text", "text": full_prompt })];
-        content.extend(image_parts);
-        json!({ "role": "user", "content": content })
-    };
+        let attachment_text = build_attachment_text_context(&state, &attachments).await?;
+        let full_prompt = if attachment_text.is_empty() {
+            prompt.clone()
+        } else {
+            format!("{prompt}\n\n{attachment_text}")
+        };
 
-    let mut history = state.openai_history.read().await.clone();
-    history.push(user_msg);
+        let image_parts: Vec<Value> = attachments
+            .iter()
+            .filter(|a| a.kind == "image")
+            .filter_map(|a| {
+                let b64 = a.data_base64.as_ref()?.trim();
+                if b64.is_empty() {
+                    return None;
+                }
+                let mime = a.mime_type.as_deref().unwrap_or("image/png");
+                Some(json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:{mime};base64,{b64}") }
+                }))
+            })
+            .collect();
+
+        let user_msg = if image_parts.is_empty() {
+            json!({ "role": "user", "content": full_prompt })
+        } else {
+            let mut content = vec![json!({ "type": "text", "text": full_prompt })];
+            content.extend(image_parts);
+            json!({ "role": "user", "content": content })
+        };
+        history.push(user_msg);
+    }
+
+    let mut last_clean_history = history.clone();
+    let watchdog = load_watchdog_settings(&state).await;
+    let max_steps = if run_ctx.depth > 0 {
+        watchdog.max_steps.min(10)
+    } else {
+        watchdog.max_steps
+    };
+    let turn_budget_secs = if run_ctx.depth > 0 {
+        watchdog.turn_budget_secs.min(60)
+    } else {
+        watchdog.turn_budget_secs
+    };
+    let stream_idle_secs = watchdog.stream_idle_secs;
+    let ttfb_timeout_secs = watchdog.ttfb_timeout_secs;
+    let turn_start = Instant::now();
+    let mut soft_budget_notified = false;
+    let mut awaiting_approval = false;
 
     let openai_tools: Vec<Value> = tools
         .into_iter()
@@ -510,22 +1063,48 @@ pub async fn run_openai_compat_turn(
         })
         .collect();
 
-    let client = reqwest::Client::new();
+    let client = &state.http_client;
     let url = format!("{base_url}/chat/completions");
-    let mut steps = Vec::new();
+    let mut steps: Vec<ToolStepTrace> = Vec::new();
     let mut total_usage = TokenUsage::default();
     let mut final_reply = String::new();
     let mut last_streamed_text = String::new();
-    let mut was_cancelled = false;
+    let mut interrupt_opt: Option<WatchdogInterrupt> = None;
+    let mut hit_max_steps = false;
     const BACKOFF_SECS: [u64; 3] = [2, 5, 10];
 
-    for step_idx in 0..8 {
-        if let Some(app) = &app_handle {
-            let _ = app.emit(
-                "agent-step",
-                format!("Step {}/8: Streaming {}...", step_idx + 1, model),
-            );
+    for step_idx in 0..max_steps {
+        let elapsed_secs = turn_start.elapsed().as_secs();
+        if *cancel_rx.borrow() {
+            interrupt_opt = Some(WatchdogInterrupt::Cancelled);
+            break;
         }
+        if elapsed_secs >= turn_budget_secs {
+            interrupt_opt = Some(WatchdogInterrupt::TurnBudgetTimeout);
+            break;
+        }
+        if !soft_budget_notified && elapsed_secs >= (turn_budget_secs * 4) / 5 {
+            soft_budget_notified = true;
+            emit_stream_step(
+                &app_handle,
+                &state,
+                &run_ctx,
+                step_idx + 1,
+                max_steps,
+                "80% batas waktu giliran tercapai — menyelesaikan langkah saat ini...",
+            )
+            .await;
+        }
+
+        emit_stream_step(
+            &app_handle,
+            &state,
+            &run_ctx,
+            step_idx + 1,
+            max_steps,
+            &format!("Step {}/{}: Streaming {}...", step_idx + 1, max_steps, model),
+        )
+        .await;
 
         let mut messages_payload = vec![json!({ "role": "system", "content": system_prompt })];
         messages_payload.extend(history.clone());
@@ -546,12 +1125,21 @@ pub async fn run_openai_compat_turn(
             if !api_key.trim().is_empty() {
                 req = req.bearer_auth(api_key.trim());
             }
-            let send_res = tokio::select! {
-                _ = state.agent_cancel.notified() => {
-                    was_cancelled = true;
+            let send_res = match await_with_watchdog(
+                req.send(),
+                &mut cancel_rx,
+                ttfb_timeout_secs,
+                WatchdogInterrupt::StreamIdleTimeout,
+                turn_start,
+                turn_budget_secs,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(kind) => {
+                    interrupt_opt = Some(kind);
                     break;
                 }
-                res = req.send() => res,
             };
 
             let resp = send_res.map_err(|e| format!("Koneksi ke {url} gagal: {e}"))?;
@@ -570,12 +1158,23 @@ pub async fn run_openai_compat_turn(
             {
                 let wait_secs = BACKOFF_SECS[attempt];
                 attempt += 1;
-                tokio::select! {
-                    _ = state.agent_cancel.notified() => {
-                        was_cancelled = true;
-                        break;
-                    }
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(wait_secs)) => {}
+                if await_with_watchdog(
+                    tokio::time::sleep(Duration::from_secs(wait_secs)),
+                    &mut cancel_rx,
+                    wait_secs + 1,
+                    WatchdogInterrupt::TurnBudgetTimeout,
+                    turn_start,
+                    turn_budget_secs,
+                )
+                .await
+                .is_err()
+                {
+                    interrupt_opt = Some(if *cancel_rx.borrow() {
+                        WatchdogInterrupt::Cancelled
+                    } else {
+                        WatchdogInterrupt::TurnBudgetTimeout
+                    });
+                    break;
                 }
                 continue;
             }
@@ -587,7 +1186,7 @@ pub async fn run_openai_compat_turn(
             return Err(format!("OpenAI-Compatible API error ({status}): {err_msg}"));
         }
 
-        if was_cancelled {
+        if interrupt_opt.is_some() {
             break;
         }
 
@@ -596,29 +1195,30 @@ pub async fn run_openai_compat_turn(
         let mut byte_buf: Vec<u8> = Vec::new();
 
         loop {
-            tokio::select! {
-                _ = state.agent_cancel.notified() => {
-                    was_cancelled = true;
-                    break;
-                }
-                chunk_res = resp.chunk() => {
-                    match chunk_res {
-                        Ok(Some(bytes)) => {
-                            byte_buf.extend_from_slice(&bytes);
-                            while let Some(pos) = byte_buf.iter().position(|&b| b == b'\n') {
-                                let raw_line: Vec<u8> = byte_buf.drain(..=pos).collect();
-                                process_openai_sse_raw_line(&mut step_acc, &raw_line, &app_handle);
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(e) => return Err(format!("Streaming terputus: {e}")),
+            match await_with_watchdog(
+                resp.chunk(),
+                &mut cancel_rx,
+                stream_idle_secs,
+                WatchdogInterrupt::StreamIdleTimeout,
+                turn_start,
+                turn_budget_secs,
+            )
+            .await
+            {
+                Ok(Ok(Some(bytes))) => {
+                    byte_buf.extend_from_slice(&bytes);
+                    while let Some(pos) = byte_buf.iter().position(|&b| b == b'\n') {
+                        let raw_line: Vec<u8> = byte_buf.drain(..=pos).collect();
+                        process_openai_sse_raw_line(&mut step_acc, &raw_line, &app_handle, &run_ctx);
                     }
                 }
+                Ok(Ok(None)) => break,
+                Ok(Err(e)) => return Err(format!("Streaming terputus: {e}")),
+                Err(kind) => {
+                    interrupt_opt = Some(kind);
+                    break;
+                }
             }
-        }
-
-        if !was_cancelled && !byte_buf.is_empty() {
-            process_openai_sse_raw_line(&mut step_acc, &byte_buf, &app_handle);
         }
 
         total_usage.prompt_tokens += step_acc.usage.prompt_tokens;
@@ -629,8 +1229,11 @@ pub async fn run_openai_compat_turn(
         if !step_acc.text_buf.trim().is_empty() {
             last_streamed_text = step_acc.text_buf.clone();
         }
-        if was_cancelled {
+        if interrupt_opt.is_some() {
             break;
+        }
+        if !byte_buf.is_empty() {
+            process_openai_sse_raw_line(&mut step_acc, &byte_buf, &app_handle, &run_ctx);
         }
 
         if step_acc.tool_calls.is_empty() {
@@ -639,6 +1242,7 @@ pub async fn run_openai_compat_turn(
                 "content": step_acc.text_buf
             });
             history.push(assistant_msg);
+            last_clean_history = history.clone();
             final_reply = if step_acc.text_buf.trim().is_empty() {
                 "(Selesai tanpa teks tambahan)".to_string()
             } else {
@@ -673,78 +1277,162 @@ pub async fn run_openai_compat_turn(
             "tool_calls": tool_calls_json
         }));
 
-        for tc_val in &tool_calls_json {
-            let tc_id = tc_val["id"].as_str().unwrap_or("call_0");
-            let tname = tc_val["function"]["name"].as_str().unwrap_or("");
-            let args_raw = tc_val["function"]["arguments"].as_str().unwrap_or("{}");
-            let args: Value = serde_json::from_str(args_raw).unwrap_or_else(|_| json!({}));
+        let pending_calls: Vec<PendingToolCall> = tool_calls_json
+            .iter()
+            .map(|tc_val| {
+                let id = tc_val["id"].as_str().unwrap_or("call_0").to_string();
+                let name = tc_val["function"]["name"].as_str().unwrap_or("").to_string();
+                let args_raw = tc_val["function"]["arguments"].as_str().unwrap_or("{}");
+                let args: Value = serde_json::from_str(args_raw).unwrap_or_else(|_| json!({}));
+                PendingToolCall { id, name, args }
+            })
+            .collect();
 
-            if let Some(app) = &app_handle {
-                let _ = app.emit("agent-step", format!("Menjalankan tool: {tname}..."));
-            }
-
-            let out_opt = tokio::select! {
-                _ = state.agent_cancel.notified() => {
-                    was_cancelled = true;
-                    None
+        match execute_tool_calls_hybrid(
+            state.clone(),
+            "LocalAgent",
+            pending_calls,
+            &mut cancel_rx,
+            turn_start,
+            turn_budget_secs,
+            &app_handle,
+            Some(&run_ctx),
+        )
+        .await
+        {
+            Ok(exec_results) => {
+                let mut requested_approval_msg: Option<String> = None;
+                for item in exec_results {
+                    if item.name == "request_plan_approval" && !item.output.is_error {
+                        requested_approval_msg = Some(item.output.text.clone());
+                    }
+                    steps.push(ToolStepTrace {
+                        tool_name: item.name,
+                        summary: item
+                            .output
+                            .text
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .chars()
+                            .take(80)
+                            .collect(),
+                        tokens_saved: item.tokens_saved,
+                    });
+                    history.push(json!({
+                        "role": "tool",
+                        "tool_call_id": item.id,
+                        "content": item.output.text
+                    }));
                 }
-                out = execute_any_tool(state, "LocalAgent", tname, args) => Some(out),
-            };
-            let Some(out) = out_opt else {
+                last_clean_history = history.clone();
+                if let Some(msg) = requested_approval_msg {
+                    awaiting_approval = true;
+                    final_reply = if last_streamed_text.trim().is_empty() {
+                        format!(
+                            "Implementation Plan siap ditinjau pada panel Artifacts.\n\n{msg}"
+                        )
+                    } else {
+                        last_streamed_text.clone()
+                    };
+                    break;
+                }
+            }
+            Err(kind) => {
+                interrupt_opt = Some(kind);
                 break;
-            };
-
-            let tokens_saved = {
-                let logs = state.audit_logs.read().await;
-                logs.last().map(|l| l.tokens_saved).unwrap_or(0)
-            };
-            steps.push(ToolStepTrace {
-                tool_name: tname.to_string(),
-                summary: out
-                    .text
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .take(80)
-                    .collect(),
-                tokens_saved,
-            });
-
-            history.push(json!({
-                "role": "tool",
-                "tool_call_id": tc_id,
-                "content": out.text
-            }));
+            }
         }
 
-        if was_cancelled {
-            break;
-        }
-        if step_idx == 7 {
-            final_reply = "Batas maksimum 8 langkah tool per giliran tercapai. Kirim pesan lanjutan untuk melanjutkan.".to_string();
+        if step_idx + 1 == max_steps {
+            hit_max_steps = true;
+            final_reply = format!(
+                "Batas maksimum {max_steps} langkah tool per giliran tercapai. Klik Resume Turn atau kirim pesan lanjutan untuk melanjutkan."
+            );
         }
     }
 
-    if was_cancelled {
-        final_reply = if last_streamed_text.trim().is_empty() {
-            "(Dibatalkan oleh user)".to_string()
-        } else {
-            format!(
-                "{}\n\n[Dibatalkan oleh user]",
-                last_streamed_text.trim_end()
-            )
+    let checkpoint_opt = if run_ctx.depth > 0 {
+        None
+    } else if let Some(kind) = interrupt_opt {
+        prune_openai_history(&mut last_clean_history, 36);
+        state
+            .agent_manager
+            .set_history("openai_compat", &run_ctx.session_id, last_clean_history.clone())
+            .await;
+        if run_ctx.session_id == "default" {
+            *state.openai_history.write().await = last_clean_history;
+        }
+        let cp = TurnCheckpointInfo {
+            can_resume: true,
+            reason: kind.reason_str().to_string(),
+            completed_steps: steps.len(),
+            last_tool: steps.last().map(|s| s.tool_name.clone()),
         };
+        state
+            .agent_manager
+            .set_checkpoint(&run_ctx.session_id, Some(cp.clone()))
+            .await;
+        *state.pending_checkpoint.write().await = Some(cp.clone());
+        final_reply =
+            format_interrupted_reply(&last_streamed_text, kind, turn_budget_secs, stream_idle_secs);
+        Some(cp)
+    } else if hit_max_steps {
+        prune_openai_history(&mut last_clean_history, 36);
+        state
+            .agent_manager
+            .set_history("openai_compat", &run_ctx.session_id, last_clean_history.clone())
+            .await;
+        if run_ctx.session_id == "default" {
+            *state.openai_history.write().await = last_clean_history;
+        }
+        let cp = TurnCheckpointInfo {
+            can_resume: true,
+            reason: "max_steps".to_string(),
+            completed_steps: steps.len(),
+            last_tool: steps.last().map(|s| s.tool_name.clone()),
+        };
+        state
+            .agent_manager
+            .set_checkpoint(&run_ctx.session_id, Some(cp.clone()))
+            .await;
+        *state.pending_checkpoint.write().await = Some(cp.clone());
+        Some(cp)
     } else {
-        prune_openai_history(&mut history, 36);
-        *state.openai_history.write().await = history;
+        prune_openai_history(&mut last_clean_history, 36);
+        state
+            .agent_manager
+            .set_history("openai_compat", &run_ctx.session_id, last_clean_history.clone())
+            .await;
+        if run_ctx.session_id == "default" {
+            *state.openai_history.write().await = last_clean_history;
+        }
+        state
+            .agent_manager
+            .set_checkpoint(&run_ctx.session_id, None)
+            .await;
+        *state.pending_checkpoint.write().await = None;
+        None
+    };
+
+    if awaiting_approval {
+        state
+            .agent_manager
+            .finish_run(
+                &run_ctx.run_id,
+                AgentRunStatus::AwaitingApproval,
+                "Awaiting plan approval".to_string(),
+            )
+            .await;
     }
 
     Ok(ProviderTurnOutcome {
         reply: final_reply,
         steps,
         usage: total_usage,
-        cancelled: was_cancelled,
+        cancelled: interrupt_opt == Some(WatchdogInterrupt::Cancelled),
+        awaiting_approval,
+        checkpoint: checkpoint_opt,
     })
 }
 
@@ -897,6 +1585,7 @@ fn process_anthropic_sse_raw_line(
     acc: &mut AnthropicSseAccumulator,
     raw_line: &[u8],
     app_handle: &Option<tauri::AppHandle>,
+    run_ctx: &RunContext,
 ) {
     let line_str = String::from_utf8_lossy(raw_line);
     let trimmed = line_str.trim_end_matches(&['\r', '\n'][..]);
@@ -906,16 +1595,8 @@ fn process_anthropic_sse_raw_line(
             if let Ok((text_delta, thought_delta)) =
                 process_anthropic_sse_data_line(acc, data_trimmed)
             {
-                if !thought_delta.is_empty() {
-                    if let Some(app) = app_handle {
-                        let _ = app.emit("agent-thought-chunk", &thought_delta);
-                    }
-                }
-                if !text_delta.is_empty() {
-                    if let Some(app) = app_handle {
-                        let _ = app.emit("agent-text-chunk", &text_delta);
-                    }
-                }
+                emit_stream_thought(app_handle, run_ctx, &thought_delta);
+                emit_stream_chunk(app_handle, run_ctx, &text_delta);
             }
         }
     }
@@ -948,12 +1629,15 @@ fn prune_anthropic_history(history: &mut Vec<Value>, max_entries: usize) {
 }
 
 pub async fn run_anthropic_turn(
-    state: &AppState,
+    state: Arc<AppState>,
     prompt: String,
     attachments: Vec<AgentAttachment>,
     system_prompt: String,
     tools: Vec<Value>,
     app_handle: Option<tauri::AppHandle>,
+    mut cancel_rx: watch::Receiver<bool>,
+    is_resume: bool,
+    run_ctx: RunContext,
 ) -> Result<ProviderTurnOutcome, String> {
     let model = state.config.read().await.anthropic_model.trim().to_string();
     let api_key = state.provider_secrets.read().await.anthropic_api_key.clone();
@@ -964,35 +1648,84 @@ pub async fn run_anthropic_turn(
         return Err("Model Anthropic belum diisi.".to_string());
     }
 
-    let attachment_text = build_attachment_text_context(state, &attachments).await?;
-    let full_prompt = if attachment_text.is_empty() {
-        prompt.clone()
+    let mut history = if run_ctx.depth > 0 {
+        Vec::new()
     } else {
-        format!("{prompt}\n\n{attachment_text}")
+        let per_sess = state
+            .agent_manager
+            .get_history("anthropic", &run_ctx.session_id)
+            .await;
+        if per_sess.is_empty() && run_ctx.session_id == "default" {
+            state.anthropic_history.read().await.clone()
+        } else {
+            per_sess
+        }
     };
+    if is_resume {
+        let needs_continue_prompt = history
+            .last()
+            .and_then(|m| m.get("role"))
+            .and_then(|r| r.as_str())
+            == Some("assistant")
+            || history.is_empty();
+        if needs_continue_prompt {
+            history.push(json!({
+                "role": "user",
+                "content": [{ "type": "text", "text": "Continue from the last completed step and finish the task." }]
+            }));
+        }
+    } else {
+        let attachment_text = build_attachment_text_context(&state, &attachments).await?;
+        let full_prompt = if attachment_text.is_empty() {
+            prompt.clone()
+        } else {
+            format!("{prompt}\n\n{attachment_text}")
+        };
 
-    let mut content_blocks = vec![json!({ "type": "text", "text": full_prompt })];
-    for att in &attachments {
-        if att.kind == "image" {
-            if let Some(b64) = att.data_base64.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                let mime = att.mime_type.as_deref().unwrap_or("image/png");
-                content_blocks.push(json!({
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": mime,
-                        "data": b64
-                    }
-                }));
+        let mut content_blocks = vec![json!({ "type": "text", "text": full_prompt })];
+        for att in &attachments {
+            if att.kind == "image" {
+                if let Some(b64) = att
+                    .data_base64
+                    .as_ref()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                {
+                    let mime = att.mime_type.as_deref().unwrap_or("image/png");
+                    content_blocks.push(json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": mime,
+                            "data": b64
+                        }
+                    }));
+                }
             }
         }
+        history.push(json!({
+            "role": "user",
+            "content": content_blocks
+        }));
     }
 
-    let mut history = state.anthropic_history.read().await.clone();
-    history.push(json!({
-        "role": "user",
-        "content": content_blocks
-    }));
+    let mut last_clean_history = history.clone();
+    let watchdog = load_watchdog_settings(&state).await;
+    let max_steps = if run_ctx.depth > 0 {
+        watchdog.max_steps.min(10)
+    } else {
+        watchdog.max_steps
+    };
+    let turn_budget_secs = if run_ctx.depth > 0 {
+        watchdog.turn_budget_secs.min(60)
+    } else {
+        watchdog.turn_budget_secs
+    };
+    let stream_idle_secs = watchdog.stream_idle_secs;
+    let ttfb_timeout_secs = watchdog.ttfb_timeout_secs;
+    let turn_start = Instant::now();
+    let mut soft_budget_notified = false;
+    let mut awaiting_approval = false;
 
     let anthropic_tools: Vec<Value> = tools
         .into_iter()
@@ -1005,22 +1738,48 @@ pub async fn run_anthropic_turn(
         })
         .collect();
 
-    let client = reqwest::Client::new();
+    let client = &state.http_client;
     let url = "https://api.anthropic.com/v1/messages";
-    let mut steps = Vec::new();
+    let mut steps: Vec<ToolStepTrace> = Vec::new();
     let mut total_usage = TokenUsage::default();
     let mut final_reply = String::new();
     let mut last_streamed_text = String::new();
-    let mut was_cancelled = false;
+    let mut interrupt_opt: Option<WatchdogInterrupt> = None;
+    let mut hit_max_steps = false;
     const BACKOFF_SECS: [u64; 3] = [2, 5, 10];
 
-    for step_idx in 0..8 {
-        if let Some(app) = &app_handle {
-            let _ = app.emit(
-                "agent-step",
-                format!("Step {}/8: Streaming {}...", step_idx + 1, model),
-            );
+    for step_idx in 0..max_steps {
+        let elapsed_secs = turn_start.elapsed().as_secs();
+        if *cancel_rx.borrow() {
+            interrupt_opt = Some(WatchdogInterrupt::Cancelled);
+            break;
         }
+        if elapsed_secs >= turn_budget_secs {
+            interrupt_opt = Some(WatchdogInterrupt::TurnBudgetTimeout);
+            break;
+        }
+        if !soft_budget_notified && elapsed_secs >= (turn_budget_secs * 4) / 5 {
+            soft_budget_notified = true;
+            emit_stream_step(
+                &app_handle,
+                &state,
+                &run_ctx,
+                step_idx + 1,
+                max_steps,
+                "80% batas waktu giliran tercapai — menyelesaikan langkah saat ini...",
+            )
+            .await;
+        }
+
+        emit_stream_step(
+            &app_handle,
+            &state,
+            &run_ctx,
+            step_idx + 1,
+            max_steps,
+            &format!("Step {}/{}: Streaming {}...", step_idx + 1, max_steps, model),
+        )
+        .await;
 
         let body = json!({
             "model": model,
@@ -1035,17 +1794,27 @@ pub async fn run_anthropic_turn(
         let mut resp_opt: Option<reqwest::Response> = None;
 
         loop {
-            let send_res = tokio::select! {
-                _ = state.agent_cancel.notified() => {
-                    was_cancelled = true;
+            let send_fut = client
+                .post(url)
+                .header("x-api-key", api_key.trim())
+                .header("anthropic-version", "2023-06-01")
+                .json(&body)
+                .send();
+            let send_res = match await_with_watchdog(
+                send_fut,
+                &mut cancel_rx,
+                ttfb_timeout_secs,
+                WatchdogInterrupt::StreamIdleTimeout,
+                turn_start,
+                turn_budget_secs,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(kind) => {
+                    interrupt_opt = Some(kind);
                     break;
                 }
-                res = client
-                    .post(url)
-                    .header("x-api-key", api_key.trim())
-                    .header("anthropic-version", "2023-06-01")
-                    .json(&body)
-                    .send() => res,
             };
 
             let resp = send_res.map_err(|e| format!("Koneksi ke Anthropic API gagal: {e}"))?;
@@ -1065,12 +1834,23 @@ pub async fn run_anthropic_turn(
             {
                 let wait_secs = BACKOFF_SECS[attempt];
                 attempt += 1;
-                tokio::select! {
-                    _ = state.agent_cancel.notified() => {
-                        was_cancelled = true;
-                        break;
-                    }
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(wait_secs)) => {}
+                if await_with_watchdog(
+                    tokio::time::sleep(Duration::from_secs(wait_secs)),
+                    &mut cancel_rx,
+                    wait_secs + 1,
+                    WatchdogInterrupt::TurnBudgetTimeout,
+                    turn_start,
+                    turn_budget_secs,
+                )
+                .await
+                .is_err()
+                {
+                    interrupt_opt = Some(if *cancel_rx.borrow() {
+                        WatchdogInterrupt::Cancelled
+                    } else {
+                        WatchdogInterrupt::TurnBudgetTimeout
+                    });
+                    break;
                 }
                 continue;
             }
@@ -1082,7 +1862,7 @@ pub async fn run_anthropic_turn(
             return Err(format!("Anthropic API error ({status}): {err_msg}"));
         }
 
-        if was_cancelled {
+        if interrupt_opt.is_some() {
             break;
         }
 
@@ -1091,32 +1871,35 @@ pub async fn run_anthropic_turn(
         let mut byte_buf: Vec<u8> = Vec::new();
 
         loop {
-            tokio::select! {
-                _ = state.agent_cancel.notified() => {
-                    was_cancelled = true;
-                    break;
-                }
-                chunk_res = resp.chunk() => {
-                    match chunk_res {
-                        Ok(Some(bytes)) => {
-                            byte_buf.extend_from_slice(&bytes);
-                            while let Some(pos) = byte_buf.iter().position(|&b| b == b'\n') {
-                                let raw_line: Vec<u8> = byte_buf.drain(..=pos).collect();
-                                process_anthropic_sse_raw_line(&mut step_acc, &raw_line, &app_handle);
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(e) => return Err(format!("Streaming Anthropic terputus: {e}")),
+            match await_with_watchdog(
+                resp.chunk(),
+                &mut cancel_rx,
+                stream_idle_secs,
+                WatchdogInterrupt::StreamIdleTimeout,
+                turn_start,
+                turn_budget_secs,
+            )
+            .await
+            {
+                Ok(Ok(Some(bytes))) => {
+                    byte_buf.extend_from_slice(&bytes);
+                    while let Some(pos) = byte_buf.iter().position(|&b| b == b'\n') {
+                        let raw_line: Vec<u8> = byte_buf.drain(..=pos).collect();
+                        process_anthropic_sse_raw_line(
+                            &mut step_acc,
+                            &raw_line,
+                            &app_handle,
+                            &run_ctx,
+                        );
                     }
                 }
+                Ok(Ok(None)) => break,
+                Ok(Err(e)) => return Err(format!("Streaming Anthropic terputus: {e}")),
+                Err(kind) => {
+                    interrupt_opt = Some(kind);
+                    break;
+                }
             }
-        }
-
-        if !was_cancelled && !byte_buf.is_empty() {
-            process_anthropic_sse_raw_line(&mut step_acc, &byte_buf, &app_handle);
-        }
-        if let Some(err) = step_acc.api_error {
-            return Err(format!("Anthropic API stream error: {err}"));
         }
 
         total_usage.prompt_tokens += step_acc.usage.prompt_tokens;
@@ -1127,12 +1910,18 @@ pub async fn run_anthropic_turn(
         if !step_acc.text_buf.trim().is_empty() {
             last_streamed_text = step_acc.text_buf.clone();
         }
-        if was_cancelled {
+        if interrupt_opt.is_some() {
             break;
+        }
+        if !byte_buf.is_empty() {
+            process_anthropic_sse_raw_line(&mut step_acc, &byte_buf, &app_handle, &run_ctx);
+        }
+        if let Some(err) = step_acc.api_error {
+            return Err(format!("Anthropic API stream error: {err}"));
         }
 
         let mut assistant_content = Vec::new();
-        let mut tool_uses: Vec<(String, String, Value)> = Vec::new();
+        let mut pending_calls: Vec<PendingToolCall> = Vec::new();
         for (_, block) in &step_acc.blocks {
             match block {
                 AnthropicBlockAcc::Text(txt) if !txt.is_empty() => {
@@ -1154,7 +1943,11 @@ pub async fn run_anthropic_turn(
                         "name": name,
                         "input": parsed_input
                     }));
-                    tool_uses.push((id.clone(), name.clone(), parsed_input));
+                    pending_calls.push(PendingToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        args: parsed_input,
+                    });
                 }
                 _ => {}
             }
@@ -1167,7 +1960,8 @@ pub async fn run_anthropic_turn(
             }));
         }
 
-        if tool_uses.is_empty() {
+        if pending_calls.is_empty() {
+            last_clean_history = history.clone();
             final_reply = if step_acc.text_buf.trim().is_empty() {
                 "(Selesai tanpa teks tambahan)".to_string()
             } else {
@@ -1176,78 +1970,157 @@ pub async fn run_anthropic_turn(
             break;
         }
 
-        let mut tool_result_blocks = Vec::new();
-        for (tu_id, tname, args) in tool_uses {
-            if let Some(app) = &app_handle {
-                let _ = app.emit("agent-step", format!("Menjalankan tool: {tname}..."));
-            }
-            let out_opt = tokio::select! {
-                _ = state.agent_cancel.notified() => {
-                    was_cancelled = true;
-                    None
+        match execute_tool_calls_hybrid(
+            state.clone(),
+            "LocalAgent",
+            pending_calls,
+            &mut cancel_rx,
+            turn_start,
+            turn_budget_secs,
+            &app_handle,
+            Some(&run_ctx),
+        )
+        .await
+        {
+            Ok(exec_results) => {
+                let mut tool_result_blocks = Vec::with_capacity(exec_results.len());
+                let mut requested_approval_msg: Option<String> = None;
+                for item in exec_results {
+                    if item.name == "request_plan_approval" && !item.output.is_error {
+                        requested_approval_msg = Some(item.output.text.clone());
+                    }
+                    steps.push(ToolStepTrace {
+                        tool_name: item.name,
+                        summary: item
+                            .output
+                            .text
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .chars()
+                            .take(80)
+                            .collect(),
+                        tokens_saved: item.tokens_saved,
+                    });
+                    tool_result_blocks.push(json!({
+                        "type": "tool_result",
+                        "tool_use_id": item.id,
+                        "is_error": item.output.is_error,
+                        "content": item.output.text
+                    }));
                 }
-                out = execute_any_tool(state, "LocalAgent", &tname, args) => Some(out),
-            };
-            let Some(out) = out_opt else {
+                history.push(json!({
+                    "role": "user",
+                    "content": tool_result_blocks
+                }));
+                last_clean_history = history.clone();
+                if let Some(msg) = requested_approval_msg {
+                    awaiting_approval = true;
+                    final_reply = if last_streamed_text.trim().is_empty() {
+                        format!(
+                            "Implementation Plan siap ditinjau pada panel Artifacts.\n\n{msg}"
+                        )
+                    } else {
+                        last_streamed_text.clone()
+                    };
+                    break;
+                }
+            }
+            Err(kind) => {
+                interrupt_opt = Some(kind);
                 break;
-            };
-
-            let tokens_saved = {
-                let logs = state.audit_logs.read().await;
-                logs.last().map(|l| l.tokens_saved).unwrap_or(0)
-            };
-            steps.push(ToolStepTrace {
-                tool_name: tname,
-                summary: out
-                    .text
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .take(80)
-                    .collect(),
-                tokens_saved,
-            });
-            tool_result_blocks.push(json!({
-                "type": "tool_result",
-                "tool_use_id": tu_id,
-                "is_error": out.is_error,
-                "content": out.text
-            }));
+            }
         }
 
-        if was_cancelled {
-            break;
-        }
-        history.push(json!({
-            "role": "user",
-            "content": tool_result_blocks
-        }));
-
-        if step_idx == 7 {
-            final_reply = "Batas maksimum 8 langkah tool per giliran tercapai. Kirim pesan lanjutan untuk melanjutkan.".to_string();
+        if step_idx + 1 == max_steps {
+            hit_max_steps = true;
+            final_reply = format!(
+                "Batas maksimum {max_steps} langkah tool per giliran tercapai. Klik Resume Turn atau kirim pesan lanjutan untuk melanjutkan."
+            );
         }
     }
 
-    if was_cancelled {
-        final_reply = if last_streamed_text.trim().is_empty() {
-            "(Dibatalkan oleh user)".to_string()
-        } else {
-            format!(
-                "{}\n\n[Dibatalkan oleh user]",
-                last_streamed_text.trim_end()
-            )
+    let checkpoint_opt = if run_ctx.depth > 0 {
+        None
+    } else if let Some(kind) = interrupt_opt {
+        prune_anthropic_history(&mut last_clean_history, 30);
+        state
+            .agent_manager
+            .set_history("anthropic", &run_ctx.session_id, last_clean_history.clone())
+            .await;
+        if run_ctx.session_id == "default" {
+            *state.anthropic_history.write().await = last_clean_history;
+        }
+        let cp = TurnCheckpointInfo {
+            can_resume: true,
+            reason: kind.reason_str().to_string(),
+            completed_steps: steps.len(),
+            last_tool: steps.last().map(|s| s.tool_name.clone()),
         };
+        state
+            .agent_manager
+            .set_checkpoint(&run_ctx.session_id, Some(cp.clone()))
+            .await;
+        *state.pending_checkpoint.write().await = Some(cp.clone());
+        final_reply =
+            format_interrupted_reply(&last_streamed_text, kind, turn_budget_secs, stream_idle_secs);
+        Some(cp)
+    } else if hit_max_steps {
+        prune_anthropic_history(&mut last_clean_history, 30);
+        state
+            .agent_manager
+            .set_history("anthropic", &run_ctx.session_id, last_clean_history.clone())
+            .await;
+        if run_ctx.session_id == "default" {
+            *state.anthropic_history.write().await = last_clean_history;
+        }
+        let cp = TurnCheckpointInfo {
+            can_resume: true,
+            reason: "max_steps".to_string(),
+            completed_steps: steps.len(),
+            last_tool: steps.last().map(|s| s.tool_name.clone()),
+        };
+        state
+            .agent_manager
+            .set_checkpoint(&run_ctx.session_id, Some(cp.clone()))
+            .await;
+        *state.pending_checkpoint.write().await = Some(cp.clone());
+        Some(cp)
     } else {
-        prune_anthropic_history(&mut history, 30);
-        *state.anthropic_history.write().await = history;
+        prune_anthropic_history(&mut last_clean_history, 30);
+        state
+            .agent_manager
+            .set_history("anthropic", &run_ctx.session_id, last_clean_history.clone())
+            .await;
+        if run_ctx.session_id == "default" {
+            *state.anthropic_history.write().await = last_clean_history;
+        }
+        state
+            .agent_manager
+            .set_checkpoint(&run_ctx.session_id, None)
+            .await;
+        *state.pending_checkpoint.write().await = None;
+        None
+    };
+
+    if awaiting_approval {
+        state
+            .agent_manager
+            .finish_run(
+                &run_ctx.run_id,
+                AgentRunStatus::AwaitingApproval,
+                "Awaiting plan approval".to_string(),
+            )
+            .await;
     }
 
     Ok(ProviderTurnOutcome {
         reply: final_reply,
         steps,
         usage: total_usage,
-        cancelled: was_cancelled,
+        cancelled: interrupt_opt == Some(WatchdogInterrupt::Cancelled),
+        awaiting_approval,
+        checkpoint: checkpoint_opt,
     })
 }
 

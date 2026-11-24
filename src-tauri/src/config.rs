@@ -38,6 +38,22 @@ fn default_anthropic_model() -> String {
     "claude-sonnet-4-20250514".to_string()
 }
 
+fn default_gemini_thinking_mode() -> String {
+    "auto".to_string()
+}
+
+fn default_agent_max_steps() -> usize {
+    16
+}
+
+fn default_agent_turn_timeout_secs() -> u64 {
+    180
+}
+
+fn default_stream_idle_timeout_secs() -> u64 {
+    35
+}
+
 fn default_sensitive_patterns() -> Vec<String> {
     vec![
         ".env".to_string(),
@@ -70,8 +86,19 @@ pub struct DownstreamMcpConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    #[serde(default)]
+    pub plugin_id: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LspServerOverride {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +139,28 @@ pub struct AppConfig {
     pub auto_inject_project_rules: bool,
     #[serde(default)]
     pub downstream_mcps: Vec<DownstreamMcpConfig>,
+    #[serde(default)]
+    pub workspaces: Vec<crate::workspace::WorkspaceProfile>,
+    #[serde(default)]
+    pub default_workspace_id: Option<String>,
+    #[serde(default = "default_gemini_thinking_mode")]
+    pub gemini_thinking_mode: String,
+    #[serde(default = "default_agent_max_steps")]
+    pub agent_max_steps: usize,
+    #[serde(default = "default_agent_turn_timeout_secs")]
+    pub agent_turn_timeout_secs: u64,
+    #[serde(default = "default_stream_idle_timeout_secs")]
+    pub stream_idle_timeout_secs: u64,
+    #[serde(default)]
+    pub disabled_skills: Vec<String>,
+    #[serde(default)]
+    pub installed_plugins: Vec<crate::plugins::InstalledPluginRecord>,
+    #[serde(default)]
+    pub trusted_hook_hashes: HashMap<String, String>,
+    #[serde(default)]
+    pub hooks: Vec<crate::hooks::HookDefinition>,
+    #[serde(default)]
+    pub lsp_servers: HashMap<String, LspServerOverride>,
 }
 
 impl Default for AppConfig {
@@ -135,6 +184,17 @@ impl Default for AppConfig {
             anthropic_model: default_anthropic_model(),
             auto_inject_project_rules: default_true(),
             downstream_mcps: Vec::new(),
+            workspaces: Vec::new(),
+            default_workspace_id: None,
+            gemini_thinking_mode: default_gemini_thinking_mode(),
+            agent_max_steps: default_agent_max_steps(),
+            agent_turn_timeout_secs: default_agent_turn_timeout_secs(),
+            stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
+            disabled_skills: Vec::new(),
+            installed_plugins: Vec::new(),
+            trusted_hook_hashes: HashMap::new(),
+            hooks: Vec::new(),
+            lsp_servers: HashMap::new(),
         }
     }
 }
@@ -178,6 +238,18 @@ impl AppConfig {
         }
 
         Ok(())
+    }
+
+    /// Returns a copy stripped of secrets so plaintext tokens/envs are never written to `config.json`.
+    pub fn sanitized_for_disk(&self) -> Self {
+        let mut cloned = self.clone();
+        cloned.cloudflare_tunnel_token.clear();
+        for mcp in &mut cloned.downstream_mcps {
+            mcp.bearer_token.clear();
+            mcp.env.clear();
+            mcp.headers.clear();
+        }
+        cloned
     }
 
     /// Records a recently used workspace path at the front of the list (max 10).

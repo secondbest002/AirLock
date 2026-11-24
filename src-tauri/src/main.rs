@@ -1,31 +1,48 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod acp_server;
+mod agent_manager;
+mod artifacts;
 mod chat_store;
 mod config;
+mod hooks;
 mod jobs;
 mod local_agent;
+mod lsp_bridge;
 mod mcp_hub;
 mod mcp_resources;
 mod mcp_server;
+mod mcp_tasks;
 mod oauth;
+mod plugins;
+mod process_util;
 mod providers;
 mod secrets;
 mod security;
+mod semantic;
+mod skills;
 mod snapshots;
 mod state;
 mod stdio_bridge;
 mod tools;
 mod tools_extra;
 mod tunnel;
+mod workspace;
 
 use crate::config::{AppConfig, DownstreamMcpConfig};
 use crate::local_agent::{
-    fetch_gemini_models as agent_fetch_models, run_agent_turn, AgentTurnResponse, GeminiModelInfo,
+    fetch_gemini_models as agent_fetch_models, resume_agent_turn_for_session,
+    run_agent_turn_with_options, AgentTurnResponse, GeminiModelInfo,
 };
 use crate::mcp_server::DiagnosticReport;
 use crate::providers::AgentAttachment;
 use crate::state::{AppState, DashboardSnapshot, OAuthDecision, ToolApprovalDecision};
+use crate::workspace::{
+    default_alias_for_path, ensure_unique_alias, normalize_clean_path, paths_equal,
+    resolve_workspace, valid_guardrail_value, WorkspaceProfile,
+};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -45,22 +62,289 @@ async fn set_workspace_root(
     state: State<'_, Arc<AppState>>,
     path: String,
 ) -> Result<DashboardSnapshot, String> {
-    let candidate = PathBuf::from(path.trim());
-    if !candidate.exists() || !candidate.is_dir() {
-        return Err(format!("Folder tidak ditemukan: {}", candidate.display()));
+    let (canon, clean_canon) = normalize_clean_path(&PathBuf::from(path.trim()))?;
+    let chosen_id = {
+        let mut cfg = state.config.write().await;
+        let id = if let Some(existing) = cfg
+            .workspaces
+            .iter_mut()
+            .find(|w| paths_equal(&w.path, &clean_canon))
+        {
+            existing.enabled = true;
+            existing.id.clone()
+        } else {
+            let new_id = format!("ws-{}", &AppState::generate_token()[..8]);
+            let alias = ensure_unique_alias(&default_alias_for_path(&canon), &cfg.workspaces, None);
+            cfg.workspaces.push(WorkspaceProfile {
+                id: new_id.clone(),
+                alias,
+                path: clean_canon.clone(),
+                enabled: true,
+                guardrail_override: None,
+                allow_sensitive_override: None,
+                extra_sensitive_patterns: Vec::new(),
+                pinned: false,
+            });
+            new_id
+        };
+        cfg.default_workspace_id = Some(id.clone());
+        cfg.record_recent_workspace(&clean_canon);
+        id
+    };
+    *state.default_workspace_id.write().await = chosen_id;
+    state.sync_default_workspace_root().await;
+    state.save_config_state().await;
+    state.save_auth_state().await;
+    state.touch_activity().await;
+    let snap = state.snapshot().await;
+    state.emit_dashboard().await;
+    Ok(snap)
+}
+
+#[tauri::command]
+async fn add_workspace(
+    state: State<'_, Arc<AppState>>,
+    path: String,
+    alias: Option<String>,
+    guardrail_override: Option<String>,
+    set_default: Option<bool>,
+) -> Result<DashboardSnapshot, String> {
+    let (canon, clean_canon) = normalize_clean_path(&PathBuf::from(path.trim()))?;
+    let parsed_guard = match guardrail_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "inherit")
+    {
+        Some(g) if valid_guardrail_value(g) => Some(g.to_string()),
+        Some(other) => return Err(format!("Guardrail override tidak valid: {other}")),
+        None => None,
+    };
+
+    let target_id = {
+        let mut cfg = state.config.write().await;
+        let existing_idx = cfg
+            .workspaces
+            .iter()
+            .position(|w| paths_equal(&w.path, &clean_canon));
+
+        let id = if let Some(idx) = existing_idx {
+            let existing_id = cfg.workspaces[idx].id.clone();
+            if let Some(raw_alias) = alias.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                let unique = ensure_unique_alias(raw_alias, &cfg.workspaces, Some(&existing_id));
+                cfg.workspaces[idx].alias = unique;
+            }
+            if guardrail_override.is_some() {
+                cfg.workspaces[idx].guardrail_override = parsed_guard;
+            }
+            cfg.workspaces[idx].enabled = true;
+            existing_id
+        } else {
+            let new_id = format!("ws-{}", &AppState::generate_token()[..8]);
+            let base_alias = alias
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| default_alias_for_path(&canon));
+            let unique_alias = ensure_unique_alias(&base_alias, &cfg.workspaces, None);
+            cfg.workspaces.push(WorkspaceProfile {
+                id: new_id.clone(),
+                alias: unique_alias,
+                path: clean_canon.clone(),
+                enabled: true,
+                guardrail_override: parsed_guard,
+                allow_sensitive_override: None,
+                extra_sensitive_patterns: Vec::new(),
+                pinned: false,
+            });
+            new_id
+        };
+
+        cfg.record_recent_workspace(&clean_canon);
+        if set_default.unwrap_or(false) || cfg.workspaces.len() == 1 {
+            cfg.default_workspace_id = Some(id.clone());
+        }
+        id
+    };
+
+    let should_set_def = set_default.unwrap_or(false)
+        || state.default_workspace_id.read().await.trim().is_empty();
+    if should_set_def {
+        *state.default_workspace_id.write().await = target_id;
     }
-    let canon = std::fs::canonicalize(&candidate)
-        .map_err(|e| format!("Gagal memverifikasi folder: {e}"))?;
-    let raw_canon = canon.display().to_string();
-    let clean_canon = raw_canon
-        .strip_prefix(r"\\?\")
-        .unwrap_or(&raw_canon)
-        .to_string();
-    *state.workspace_root.write().await = canon;
+
+    state.sync_default_workspace_root().await;
+    state.save_config_state().await;
+    state.save_auth_state().await;
+    state.touch_activity().await;
+    let snap = state.snapshot().await;
+    state.emit_dashboard().await;
+    Ok(snap)
+}
+
+#[tauri::command]
+async fn update_workspace(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    alias: Option<String>,
+    enabled: Option<bool>,
+    guardrail_override: Option<String>,
+    allow_sensitive_override: Option<Option<bool>>,
+    pinned: Option<bool>,
+) -> Result<DashboardSnapshot, String> {
+    let ws_id = id.trim().to_string();
+    let mut clear_session_cache = false;
+
     {
         let mut cfg = state.config.write().await;
-        cfg.record_recent_workspace(&clean_canon);
+        let snapshot_list = cfg.workspaces.clone();
+        let idx = cfg
+            .workspaces
+            .iter()
+            .position(|w| w.id == ws_id)
+            .ok_or_else(|| format!("Workspace '{ws_id}' tidak ditemukan."))?;
+
+        if let Some(en) = enabled {
+            if !en {
+                let other_enabled = cfg
+                    .workspaces
+                    .iter()
+                    .enumerate()
+                    .any(|(i, w)| i != idx && w.enabled);
+                if !other_enabled {
+                    return Err("Minimal satu workspace harus tetap aktif.".to_string());
+                }
+            }
+            cfg.workspaces[idx].enabled = en;
+            clear_session_cache = true;
+        }
+
+        if let Some(raw_alias) = alias.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let unique = ensure_unique_alias(raw_alias, &snapshot_list, Some(&ws_id));
+            cfg.workspaces[idx].alias = unique;
+        }
+
+        if let Some(ref g_raw) = guardrail_override {
+            let trimmed = g_raw.trim();
+            if trimmed.is_empty() || trimmed == "inherit" {
+                cfg.workspaces[idx].guardrail_override = None;
+            } else if valid_guardrail_value(trimmed) {
+                cfg.workspaces[idx].guardrail_override = Some(trimmed.to_string());
+            } else {
+                return Err(format!("Guardrail override tidak valid: {trimmed}"));
+            }
+            clear_session_cache = true;
+        }
+
+        if let Some(sens_ov) = allow_sensitive_override {
+            cfg.workspaces[idx].allow_sensitive_override = sens_ov;
+        }
+
+        if let Some(pin) = pinned {
+            cfg.workspaces[idx].pinned = pin;
+        }
+
+        // If default workspace was disabled, promote first remaining enabled workspace
+        if cfg.default_workspace_id.as_deref() == Some(&ws_id) && !cfg.workspaces[idx].enabled {
+            let next_def = cfg
+                .workspaces
+                .iter()
+                .find(|w| w.enabled)
+                .map(|w| w.id.clone());
+            cfg.default_workspace_id = next_def;
+        }
     }
+
+    if clear_session_cache {
+        let prefix = format!("{ws_id}::");
+        state
+            .session_approved_tools
+            .write()
+            .await
+            .retain(|k| !k.starts_with(&prefix));
+    }
+
+    let next_def_id = state.config.read().await.default_workspace_id.clone().unwrap_or_default();
+    *state.default_workspace_id.write().await = next_def_id;
+    state.sync_default_workspace_root().await;
+    state.save_config_state().await;
+    state.save_auth_state().await;
+    let snap = state.snapshot().await;
+    state.emit_dashboard().await;
+    Ok(snap)
+}
+
+#[tauri::command]
+async fn remove_workspace(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<DashboardSnapshot, String> {
+    let ws_id = id.trim().to_string();
+    {
+        let mut cfg = state.config.write().await;
+        if cfg.workspaces.len() <= 1 {
+            return Err("Tidak dapat menghapus satu-satunya workspace yang terpasang.".to_string());
+        }
+        let before = cfg.workspaces.len();
+        cfg.workspaces.retain(|w| w.id != ws_id);
+        if cfg.workspaces.len() == before {
+            return Err(format!("Workspace '{ws_id}' tidak ditemukan."));
+        }
+        if !cfg.workspaces.iter().any(|w| w.enabled) {
+            if let Some(first) = cfg.workspaces.first_mut() {
+                first.enabled = true;
+            }
+        }
+        if cfg.default_workspace_id.as_deref() == Some(&ws_id) {
+            cfg.default_workspace_id = cfg
+                .workspaces
+                .iter()
+                .find(|w| w.enabled)
+                .map(|w| w.id.clone());
+        }
+    }
+
+    let prefix = format!("{ws_id}::");
+    state
+        .session_approved_tools
+        .write()
+        .await
+        .retain(|k| !k.starts_with(&prefix));
+
+    let next_def_id = state.config.read().await.default_workspace_id.clone().unwrap_or_default();
+    *state.default_workspace_id.write().await = next_def_id;
+    state.sync_default_workspace_root().await;
+    state.save_config_state().await;
+    state.save_auth_state().await;
+    let snap = state.snapshot().await;
+    state.emit_dashboard().await;
+    Ok(snap)
+}
+
+#[tauri::command]
+async fn set_default_workspace(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<DashboardSnapshot, String> {
+    let ws_id = id.trim().to_string();
+    let (prof_id, prof_path) = {
+        let mut cfg = state.config.write().await;
+        let (pid, ppath) = {
+            let prof = cfg
+                .workspaces
+                .iter_mut()
+                .find(|w| w.id == ws_id || w.alias.eq_ignore_ascii_case(&ws_id))
+                .ok_or_else(|| format!("Workspace '{ws_id}' tidak ditemukan."))?;
+            prof.enabled = true;
+            (prof.id.clone(), prof.path.clone())
+        };
+        cfg.default_workspace_id = Some(pid.clone());
+        cfg.record_recent_workspace(&ppath);
+        (pid, ppath)
+    };
+    let _ = prof_path;
+    *state.default_workspace_id.write().await = prof_id;
+    state.sync_default_workspace_root().await;
     state.save_config_state().await;
     state.save_auth_state().await;
     state.touch_activity().await;
@@ -81,10 +365,8 @@ async fn configure_gemini(
         let mut cfg = state.gemini_config.write().await;
         if trimmed == "__CLEAR__" {
             secs.gemini_api_key.clear();
-            cfg.api_key.clear();
         } else if !trimmed.is_empty() {
             secs.gemini_api_key = trimmed.to_string();
-            cfg.api_key = trimmed.to_string();
         }
         if !model.trim().is_empty() {
             cfg.model = model.trim().to_string();
@@ -98,10 +380,23 @@ async fn configure_gemini(
 }
 
 #[tauri::command]
-async fn clear_agent_history(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.gemini_config.write().await.history.clear();
-    state.openai_history.write().await.clear();
-    state.anthropic_history.write().await.clear();
+async fn clear_agent_history(
+    state: State<'_, Arc<AppState>>,
+    session_id: Option<String>,
+) -> Result<(), String> {
+    let clean_sid = session_id
+        .as_deref()
+        .map(artifacts::ArtifactStore::sanitize_session_id);
+    state
+        .agent_manager
+        .clear_history(clean_sid.as_deref())
+        .await;
+    if clean_sid.is_none() || clean_sid.as_deref() == Some("default") {
+        state.gemini_config.write().await.history.clear();
+        state.openai_history.write().await.clear();
+        state.anthropic_history.write().await.clear();
+        *state.pending_checkpoint.write().await = None;
+    }
     Ok(())
 }
 
@@ -110,8 +405,45 @@ async fn run_local_agent_turn(
     state: State<'_, Arc<AppState>>,
     prompt: String,
     attachments: Option<Vec<AgentAttachment>>,
+    session_id: Option<String>,
+    execution_mode: Option<String>,
+    workspace_alias: Option<String>,
 ) -> Result<AgentTurnResponse, String> {
-    run_agent_turn(&state, prompt, attachments.unwrap_or_default()).await
+    run_agent_turn_with_options(
+        state.inner().clone(),
+        prompt,
+        attachments.unwrap_or_default(),
+        session_id,
+        execution_mode,
+        workspace_alias,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn resume_local_agent_turn(
+    state: State<'_, Arc<AppState>>,
+    session_id: Option<String>,
+) -> Result<AgentTurnResponse, String> {
+    resume_agent_turn_for_session(state.inner().clone(), session_id).await
+}
+
+#[tauri::command]
+async fn discard_agent_checkpoint(
+    state: State<'_, Arc<AppState>>,
+    session_id: Option<String>,
+) -> Result<DashboardSnapshot, String> {
+    let clean_sid = session_id
+        .as_deref()
+        .map(artifacts::ArtifactStore::sanitize_session_id)
+        .unwrap_or_else(|| "default".to_string());
+    state.agent_manager.set_checkpoint(&clean_sid, None).await;
+    if clean_sid == "default" {
+        *state.pending_checkpoint.write().await = None;
+    }
+    let snap = state.snapshot().await;
+    state.emit_dashboard().await;
+    Ok(snap)
 }
 
 #[tauri::command]
@@ -151,7 +483,13 @@ async fn stop_tunnel(state: State<'_, Arc<AppState>>) -> Result<DashboardSnapsho
 
 #[tauri::command]
 async fn rotate_auth_token(state: State<'_, Arc<AppState>>) -> Result<DashboardSnapshot, String> {
-    *state.auth_token.write().await = AppState::generate_token();
+    let next_tok = AppState::generate_token();
+    *state.auth_token.write().await = next_tok.clone();
+    {
+        let mut secs = state.provider_secrets.write().await;
+        secs.auth_token = next_tok;
+        state.secrets_store.save(&secs)?;
+    }
     state.save_auth_state().await;
     let snap = state.snapshot().await;
     state.emit_dashboard().await;
@@ -326,14 +664,19 @@ async fn configure_cloudflare_named(
     token: String,
     public_url: String,
 ) -> Result<DashboardSnapshot, String> {
+    let tok_trim = token.trim();
+    if tok_trim == "__CLEAR__" || !tok_trim.is_empty() {
+        let mut secs = state.provider_secrets.write().await;
+        if tok_trim == "__CLEAR__" {
+            secs.cloudflare_tunnel_token.clear();
+        } else {
+            secs.cloudflare_tunnel_token = tok_trim.to_string();
+        }
+        state.secrets_store.save(&secs)?;
+    }
     {
         let mut cfg = state.config.write().await;
-        let tok_trim = token.trim();
-        if tok_trim == "__CLEAR__" {
-            cfg.cloudflare_tunnel_token.clear();
-        } else if !tok_trim.is_empty() {
-            cfg.cloudflare_tunnel_token = tok_trim.to_string();
-        }
+        cfg.cloudflare_tunnel_token.clear();
         cfg.cloudflare_public_url = public_url.trim().trim_end_matches('/').to_string();
     }
     state.save_config_state().await;
@@ -368,8 +711,25 @@ async fn open_in_editor(
     state: State<'_, Arc<AppState>>,
     rel_path: Option<String>,
     mode: String,
+    workspace_alias: Option<String>,
+    workspace_root: Option<String>,
 ) -> Result<String, String> {
-    let root = state.workspace_root.read().await.clone();
+    let root = if let Some(explicit_root) = workspace_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        normalize_clean_path(std::path::Path::new(explicit_root))
+            .map(|(canon, _)| canon)?
+    } else if let Some(alias) = workspace_alias
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        resolve_workspace(&state, Some(alias), None).await?.canon_root
+    } else {
+        state.workspace_root.read().await.clone()
+    };
     let target = security::resolve_jailed_path(&root, rel_path.as_deref().unwrap_or("."))?;
     if !target.exists() {
         return Err(format!("Target path tidak ditemukan: {}", target.display()));
@@ -427,14 +787,46 @@ async fn open_in_editor(
 }
 
 #[tauri::command]
-async fn cancel_local_agent(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.agent_cancel.notify_waiters();
+async fn cancel_local_agent(
+    state: State<'_, Arc<AppState>>,
+    run_id: Option<String>,
+) -> Result<(), String> {
+    state.agent_manager.cancel_run(run_id.as_deref()).await;
+    if run_id.is_none() {
+        state.cancel_agent();
+    }
+    let app_handle = state.app_handle.read().await.clone();
+    local_agent::emit_runs_updated(&app_handle, &state).await;
     Ok(())
 }
 
 #[tauri::command]
-async fn fetch_gemini_models(api_key: String) -> Result<Vec<GeminiModelInfo>, String> {
-    agent_fetch_models(api_key).await
+async fn cancel_agent_run(
+    state: State<'_, Arc<AppState>>,
+    run_id: Option<String>,
+) -> Result<Vec<agent_manager::AgentRunSummary>, String> {
+    state.agent_manager.cancel_run(run_id.as_deref()).await;
+    if run_id.is_none() {
+        state.cancel_agent();
+    }
+    let app_handle = state.app_handle.read().await.clone();
+    local_agent::emit_runs_updated(&app_handle, &state).await;
+    Ok(state.agent_manager.list_runs().await)
+}
+
+#[tauri::command]
+async fn list_agent_runs(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<agent_manager::AgentRunSummary>, String> {
+    Ok(state.agent_manager.list_runs().await)
+}
+
+#[tauri::command]
+async fn fetch_gemini_models(
+    state: State<'_, Arc<AppState>>,
+    api_key: String,
+) -> Result<Vec<GeminiModelInfo>, String> {
+    agent_fetch_models(&state.http_client, api_key).await
 }
 
 #[tauri::command]
@@ -470,6 +862,39 @@ async fn resolve_tool_approval(
     if let Some(app) = state.app_handle.read().await.clone() {
         let _ = app.emit("tool-approval-resolved", &request_id);
     }
+    let snap = state.snapshot().await;
+    state.emit_dashboard().await;
+    Ok(snap)
+}
+
+#[tauri::command]
+async fn resolve_mcp_elicitation(
+    state: State<'_, Arc<AppState>>,
+    request_id: String,
+    action: String,
+    content: Option<Value>,
+) -> Result<DashboardSnapshot, String> {
+    let parsed_action = match action.trim() {
+        "accept" => crate::state::ElicitationAction::Accept,
+        "decline" => crate::state::ElicitationAction::Decline,
+        "cancel" => crate::state::ElicitationAction::Cancel,
+        other => return Err(format!("Keputusan elicitation tidak valid: {other}")),
+    };
+    mcp_hub::resolve_mcp_elicitation(&state, &request_id, parsed_action, content).await?;
+    if let Some(app) = state.app_handle.read().await.clone() {
+        let _ = app.emit("mcp-elicitation-resolved", &request_id);
+    }
+    let snap = state.snapshot().await;
+    state.emit_dashboard().await;
+    Ok(snap)
+}
+
+#[tauri::command]
+async fn stop_lsp_server(
+    state: State<'_, Arc<AppState>>,
+    key: Option<String>,
+) -> Result<DashboardSnapshot, String> {
+    let _ = state.lsp_manager.stop_server(key.as_deref()).await;
     let snap = state.snapshot().await;
     state.emit_dashboard().await;
     Ok(snap)
@@ -537,29 +962,54 @@ async fn upsert_downstream_mcp(
     }
     let tok_trim = cfg.bearer_token.trim().to_string();
 
+    let hydrated_cfg = {
+        let mut secs = state.provider_secrets.write().await;
+        if tok_trim == "__CLEAR__" {
+            secs.downstream_bearer_tokens.remove(&cfg.id);
+            cfg.bearer_token.clear();
+        } else if tok_trim.is_empty() {
+            cfg.bearer_token = secs
+                .downstream_bearer_tokens
+                .get(&cfg.id)
+                .cloned()
+                .unwrap_or_default();
+        } else {
+            secs.downstream_bearer_tokens
+                .insert(cfg.id.clone(), tok_trim.clone());
+            cfg.bearer_token = tok_trim;
+        }
+
+        if cfg.env.is_empty() {
+            secs.downstream_envs.remove(&cfg.id);
+        } else {
+            secs.downstream_envs.insert(cfg.id.clone(), cfg.env.clone());
+        }
+        state.secrets_store.save(&secs)?;
+        cfg.clone()
+    };
+
+    let mut sanitized_cfg = hydrated_cfg.clone();
+    sanitized_cfg.bearer_token.clear();
+    sanitized_cfg.env.clear();
+
     {
         let mut app_cfg = state.config.write().await;
-        if let Some(existing) = app_cfg.downstream_mcps.iter_mut().find(|c| c.id == cfg.id) {
-            if tok_trim == "__CLEAR__" {
-                cfg.bearer_token.clear();
-            } else if tok_trim.is_empty() && !existing.bearer_token.is_empty() {
-                cfg.bearer_token = existing.bearer_token.clone();
-            } else {
-                cfg.bearer_token = tok_trim;
-            }
-            *existing = cfg.clone();
+        if let Some(existing) = app_cfg
+            .downstream_mcps
+            .iter_mut()
+            .find(|c| c.id == sanitized_cfg.id)
+        {
+            *existing = sanitized_cfg;
         } else {
-            cfg.bearer_token = if tok_trim == "__CLEAR__" {
-                String::new()
-            } else {
-                tok_trim
-            };
-            app_cfg.downstream_mcps.push(cfg.clone());
+            app_cfg.downstream_mcps.push(sanitized_cfg);
         }
     }
 
     state.save_config_state().await;
-    let _ = state.mcp_hub.refresh_server(&cfg).await;
+    let _ = state
+        .mcp_hub
+        .refresh_server(&state.http_client, &hydrated_cfg)
+        .await;
     let snap = state.snapshot().await;
     state.emit_dashboard().await;
     Ok(snap)
@@ -571,8 +1021,30 @@ async fn remove_downstream_mcp(
     id: String,
 ) -> Result<DashboardSnapshot, String> {
     {
+        let app_cfg = state.config.read().await;
+        let managed_by_plugin = id.contains("::")
+            || app_cfg
+                .installed_plugins
+                .iter()
+                .any(|p| p.mcp_server_ids.iter().any(|sid| sid == &id));
+        if managed_by_plugin {
+            return Err(
+                "Server MCP ini dikelola oleh plugin — nonaktifkan atau uninstall lewat panel Installed Plugins."
+                    .to_string(),
+            );
+        }
+    }
+    {
         let mut app_cfg = state.config.write().await;
         app_cfg.downstream_mcps.retain(|c| c.id != id);
+    }
+    {
+        let mut secs = state.provider_secrets.write().await;
+        let removed_tok = secs.downstream_bearer_tokens.remove(&id).is_some();
+        let removed_env = secs.downstream_envs.remove(&id).is_some();
+        if removed_tok || removed_env {
+            let _ = state.secrets_store.save(&secs);
+        }
     }
     state.mcp_hub.remove_server(&id).await;
     state.save_config_state().await;
@@ -586,16 +1058,16 @@ async fn refresh_downstream_mcp(
     state: State<'_, Arc<AppState>>,
     id: String,
 ) -> Result<DashboardSnapshot, String> {
-    let target_cfg = {
-        let app_cfg = state.config.read().await;
-        app_cfg
-            .downstream_mcps
-            .iter()
-            .find(|c| c.id == id)
-            .cloned()
-    };
+    let target_cfg = state
+        .resolved_downstream_mcps()
+        .await
+        .into_iter()
+        .find(|c| c.id == id);
     if let Some(cfg) = target_cfg {
-        let _ = state.mcp_hub.refresh_server(&cfg).await;
+        let _ = state
+            .mcp_hub
+            .refresh_server(&state.http_client, &cfg)
+            .await;
     } else {
         return Err(format!("Downstream MCP server '{id}' tidak ditemukan."));
     }
@@ -612,6 +1084,10 @@ async fn configure_agent_provider(
     base_url: Option<String>,
     model: Option<String>,
     auto_inject_project_rules: Option<bool>,
+    gemini_thinking_mode: Option<String>,
+    agent_max_steps: Option<usize>,
+    agent_turn_timeout_secs: Option<u64>,
+    stream_idle_timeout_secs: Option<u64>,
 ) -> Result<DashboardSnapshot, String> {
     let prov = provider.trim().to_string();
     if !matches!(prov.as_str(), "gemini" | "openai_compat" | "anthropic") {
@@ -624,6 +1100,22 @@ async fn configure_agent_provider(
         app_cfg.agent_provider = prov.clone();
         if let Some(rules_flag) = auto_inject_project_rules {
             app_cfg.auto_inject_project_rules = rules_flag;
+        }
+        if let Some(ref tm) = gemini_thinking_mode {
+            let norm = tm.trim().to_ascii_lowercase();
+            if !matches!(norm.as_str(), "auto" | "off" | "low" | "medium" | "high") {
+                return Err(format!("Mode thinking Gemini tidak valid: {norm}"));
+            }
+            app_cfg.gemini_thinking_mode = norm;
+        }
+        if let Some(steps) = agent_max_steps {
+            app_cfg.agent_max_steps = steps.clamp(4, 30);
+        }
+        if let Some(budget) = agent_turn_timeout_secs {
+            app_cfg.agent_turn_timeout_secs = budget.clamp(30, 600);
+        }
+        if let Some(idle) = stream_idle_timeout_secs {
+            app_cfg.stream_idle_timeout_secs = idle.clamp(10, 120);
         }
         if let Some(ref bu) = base_url {
             let trimmed_bu = bu.trim().trim_end_matches('/');
@@ -668,13 +1160,10 @@ async fn configure_agent_provider(
                 }
             }
             _ => {
-                let mut gcfg = state.gemini_config.write().await;
                 if key_trim == "__CLEAR__" {
                     secs.gemini_api_key.clear();
-                    gcfg.api_key.clear();
                 } else {
                     secs.gemini_api_key = key_trim.to_string();
-                    gcfg.api_key = key_trim.to_string();
                 }
             }
         }
@@ -713,20 +1202,15 @@ async fn fetch_provider_models(
             } else {
                 state.provider_secrets.read().await.openai_api_key.clone()
             };
-            providers::fetch_openai_compat_models(eff_base, eff_key).await
+            providers::fetch_openai_compat_models(&state.http_client, eff_base, eff_key).await
         }
         _ => {
             let eff_key = if !trimmed_key.is_empty() {
                 trimmed_key
             } else {
-                let sec = state.provider_secrets.read().await.gemini_api_key.clone();
-                if !sec.is_empty() {
-                    sec
-                } else {
-                    state.gemini_config.read().await.api_key.clone()
-                }
+                state.provider_secrets.read().await.gemini_api_key.clone()
             };
-            agent_fetch_models(eff_key).await
+            agent_fetch_models(&state.http_client, eff_key).await
         }
     }
 }
@@ -762,6 +1246,297 @@ async fn delete_chat_session(
     state.chat_store.delete_session(&ws, &session_id)
 }
 
+#[derive(serde::Serialize)]
+struct ArtifactFeedbackResult {
+    artifact: artifacts::ArtifactDocument,
+    feedback_prompt: String,
+}
+
+#[tauri::command]
+async fn list_session_artifacts(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    workspace_alias: Option<String>,
+) -> Result<Vec<artifacts::ArtifactDocument>, String> {
+    let ws = resolve_workspace(&state, workspace_alias.as_deref(), None).await?;
+    Ok(state
+        .artifact_store
+        .list_session_artifacts(&ws.clean_path, &session_id)
+        .await)
+}
+
+#[tauri::command]
+async fn add_artifact_comment(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    artifact_id: String,
+    line_anchor: Option<u32>,
+    quote: Option<String>,
+    body: String,
+    workspace_alias: Option<String>,
+) -> Result<artifacts::ArtifactDocument, String> {
+    let ws = resolve_workspace(&state, workspace_alias.as_deref(), None).await?;
+    let doc = state
+        .artifact_store
+        .add_comment(
+            &ws.clean_path,
+            &session_id,
+            &artifact_id,
+            line_anchor,
+            quote,
+            &body,
+        )
+        .await?;
+    if let Some(app) = state.app_handle.read().await.clone() {
+        let _ = app.emit("artifact-updated", &doc);
+    }
+    Ok(doc)
+}
+
+#[tauri::command]
+async fn resolve_artifact_comment(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    artifact_id: String,
+    comment_id: String,
+    resolved: bool,
+    workspace_alias: Option<String>,
+) -> Result<artifacts::ArtifactDocument, String> {
+    let ws = resolve_workspace(&state, workspace_alias.as_deref(), None).await?;
+    let doc = state
+        .artifact_store
+        .resolve_comment(&ws.clean_path, &session_id, &artifact_id, &comment_id, resolved)
+        .await?;
+    if let Some(app) = state.app_handle.read().await.clone() {
+        let _ = app.emit("artifact-updated", &doc);
+    }
+    Ok(doc)
+}
+
+#[tauri::command]
+async fn approve_artifact(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    artifact_id: String,
+    workspace_alias: Option<String>,
+) -> Result<artifacts::ArtifactDocument, String> {
+    let ws = resolve_workspace(&state, workspace_alias.as_deref(), None).await?;
+    let doc = state
+        .artifact_store
+        .approve_artifact(&ws.clean_path, &session_id, &artifact_id)
+        .await?;
+    if let Some(app) = state.app_handle.read().await.clone() {
+        let _ = app.emit("artifact-updated", &doc);
+    }
+    Ok(doc)
+}
+
+#[tauri::command]
+async fn request_artifact_changes(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    artifact_id: String,
+    workspace_alias: Option<String>,
+) -> Result<ArtifactFeedbackResult, String> {
+    let ws = resolve_workspace(&state, workspace_alias.as_deref(), None).await?;
+    let (doc, feedback_prompt) = state
+        .artifact_store
+        .request_changes_and_format_feedback(&ws.clean_path, &session_id, &artifact_id)
+        .await?;
+    if let Some(app) = state.app_handle.read().await.clone() {
+        let _ = app.emit("artifact-updated", &doc);
+    }
+    Ok(ArtifactFeedbackResult {
+        artifact: doc,
+        feedback_prompt,
+    })
+}
+
+#[tauri::command]
+async fn export_artifact_to_workspace(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    artifact_id: String,
+    workspace_alias: Option<String>,
+) -> Result<String, String> {
+    let ws = resolve_workspace(&state, workspace_alias.as_deref(), None).await?;
+    state
+        .artifact_store
+        .export_artifact_to_workspace(&ws.clean_path, &ws.canon_root, &session_id, &artifact_id)
+        .await
+}
+
+#[tauri::command]
+async fn list_workflows(
+    state: State<'_, Arc<AppState>>,
+    workspace_alias: Option<String>,
+) -> Result<Vec<hooks::WorkflowSummary>, String> {
+    let ws = resolve_workspace(&state, workspace_alias.as_deref(), None).await?;
+    Ok(hooks::list_workflows(&ws.canon_root))
+}
+
+#[tauri::command]
+async fn get_workspace_hooks_status(
+    state: State<'_, Arc<AppState>>,
+    workspace_alias: Option<String>,
+) -> Result<hooks::HooksStatusSummary, String> {
+    let ws = resolve_workspace(&state, workspace_alias.as_deref(), None).await?;
+    Ok(hooks::get_hooks_status(&state, &ws).await)
+}
+
+#[tauri::command]
+async fn trust_workspace_hooks(
+    state: State<'_, Arc<AppState>>,
+    workspace_alias: Option<String>,
+    expected_sha256: String,
+) -> Result<hooks::HooksStatusSummary, String> {
+    let ws = resolve_workspace(&state, workspace_alias.as_deref(), None).await?;
+    let status = hooks::trust_workspace_hooks(&state, &ws, &expected_sha256).await?;
+    state.emit_dashboard().await;
+    Ok(status)
+}
+
+#[tauri::command]
+async fn list_skills(state: State<'_, Arc<AppState>>) -> Result<Vec<skills::SkillSummary>, String> {
+    let entries = state.refresh_skills().await;
+    Ok(entries.into_iter().map(|s| s.summary).collect())
+}
+
+#[tauri::command]
+async fn get_skill_detail(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+) -> Result<skills::SkillDetail, String> {
+    let trimmed = name.trim();
+    let entries = state.refresh_skills().await;
+    let entry = entries
+        .into_iter()
+        .find(|s| s.summary.name.eq_ignore_ascii_case(trimmed))
+        .ok_or_else(|| format!("Skill '{trimmed}' tidak ditemukan."))?;
+    Ok(skills::SkillDetail {
+        summary: entry.summary,
+        body_md: entry.body_md,
+        raw_md: entry.raw_md,
+    })
+}
+
+#[tauri::command]
+async fn toggle_skill_enabled(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    enabled: bool,
+) -> Result<DashboardSnapshot, String> {
+    let norm = name.trim().to_ascii_lowercase();
+    if norm.is_empty() {
+        return Err("Nama skill tidak boleh kosong.".to_string());
+    }
+    {
+        let mut cfg = state.config.write().await;
+        cfg.disabled_skills
+            .retain(|existing| !existing.eq_ignore_ascii_case(&norm));
+        if !enabled {
+            cfg.disabled_skills.push(norm);
+        }
+    }
+    state.save_config_state().await;
+    let _ = state.refresh_skills().await;
+    let snap = state.snapshot().await;
+    state.emit_dashboard().await;
+    Ok(snap)
+}
+
+#[tauri::command]
+async fn create_global_skill(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    description: String,
+    body_md: String,
+) -> Result<DashboardSnapshot, String> {
+    let global_dir = state
+        .global_skills_dir()
+        .ok_or_else(|| "Direktori global skills tidak tersedia.".to_string())?;
+    skills::create_global_skill_file(&global_dir, &name, &description, &body_md)?;
+    let _ = state.refresh_skills().await;
+    let snap = state.snapshot().await;
+    state.emit_dashboard().await;
+    Ok(snap)
+}
+
+#[tauri::command]
+async fn rescan_skills(state: State<'_, Arc<AppState>>) -> Result<DashboardSnapshot, String> {
+    let _ = state.refresh_skills().await;
+    let snap = state.snapshot().await;
+    state.emit_dashboard().await;
+    Ok(snap)
+}
+
+#[tauri::command]
+async fn inspect_plugin_source(
+    state: State<'_, Arc<AppState>>,
+    source_type: String,
+    location: String,
+    subdir: Option<String>,
+) -> Result<plugins::PluginInstallPreview, String> {
+    plugins::inspect_plugin_source(&state, &source_type, &location, subdir.as_deref()).await
+}
+
+#[tauri::command]
+async fn cancel_plugin_staging(
+    state: State<'_, Arc<AppState>>,
+    staging_id: String,
+) -> Result<(), String> {
+    plugins::cancel_staging(&state, &staging_id).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn confirm_install_plugin(
+    state: State<'_, Arc<AppState>>,
+    staging_id: String,
+    enable_immediately: bool,
+    secrets: HashMap<String, String>,
+) -> Result<DashboardSnapshot, String> {
+    plugins::confirm_install_plugin(&state, &staging_id, enable_immediately, secrets).await?;
+    let snap = state.snapshot().await;
+    state.emit_dashboard().await;
+    Ok(snap)
+}
+
+#[tauri::command]
+async fn toggle_plugin(
+    state: State<'_, Arc<AppState>>,
+    plugin_id: String,
+    enabled: bool,
+) -> Result<DashboardSnapshot, String> {
+    plugins::toggle_plugin(&state, &plugin_id, enabled).await?;
+    let snap = state.snapshot().await;
+    state.emit_dashboard().await;
+    Ok(snap)
+}
+
+#[tauri::command]
+async fn update_plugin_secrets(
+    state: State<'_, Arc<AppState>>,
+    plugin_id: String,
+    secrets: HashMap<String, String>,
+) -> Result<DashboardSnapshot, String> {
+    plugins::update_plugin_secrets(&state, &plugin_id, secrets).await?;
+    let snap = state.snapshot().await;
+    state.emit_dashboard().await;
+    Ok(snap)
+}
+
+#[tauri::command]
+async fn uninstall_plugin(
+    state: State<'_, Arc<AppState>>,
+    plugin_id: String,
+) -> Result<DashboardSnapshot, String> {
+    plugins::uninstall_plugin(&state, &plugin_id).await?;
+    let snap = state.snapshot().await;
+    state.emit_dashboard().await;
+    Ok(snap)
+}
+
 fn default_workspace_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
@@ -769,6 +1544,9 @@ fn default_workspace_dir() -> PathBuf {
 fn main() {
     if std::env::args().any(|a| a == "--stdio") {
         std::process::exit(stdio_bridge::run_stdio_bridge());
+    }
+    if std::env::args().any(|a| a == "--acp") {
+        std::process::exit(acp_server::run_acp_server());
     }
 
     let app_state = Arc::new(AppState::new_persistent(
@@ -796,11 +1574,16 @@ fn main() {
             let state_for_handle = state_setup.clone();
             tauri::async_runtime::spawn(async move {
                 *state_for_handle.app_handle.write().await = Some(handle);
+                plugins::cleanup_stale_staging(&state_for_handle.plugins_dir());
+                let _ = state_for_handle.refresh_skills().await;
                 let _ = mcp_server::start_server(state_for_handle.clone()).await;
                 tunnel::sync_existing_tailscale_funnel(state_for_handle.clone()).await;
-                let cfgs = state_for_handle.config.read().await.downstream_mcps.clone();
+                let cfgs = state_for_handle.resolved_downstream_mcps().await;
                 if !cfgs.is_empty() {
-                    state_for_handle.mcp_hub.refresh_all(&cfgs).await;
+                    state_for_handle
+                        .mcp_hub
+                        .refresh_all(&state_for_handle.http_client, &cfgs)
+                        .await;
                 }
                 state_for_handle.emit_dashboard().await;
             });
@@ -810,6 +1593,11 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(30)).await;
+                    state_for_idle.mcp_tasks.gc_expired_tasks().await;
+                    state_for_idle
+                        .lsp_manager
+                        .reap_idle_servers(Duration::from_secs(300))
+                        .await;
                     let timeout_mins = state_for_idle.idle_timeout_mins.load(Ordering::SeqCst);
                     if timeout_mins == 0 {
                         continue;
@@ -883,6 +1671,7 @@ fn main() {
                             tauri::async_runtime::spawn(async move {
                                 jobs::stop_all_jobs(&st).await;
                                 st.mcp_hub.shutdown_all().await;
+                                st.lsp_manager.shutdown_all().await;
                                 tunnel::stop_tunnel(&st).await;
                                 mcp_server::stop_server(&st).await;
                                 app_clone.exit(0);
@@ -913,9 +1702,15 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_dashboard_state,
             set_workspace_root,
+            add_workspace,
+            update_workspace,
+            remove_workspace,
+            set_default_workspace,
             configure_gemini,
             clear_agent_history,
             run_local_agent_turn,
+            resume_local_agent_turn,
+            discard_agent_checkpoint,
             start_mcp_server,
             stop_mcp_server,
             start_tunnel,
@@ -936,9 +1731,13 @@ fn main() {
             run_self_diagnostic,
             open_in_editor,
             cancel_local_agent,
+            cancel_agent_run,
+            list_agent_runs,
             fetch_gemini_models,
             set_guardrail_mode,
             resolve_tool_approval,
+            resolve_mcp_elicitation,
+            stop_lsp_server,
             revert_audit_group,
             list_background_jobs,
             get_background_job_logs,
@@ -951,7 +1750,27 @@ fn main() {
             fetch_provider_models,
             list_chat_sessions,
             save_chat_session,
-            delete_chat_session
+            delete_chat_session,
+            list_session_artifacts,
+            add_artifact_comment,
+            resolve_artifact_comment,
+            approve_artifact,
+            request_artifact_changes,
+            export_artifact_to_workspace,
+            list_workflows,
+            get_workspace_hooks_status,
+            trust_workspace_hooks,
+            list_skills,
+            get_skill_detail,
+            toggle_skill_enabled,
+            create_global_skill,
+            rescan_skills,
+            inspect_plugin_source,
+            cancel_plugin_staging,
+            confirm_install_plugin,
+            toggle_plugin,
+            update_plugin_secrets,
+            uninstall_plugin
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

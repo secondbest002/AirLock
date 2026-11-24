@@ -129,6 +129,9 @@ mod tests {
             post_edit_hash: Some("deadbeef".to_string()),
             group_id: Some("turn-1".to_string()),
             move_from_path: None,
+            workspace_id: None,
+            workspace_alias: None,
+            workspace_root: None,
         };
 
         store.save_audit_entries(&[entry]);

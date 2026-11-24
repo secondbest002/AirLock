@@ -1,4 +1,5 @@
 use crate::mcp_server::compute_base_url;
+use crate::security::{hash_oauth_token, secure_token_eq};
 use crate::state::{
     AppState, HttpTrafficEntry, OAuthClient, OAuthCode, OAuthDecision, OAuthTokenRecord,
     PendingOAuthInfo,
@@ -64,7 +65,7 @@ pub async fn handle_oauth_authorization_server(
         "scopes_supported": ["mcp", "mcp:read", "mcp:write"],
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
-        "code_challenge_methods_supported": ["S256", "plain"],
+        "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic", "none"]
     }))
 }
@@ -246,11 +247,44 @@ pub async fn handle_oauth_authorize(
     }
 
     let client_id = params.get("client_id").cloned().unwrap_or_default();
-    let challenge = params.get("code_challenge").cloned();
+    if client_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_request",
+                "error_description": "client_id is required"
+            })),
+        )
+            .into_response();
+    }
+
+    let challenge_raw = params.get("code_challenge").cloned().unwrap_or_default();
     let method = params
         .get("code_challenge_method")
         .cloned()
         .unwrap_or_else(|| "S256".to_string());
+    if challenge_raw.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_request",
+                "error_description": "PKCE code_challenge (S256) is required"
+            })),
+        )
+            .into_response();
+    }
+    if method != "S256" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_request",
+                "error_description": "Only code_challenge_method=S256 is supported"
+            })),
+        )
+            .into_response();
+    }
+    let challenge = Some(challenge_raw);
+
     let oauth_state = params.get("state").cloned();
     let scope = params
         .get("scope")
@@ -260,14 +294,29 @@ pub async fn handle_oauth_authorize(
 
     let (is_trusted_client, client_name) = {
         let clients = state.oauth_clients.read().await;
-        if let Some(client) = clients.get(&client_id) {
-            let uri_allowed = client.redirect_uris.is_empty()
-                || client.redirect_uris.iter().any(|u| u == &redirect_uri);
-            let trusted = !client_id.is_empty() && client.trusted && uri_allowed;
-            (trusted, client.client_name.clone())
-        } else {
-            (false, None)
+        let Some(client) = clients.get(&client_id) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid_client",
+                    "error_description": "Unknown client_id. Register first via /oauth/register."
+                })),
+            )
+                .into_response();
+        };
+        let uri_allowed = client.redirect_uris.is_empty()
+            || client.redirect_uris.iter().any(|u| u == &redirect_uri);
+        if !uri_allowed {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid_redirect_uri",
+                    "error_description": "redirect_uri is not registered for this client_id"
+                })),
+            )
+                .into_response();
         }
+        (client.trusted, client.client_name.clone())
     };
 
     if !is_trusted_client && state.require_oauth_consent.load(Ordering::SeqCst) {
@@ -312,19 +361,11 @@ pub async fn handle_oauth_authorize(
                 if !client_id.is_empty() {
                     {
                         let mut clients = state.oauth_clients.write().await;
-                        let entry = clients.entry(client_id.clone()).or_insert_with(|| OAuthClient {
-                            client_id: client_id.clone(),
-                            client_secret: String::new(),
-                            auth_method: "none".to_string(),
-                            client_name: None,
-                            redirect_uris: vec![redirect_uri.clone()],
-                            trusted: true,
-                            created_at_epoch: AppState::now_epoch_secs(),
-                            last_used_epoch: None,
-                        });
-                        entry.trusted = true;
-                        if !entry.redirect_uris.iter().any(|u| u == &redirect_uri) {
-                            entry.redirect_uris.push(redirect_uri.clone());
+                        if let Some(entry) = clients.get_mut(&client_id) {
+                            entry.trusted = true;
+                            if !entry.redirect_uris.iter().any(|u| u == &redirect_uri) {
+                                entry.redirect_uris.push(redirect_uri.clone());
+                            }
                         }
                     }
                     state.save_auth_state().await;
@@ -476,9 +517,10 @@ pub async fn handle_oauth_token(
 
     if grant_type == "refresh_token" {
         let rt = form.get("refresh_token").cloned().unwrap_or_default();
+        let rt_hash = hash_oauth_token(&rt);
         let rec_opt = {
             let rts = state.oauth_refresh_tokens.read().await;
-            rts.get(&rt).cloned()
+            rts.get(&rt_hash).cloned()
         };
         let Some(rec) = rec_opt else {
             return (
@@ -488,7 +530,7 @@ pub async fn handle_oauth_token(
                 .into_response();
         };
         if rec.expires_at_epoch.map(|e| e <= now).unwrap_or(false) {
-            state.oauth_refresh_tokens.write().await.remove(&rt);
+            state.oauth_refresh_tokens.write().await.remove(&rt_hash);
             state.save_auth_state().await;
             return (
                 StatusCode::UNAUTHORIZED,
@@ -497,6 +539,13 @@ pub async fn handle_oauth_token(
                 .into_response();
         }
         let cid = rec.client_id;
+        if !client_id.is_empty() && client_id != cid {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "invalid_grant", "error_description": "client_id mismatch" })),
+            )
+                .into_response();
+        }
         {
             let mut clients = state.oauth_clients.write().await;
             if !cid.is_empty() {
@@ -509,7 +558,7 @@ pub async fn handle_oauth_token(
                 };
                 if client.auth_method != "none"
                     && !client.client_secret.is_empty()
-                    && client.client_secret != client_secret
+                    && !secure_token_eq(&client.client_secret, &client_secret)
                 {
                     return (
                         StatusCode::UNAUTHORIZED,
@@ -523,7 +572,7 @@ pub async fn handle_oauth_token(
         let access = format!("smcp_at_{}{}", AppState::generate_token(), AppState::generate_token());
         let exp_epoch = now + 86400;
         state.oauth_access_tokens.write().await.insert(
-            access.clone(),
+            hash_oauth_token(&access),
             OAuthTokenRecord {
                 client_id: cid,
                 expires_at_epoch: Some(exp_epoch),
@@ -574,7 +623,7 @@ pub async fn handle_oauth_token(
         )
             .into_response();
     }
-    if !client_id.is_empty() && !rec.client_id.is_empty() && rec.client_id != client_id {
+    if !rec.client_id.is_empty() && rec.client_id != client_id {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "invalid_grant", "error_description": "client_id mismatch" })),
@@ -582,7 +631,7 @@ pub async fn handle_oauth_token(
             .into_response();
     }
     let redirect_uri = form.get("redirect_uri").cloned().unwrap_or_default();
-    if !redirect_uri.is_empty() && !rec.redirect_uri.is_empty() && redirect_uri != rec.redirect_uri {
+    if !rec.redirect_uri.is_empty() && redirect_uri != rec.redirect_uri {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "invalid_grant", "error_description": "redirect_uri mismatch" })),
@@ -590,64 +639,57 @@ pub async fn handle_oauth_token(
             .into_response();
     }
 
-    if let Some(challenge) = &rec.challenge {
-        let verifier = form.get("code_verifier").cloned().unwrap_or_default();
-        let computed = if rec.method == "plain" {
-            verifier.clone()
-        } else {
-            let digest = Sha256::digest(verifier.as_bytes());
-            URL_SAFE_NO_PAD.encode(digest)
-        };
-        if verifier.is_empty() || &computed != challenge {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "invalid_grant", "error_description": "PKCE verification failed" })),
-            )
-                .into_response();
-        }
+    let Some(challenge) = &rec.challenge else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid_grant", "error_description": "PKCE code_challenge missing" })),
+        )
+            .into_response();
+    };
+    if rec.method != "S256" {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid_grant", "error_description": "Unsupported PKCE method" })),
+        )
+            .into_response();
+    }
+    let verifier = form.get("code_verifier").cloned().unwrap_or_default();
+    let digest = Sha256::digest(verifier.as_bytes());
+    let computed = URL_SAFE_NO_PAD.encode(digest);
+    if verifier.is_empty() || !secure_token_eq(&computed, challenge) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid_grant", "error_description": "PKCE verification failed" })),
+        )
+            .into_response();
     }
 
     let effective_client_id = if !rec.client_id.is_empty() {
         rec.client_id.clone()
-    } else if !client_id.is_empty() {
-        client_id.clone()
     } else {
-        "unregistered_client".to_string()
+        client_id.clone()
     };
 
     {
         let mut clients = state.oauth_clients.write().await;
-        if let Some(client) = clients.get_mut(&effective_client_id) {
-            if client.auth_method != "none"
-                && !client.client_secret.is_empty()
-                && client.client_secret != client_secret
-            {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({ "error": "invalid_client", "error_description": "Client secret mismatch" })),
-                )
-                    .into_response();
-            }
-            client.last_used_epoch = Some(now);
-        } else {
-            clients.insert(
-                effective_client_id.clone(),
-                OAuthClient {
-                    client_id: effective_client_id.clone(),
-                    client_secret: String::new(),
-                    auth_method: "none".to_string(),
-                    client_name: None,
-                    redirect_uris: if rec.redirect_uri.is_empty() {
-                        Vec::new()
-                    } else {
-                        vec![rec.redirect_uri.clone()]
-                    },
-                    trusted: false,
-                    created_at_epoch: now,
-                    last_used_epoch: Some(now),
-                },
-            );
+        let Some(client) = clients.get_mut(&effective_client_id) else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "invalid_client", "error_description": "Unknown or revoked OAuth client" })),
+            )
+                .into_response();
+        };
+        if client.auth_method != "none"
+            && !client.client_secret.is_empty()
+            && !secure_token_eq(&client.client_secret, &client_secret)
+        {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "invalid_client", "error_description": "Client secret mismatch" })),
+            )
+                .into_response();
         }
+        client.last_used_epoch = Some(now);
     }
 
     let access = format!("smcp_at_{}{}", AppState::generate_token(), AppState::generate_token());
@@ -656,7 +698,7 @@ pub async fn handle_oauth_token(
     let refresh_exp_epoch = now + 30 * 86400;
 
     state.oauth_access_tokens.write().await.insert(
-        access.clone(),
+        hash_oauth_token(&access),
         OAuthTokenRecord {
             client_id: effective_client_id.clone(),
             expires_at_epoch: Some(exp_epoch),
@@ -664,7 +706,7 @@ pub async fn handle_oauth_token(
         },
     );
     state.oauth_refresh_tokens.write().await.insert(
-        refresh.clone(),
+        hash_oauth_token(&refresh),
         OAuthTokenRecord {
             client_id: effective_client_id,
             expires_at_epoch: Some(refresh_exp_epoch),
@@ -739,6 +781,12 @@ pub async fn revoke_oauth_client(state: &AppState, client_id: &str) -> Result<St
         .write()
         .await
         .retain(|_, code| code.client_id != client_id);
+    state
+        .provider_secrets
+        .write()
+        .await
+        .oauth_client_secrets
+        .remove(client_id);
 
     state.save_auth_state().await;
     state.emit_dashboard().await;
@@ -765,6 +813,12 @@ pub async fn revoke_all_oauth(state: &AppState) -> usize {
         count
     };
     state.oauth_codes.write().await.clear();
+    state
+        .provider_secrets
+        .write()
+        .await
+        .oauth_client_secrets
+        .clear();
 
     let pending_senders: Vec<oneshot::Sender<OAuthDecision>> = {
         let mut pending = state.pending_oauth.write().await;

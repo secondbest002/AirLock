@@ -1,6 +1,7 @@
 use crate::config::AppConfig;
 use crate::jobs;
 use crate::mcp_server::handle_single_rpc;
+use crate::secrets::SecretsStore;
 use crate::state::AppState;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -9,6 +10,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 fn read_persisted_auth_token(auth_path: &PathBuf) -> Option<String> {
+    if let Some(dir) = auth_path.parent() {
+        let vault = SecretsStore::new_persistent(dir.to_path_buf()).load();
+        let tok = vault.auth_token.trim().to_string();
+        if !tok.is_empty() {
+            return Some(tok);
+        }
+    }
     let raw = std::fs::read_to_string(auth_path).ok()?;
     let val: Value = serde_json::from_str(&raw).ok()?;
     val.get("auth_token")
@@ -82,7 +90,7 @@ async fn proxy_line_to_hub(
     Ok(Some(parsed))
 }
 
-pub async fn process_stdio_json_line_embedded(state: &AppState, line: &str) -> Option<Value> {
+pub async fn process_stdio_json_line_embedded(state: &Arc<AppState>, line: &str) -> Option<Value> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return None;
@@ -127,9 +135,9 @@ pub fn run_stdio_bridge() -> i32 {
         if proxy_client.is_none() {
             let ws = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let st = Arc::new(AppState::new_persistent(ws, auth_path, cfg_path));
-            let downstream = st.config.read().await.downstream_mcps.clone();
+            let downstream = st.resolved_downstream_mcps().await;
             if !downstream.is_empty() {
-                st.mcp_hub.refresh_all(&downstream).await;
+                st.mcp_hub.refresh_all(&st.http_client, &downstream).await;
             }
             embedded_state = Some(st);
         }
@@ -182,9 +190,9 @@ pub fn run_stdio_bridge() -> i32 {
                                         AppState::default_auth_file_path(),
                                         AppConfig::default_path(),
                                     ));
-                                    let downstream = st.config.read().await.downstream_mcps.clone();
+                                    let downstream = st.resolved_downstream_mcps().await;
                                     if !downstream.is_empty() {
-                                        st.mcp_hub.refresh_all(&downstream).await;
+                                        st.mcp_hub.refresh_all(&st.http_client, &downstream).await;
                                     }
                                     embedded_state = Some(st);
                                 }
@@ -221,6 +229,7 @@ pub fn run_stdio_bridge() -> i32 {
         if let Some(st) = embedded_state {
             jobs::stop_all_jobs(&st).await;
             st.mcp_hub.shutdown_all().await;
+            st.lsp_manager.shutdown_all().await;
         }
         0
     })

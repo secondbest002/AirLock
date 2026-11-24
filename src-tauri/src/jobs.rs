@@ -1,4 +1,5 @@
-use crate::security::{compress_output, validate_command};
+use crate::process_util::kill_pid_tree;
+use crate::security::{ansi_regex, compress_output, validate_command};
 use crate::state::AppState;
 use regex::Regex;
 use serde::Serialize;
@@ -10,7 +11,7 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::{oneshot, watch, RwLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,6 +28,10 @@ pub struct JobSummary {
     pub job_id: String,
     pub command: String,
     pub label: Option<String>,
+    #[serde(default)]
+    pub workspace_alias: Option<String>,
+    #[serde(default)]
+    pub mcp_task_id: Option<String>,
     pub status: JobStatus,
     pub exit_code: Option<i32>,
     pub started_at: String,
@@ -38,6 +43,8 @@ pub struct ManagedJob {
     pub job_id: String,
     pub command: String,
     pub label: Option<String>,
+    pub workspace_alias: Option<String>,
+    pub mcp_task_id: Option<String>,
     pub status: JobStatus,
     pub exit_code: Option<i32>,
     pub started_at: String,
@@ -47,6 +54,7 @@ pub struct ManagedJob {
     pub total_lines_seen: usize,
     pub pid: Option<u32>,
     pub kill_tx: Option<oneshot::Sender<()>>,
+    pub done_rx: watch::Receiver<bool>,
 }
 
 impl ManagedJob {
@@ -58,6 +66,8 @@ impl ManagedJob {
             job_id: self.job_id.clone(),
             command: self.command.clone(),
             label: self.label.clone(),
+            workspace_alias: self.workspace_alias.clone(),
+            mcp_task_id: self.mcp_task_id.clone(),
             status: self.status,
             exit_code: self.exit_code,
             started_at: self.started_at.clone(),
@@ -76,24 +86,6 @@ impl Default for JobManager {
         Self {
             jobs: Arc::new(RwLock::new(HashMap::new())),
         }
-    }
-}
-
-fn kill_pid_tree(pid: u32) {
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .creation_flags(0x08000000)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = pid;
     }
 }
 
@@ -121,6 +113,19 @@ pub async fn start_job(
     label: Option<String>,
     timeout_secs: u64,
 ) -> Result<JobSummary, String> {
+    let (summary, _rx) =
+        start_job_with_handle(state, root, command, label, timeout_secs, None).await?;
+    Ok(summary)
+}
+
+pub async fn start_job_with_handle(
+    state: &AppState,
+    root: &Path,
+    command: &str,
+    label: Option<String>,
+    timeout_secs: u64,
+    workspace_alias: Option<String>,
+) -> Result<(JobSummary, watch::Receiver<bool>), String> {
     validate_command(command)?;
     let effective_timeout = timeout_secs.clamp(5, 1800);
 
@@ -154,11 +159,15 @@ pub async fn start_job(
     let job_id = format!("job-{}", &token[..8]);
     let started_at = AppState::now_timestamp();
     let (kill_tx, kill_rx) = oneshot::channel::<()>();
+    let (done_tx, done_rx) = watch::channel(false);
+    let mcp_task_id = crate::mcp_tasks::current_task_id();
 
     let managed = ManagedJob {
         job_id: job_id.clone(),
         command: command.to_string(),
         label: label.clone(),
+        workspace_alias,
+        mcp_task_id,
         status: JobStatus::Running,
         exit_code: None,
         started_at,
@@ -168,6 +177,7 @@ pub async fn start_job(
         total_lines_seen: 0,
         pid,
         kill_tx: Some(kill_tx),
+        done_rx: done_rx.clone(),
     };
 
     let summary = managed.to_summary();
@@ -180,16 +190,16 @@ pub async fn start_job(
     let app_handle = state.app_handle.read().await.clone();
     emit_job_update(&app_handle, &summary);
 
-    let ansi_re = Regex::new(r"\x1B\[[0-9;?]*[ -/]*[@-~]").expect("valid ANSI regex");
+    let ansi_re = ansi_regex();
 
     if let Some(out) = stdout_pipe {
         let map_out = jobs_map.clone();
         let jid = job_id.clone();
-        let re = ansi_re.clone();
+        let re = ansi_re;
         tokio::spawn(async move {
             let mut reader = BufReader::new(out).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                if let Some(cleaned) = clean_log_line(&line, &re) {
+                if let Some(cleaned) = clean_log_line(&line, re) {
                     let mut guard = map_out.write().await;
                     if let Some(job) = guard.get_mut(&jid) {
                         job.total_lines_seen += 1;
@@ -211,7 +221,7 @@ pub async fn start_job(
         tokio::spawn(async move {
             let mut reader = BufReader::new(err).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                if let Some(cleaned) = clean_log_line(&line, &re) {
+                if let Some(cleaned) = clean_log_line(&line, re) {
                     let mut guard = map_err.write().await;
                     if let Some(job) = guard.get_mut(&jid) {
                         job.total_lines_seen += 1;
@@ -276,9 +286,58 @@ pub async fn start_job(
         if let Some(sum) = updated_summary {
             emit_job_update(&app_handle, &sum);
         }
+        let _ = done_tx.send(true);
     });
 
-    Ok(summary)
+    Ok((summary, done_rx))
+}
+
+pub async fn get_job_snapshot_output(
+    state: &AppState,
+    job_id: &str,
+    max_lines: usize,
+) -> Option<(JobStatus, Option<i32>, u64, String, usize)> {
+    let effective_max = max_lines.clamp(12, 250);
+    let guard = state.jobs.jobs.read().await;
+    let job = guard.get(job_id)?;
+    let raw = job.lines.join("\n");
+    let (compressed, _) = compress_output(&raw, "", effective_max);
+    let elapsed_secs = job
+        .finished_elapsed_secs
+        .unwrap_or_else(|| job.started_instant.elapsed().as_secs());
+    Some((
+        job.status,
+        job.exit_code,
+        elapsed_secs,
+        compressed,
+        job.total_lines_seen,
+    ))
+}
+
+pub async fn get_job_workspace_alias(state: &AppState, job_id: &str) -> Option<String> {
+    let guard = state.jobs.jobs.read().await;
+    guard
+        .get(job_id)
+        .and_then(|j| j.workspace_alias.clone())
+}
+
+pub async fn subscribe_job_by_mcp_task(
+    state: &AppState,
+    task_id: &str,
+) -> Option<(String, watch::Receiver<bool>)> {
+    let guard = state.jobs.jobs.read().await;
+    guard
+        .values()
+        .find(|j| j.mcp_task_id.as_deref() == Some(task_id))
+        .map(|j| (j.job_id.clone(), j.done_rx.clone()))
+}
+
+pub async fn find_job_id_by_mcp_task(state: &AppState, task_id: &str) -> Option<String> {
+    let guard = state.jobs.jobs.read().await;
+    guard
+        .values()
+        .find(|j| j.mcp_task_id.as_deref() == Some(task_id))
+        .map(|j| j.job_id.clone())
 }
 
 pub async fn poll_job(
@@ -309,8 +368,14 @@ pub async fn poll_job(
         JobStatus::TimedOut => "timed_out",
     };
 
+    let ws_line = summary
+        .workspace_alias
+        .as_deref()
+        .map(|a| format!("\nWORKSPACE: @{a}"))
+        .unwrap_or_default();
+
     Ok(format!(
-        "JOB_ID: {}\nCOMMAND: {}\nSTATUS: {}\nEXIT_CODE: {}\nELAPSED: {}s\nNEXT_FROM_LINE: {}\nOUTPUT:\n{}",
+        "JOB_ID: {}{ws_line}\nCOMMAND: {}\nSTATUS: {}\nEXIT_CODE: {}\nELAPSED: {}s\nNEXT_FROM_LINE: {}\nOUTPUT:\n{}",
         summary.job_id,
         summary.command,
         status_str,
@@ -427,6 +492,83 @@ mod tests {
         assert!(completed, "Job did not complete cleanly: {last_poll}");
         assert!(last_poll.contains("EXIT_CODE: 0"));
         assert!(last_poll.contains("hello_async_job"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_auto_promote_fast_command_returns_sync() {
+        let temp_dir = std::env::temp_dir().join("smart_mcp_job_fast_sync_test");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let state = AppState::new(temp_dir.clone());
+        let (summary, mut done_rx) = start_job_with_handle(
+            &state,
+            &temp_dir,
+            "echo fast_sync_ok",
+            Some("Fast Command".to_string()),
+            60,
+            Some("api".to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.workspace_alias.as_deref(), Some("api"));
+        let wait_res = tokio::time::timeout(Duration::from_secs(5), done_rx.wait_for(|&d| d)).await;
+        assert!(wait_res.is_ok(), "Fast command should notify done_rx quickly");
+
+        let snap = get_job_snapshot_output(&state, &summary.job_id, 60)
+            .await
+            .unwrap();
+        assert_eq!(snap.0, JobStatus::Completed);
+        assert_eq!(snap.1, Some(0));
+        assert!(snap.3.contains("fast_sync_ok"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_auto_promote_slow_command_hands_off_to_job_manager() {
+        let temp_dir = std::env::temp_dir().join("smart_mcp_job_slow_promote_test");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let state = AppState::new(temp_dir.clone());
+        let slow_cmd = if cfg!(target_os = "windows") {
+            "ping -n 5 127.0.0.1"
+        } else {
+            "sleep 4"
+        };
+
+        let (summary, mut done_rx) = start_job_with_handle(
+            &state,
+            &temp_dir,
+            slow_cmd,
+            Some("Slow Build".to_string()),
+            60,
+            Some("web".to_string()),
+        )
+        .await
+        .unwrap();
+
+        // Waiting 300ms must time out without killing the job
+        let wait_res =
+            tokio::time::timeout(Duration::from_millis(300), done_rx.wait_for(|&d| d)).await;
+        assert!(wait_res.is_err(), "Slow command should exceed short promote window");
+
+        let snap = get_job_snapshot_output(&state, &summary.job_id, 20)
+            .await
+            .unwrap();
+        assert_eq!(snap.0, JobStatus::Running);
+        assert_eq!(
+            get_job_workspace_alias(&state, &summary.job_id).await.as_deref(),
+            Some("web")
+        );
+
+        let stopped = stop_job(&state, &summary.job_id).await.unwrap();
+        assert_eq!(stopped.status, JobStatus::Killed);
+        stop_all_jobs(&state).await;
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
