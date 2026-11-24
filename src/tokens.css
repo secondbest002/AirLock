@@ -1,0 +1,131 @@
+/* ==========================================================================
+   Airlock — Obsidian Studio Design Tokens
+   Dark-first neutral graphite surfaces, dual accent variants (Electric Mint
+   default + Ice Cyan via [data-accent="cyan"]), concentric radii, and
+   compositor-friendly motion timings.
+   ========================================================================== */
+
+:root {
+  color-scheme: dark;
+
+  /* --- Surfaces (Obsidian Graphite Hierarchy) --- */
+  --bg-canvas: #09090B;
+  --bg-rail: #0D0E12;
+  --bg-surface: #121318;
+  --bg-elevated: #191B22;
+  --bg-code: #0B0C10;
+
+  /* --- Hairline & Interactive Borders --- */
+  --border-subtle: #20232D;
+  --border-default: #2D3140;
+  --border-strong: #3E4458;
+
+  /* --- Text Hierarchy (WCAG AA+ on #09090B, #121318, and #191B22) --- */
+  --text-primary: #F4F5F7;
+  --text-secondary: #A1A6B4;
+  --text-muted: #858B9E;
+
+  /* --- Primary Accent: Electric Mint (Default) --- */
+  --accent: #10B981;
+  --accent-hover: #059669;
+  --accent-fg: #34D399;
+  --on-accent: #031A12;
+  --accent-tint: color-mix(in oklab, var(--accent) 14%, transparent);
+  --accent-border: color-mix(in oklab, var(--accent) 34%, transparent);
+  --accent-spotlight: color-mix(in oklab, var(--accent) 10%, transparent);
+
+  /* --- Semantic Status Tokens --- */
+  --status-ok: #34D399;
+  --status-ok-bg: color-mix(in oklab, #10B981 14%, transparent);
+  --status-ok-border: color-mix(in oklab, #10B981 34%, transparent);
+
+  --status-warn: #FBBF24;
+  --status-warn-bg: color-mix(in oklab, #F59E0B 14%, transparent);
+  --status-warn-border: color-mix(in oklab, #F59E0B 34%, transparent);
+
+  --status-info: #60A5FA;
+  --status-info-bg: color-mix(in oklab, #3B82F6 14%, transparent);
+  --status-info-border: color-mix(in oklab, #3B82F6 34%, transparent);
+
+  --status-danger: #F87171;
+  --status-danger-bg: color-mix(in oklab, #EF4444 15%, transparent);
+  --status-danger-border: color-mix(in oklab, #EF4444 38%, transparent);
+
+  /* --- Diff Viewer Tokens --- */
+  --diff-add-bg: color-mix(in oklab, #10B981 14%, transparent);
+  --diff-add-fg: #6EE7B7;
+  --diff-del-bg: color-mix(in oklab, #EF4444 14%, transparent);
+  --diff-del-fg: #FCA5A5;
+  --diff-hunk-fg: #FBBF24;
+
+  /* --- Typography --- */
+  --font-ui: "Plus Jakarta Sans Variable", "Plus Jakarta Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono Variable", "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+
+  /* --- Spacing Scale (4px / 8px Rhythm) --- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 28px;
+  --space-8: 32px;
+
+  /* --- Concentric Border Radii (Outer = Inner + Padding) --- */
+  --radius-xl: 14px;
+  --radius-lg: 12px;
+  --radius-md: 8px;
+  --radius-sm: 6px;
+  --radius-pill: 999px;
+
+  /* --- Layered Dark Elevation & Specular Rim --- */
+  --shadow-card:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.055),
+    0 1px 2px rgba(0, 0, 0, 0.45),
+    0 4px 12px rgba(0, 0, 0, 0.25);
+  --shadow-elevated:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.08),
+    0 4px 12px rgba(0, 0, 0, 0.5),
+    0 16px 36px rgba(0, 0, 0, 0.55);
+
+  /* --- Motion Curves & Durations --- */
+  --ease-out-expo: cubic-bezier(0.22, 1, 0.36, 1);
+  --dur-fast: 120ms;
+  --dur-med: 220ms;
+  --dur-slow: 280ms;
+
+  /* --- Focus Ring --- */
+  --focus-ring: 2px solid var(--accent-fg);
+}
+
+/* --- Accent Variant: Ice Cyan --- */
+:root[data-accent="cyan"] {
+  --accent: #0EA5E9;
+  --accent-hover: #0284C7;
+  --accent-fg: #38BDF8;
+  --on-accent: #041521;
+}
+
+/* --- Forced Colors / Windows High Contrast Fallbacks --- */
+@media (forced-colors: active) {
+  :root {
+    --bg-canvas: Canvas;
+    --bg-rail: Canvas;
+    --bg-surface: Canvas;
+    --bg-elevated: Canvas;
+    --bg-code: Canvas;
+    --border-subtle: CanvasText;
+    --border-default: CanvasText;
+    --border-strong: Highlight;
+    --text-primary: CanvasText;
+    --text-secondary: CanvasText;
+    --text-muted: GrayText;
+    --accent: Highlight;
+    --accent-hover: Highlight;
+    --accent-fg: Highlight;
+    --on-accent: HighlightText;
+    --shadow-card: none;
+    --shadow-elevated: none;
+  }
+}

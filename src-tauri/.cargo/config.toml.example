@@ -1,0 +1,12 @@
+# Copy to src-tauri/.cargo/config.toml and replace <USER> with your Windows username
+# and update the LLVM-MinGW WinGet folder name if you use the x86_64-pc-windows-gnu toolchain.
+
+[target.x86_64-pc-windows-gnu]
+linker = 'C:\Users\<USER>\.rustup\toolchains\stable-x86_64-pc-windows-gnu\lib\rustlib\x86_64-pc-windows-gnu\bin\self-contained\x86_64-w64-mingw32-gcc.exe'
+ar = 'C:\Users\<USER>\AppData\Local\Microsoft\WinGet\Packages\MartinStorsjo.LLVM-MinGW.MSVCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\<LLVM-MINGW-DIR>\bin\ar.exe'
+
+[env]
+CC = 'C:\Users\<USER>\AppData\Local\Microsoft\WinGet\Packages\MartinStorsjo.LLVM-MinGW.MSVCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\<LLVM-MINGW-DIR>\bin\gcc.exe'
+CXX = 'C:\Users\<USER>\AppData\Local\Microsoft\WinGet\Packages\MartinStorsjo.LLVM-MinGW.MSVCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\<LLVM-MINGW-DIR>\bin\clang++.exe'
+AR = 'C:\Users\<USER>\AppData\Local\Microsoft\WinGet\Packages\MartinStorsjo.LLVM-MinGW.MSVCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\<LLVM-MINGW-DIR>\bin\ar.exe'
+WINDRES = 'C:\Users\<USER>\AppData\Local\Microsoft\WinGet\Packages\MartinStorsjo.LLVM-MinGW.MSVCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\<LLVM-MINGW-DIR>\bin\windres.exe'

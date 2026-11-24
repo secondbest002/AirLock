@@ -1,0 +1,1152 @@
+<!doctype html>
+<html lang="id" data-accent="mint">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Airlock — MCP Bridge, Aggregator &amp; Local Agent</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="app-shell" class="app-shell">
+      <!-- TOP COMMAND BAR (48px) -->
+      <header class="cmdbar">
+        <div class="cmdbar-left">
+          <button
+            id="btn-toggle-rail"
+            type="button"
+            class="rail-toggle-btn"
+            aria-label="Toggle Left Sidebar Rail"
+            aria-expanded="true"
+            title="Toggle Left Sidebar ([)"
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+              <rect x="3" y="3" width="18" height="18" rx="3"></rect>
+              <line x1="9" y1="3" x2="9" y2="21"></line>
+            </svg>
+          </button>
+
+          <div class="brand-lockup">
+            <div class="brand-mark" aria-hidden="true">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M5 4h5v16H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"></path>
+                <path d="M19 4h-5v16h5a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2z"></path>
+                <circle cx="12" cy="12" r="2.2" fill="currentColor" stroke="none"></circle>
+              </svg>
+            </div>
+            <span class="brand-name">Airlock</span>
+          </div>
+
+          <div class="workspace-capsule">
+            <span class="ws-root-label">ROOT</span>
+            <label for="workspace-input" class="sr-only">Jailed Workspace Root</label>
+            <input
+              id="workspace-input"
+              type="text"
+              class="ws-input"
+              placeholder="C:\path\to\project"
+              spellcheck="false"
+            />
+            <span id="workspace-git-branch" class="git-branch-pill" hidden></span>
+            <button
+              id="btn-apply-workspace"
+              type="button"
+              class="icon-btn"
+              aria-label="Apply workspace path"
+              title="Apply Workspace Path"
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" aria-hidden="true">
+                <polyline points="20 6 9 17 4 12"></polyline>
+              </svg>
+            </button>
+            <button
+              id="btn-pin-workspace"
+              type="button"
+              class="icon-btn"
+              aria-pressed="false"
+              aria-label="Pin workspace"
+              title="Pin / Unpin Workspace"
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
+                <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+              </svg>
+            </button>
+            <button
+              id="btn-recent-workspaces"
+              type="button"
+              class="icon-btn"
+              aria-expanded="false"
+              aria-controls="workspace-dropdown"
+              aria-label="Recent and pinned workspaces"
+              title="Recent & Pinned Workspaces"
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <polyline points="6 9 12 15 18 9"></polyline>
+              </svg>
+            </button>
+            <button
+              id="btn-pick-workspace"
+              type="button"
+              class="icon-btn"
+              aria-label="Browse workspace folder"
+              title="Browse Folder"
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
+                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+              </svg>
+            </button>
+            <div id="workspace-dropdown" class="workspace-dropdown" hidden></div>
+          </div>
+        </div>
+
+        <div class="cmdbar-right">
+          <div id="guardrail-track" class="guardrail-track" data-mode="autonomous" role="group" aria-label="Guardrail Mode">
+            <div id="guardrail-glider" class="guardrail-glider" aria-hidden="true"></div>
+            <button type="button" class="guardrail-btn" data-guardrail="read_only" aria-pressed="false" title="Read-Only: semua tool mutasi dan shell diblokir">Read-Only</button>
+            <button type="button" class="guardrail-btn" data-guardrail="safe_edit" aria-pressed="false" title="Safe Edit: shell, commit, dan delete butuh popup konfirmasi">Safe Edit</button>
+            <button type="button" class="guardrail-btn active" data-guardrail="autonomous" aria-pressed="true" title="Autonomous: eksekusi otomatis di dalam workspace jailed">Auto</button>
+          </div>
+
+          <button
+            id="btn-open-palette"
+            type="button"
+            class="palette-trigger"
+            aria-label="Buka Command Palette (Ctrl+K)"
+            title="Command Palette (Ctrl+K)"
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <circle cx="11" cy="11" r="8"></circle>
+              <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+            </svg>
+            <span>Commands</span>
+            <kbd>Ctrl+K</kbd>
+          </button>
+        </div>
+      </header>
+
+      <!-- WORKSPACE BODY -->
+      <div class="workspace-body">
+        <!-- LEFT SIDEBAR RAIL -->
+        <aside class="side-rail" aria-label="Navigasi Utama">
+          <nav class="rail-nav" role="tablist" aria-orientation="vertical" aria-label="Main workspaces">
+            <div id="rail-indicator" class="rail-indicator" aria-hidden="true"></div>
+
+            <button
+              id="tab-btn-agent"
+              type="button"
+              role="tab"
+              aria-selected="true"
+              aria-controls="panel-agent"
+              class="rail-btn active"
+              data-tab="agent"
+              title="Local Agent (Ctrl+1)"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+              </svg>
+              <span class="rail-label">Local Agent</span>
+              <span class="rail-pill">SSE</span>
+            </button>
+
+            <button
+              id="tab-btn-bridge"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              aria-controls="panel-bridge"
+              class="rail-btn"
+              data-tab="bridge"
+              title="MCP Bridge (Ctrl+2)"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+                <rect x="2" y="3" width="20" height="7" rx="2"></rect>
+                <rect x="2" y="14" width="20" height="7" rx="2"></rect>
+                <line x1="6" y1="6.5" x2="6.01" y2="6.5"></line>
+                <line x1="6" y1="17.5" x2="6.01" y2="17.5"></line>
+              </svg>
+              <span class="rail-label">MCP Bridge</span>
+              <span id="rail-port-pill" class="rail-pill">:9494</span>
+            </button>
+
+            <button
+              id="tab-btn-hub"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              aria-controls="panel-hub"
+              class="rail-btn"
+              data-tab="hub"
+              title="Hub & Tools (Ctrl+3)"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+                <circle cx="12" cy="5" r="3"></circle>
+                <circle cx="5" cy="19" r="3"></circle>
+                <circle cx="19" cy="19" r="3"></circle>
+                <line x1="10.5" y1="7.5" x2="6.5" y2="16.5"></line>
+                <line x1="13.5" y1="7.5" x2="17.5" y2="16.5"></line>
+              </svg>
+              <span class="rail-label">Hub &amp; Tools</span>
+              <span id="rail-hub-count" class="rail-pill">14</span>
+            </button>
+
+            <button
+              id="tab-btn-monitor"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              aria-controls="panel-monitor"
+              class="rail-btn"
+              data-tab="monitor"
+              title="Live Monitor (Ctrl+4)"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+              </svg>
+              <span class="rail-label">Live Monitor</span>
+              <span id="rail-monitor-count" class="rail-pill">0</span>
+            </button>
+
+            <button
+              id="tab-btn-audit"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              aria-controls="panel-audit"
+              class="rail-btn"
+              data-tab="audit"
+              title="Diff & Audit (Ctrl+5)"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                <polyline points="14 2 14 8 20 8"></polyline>
+                <line x1="9" y1="15" x2="15" y2="15"></line>
+              </svg>
+              <span class="rail-label">Diff &amp; Audit</span>
+              <span id="audit-count-badge" class="rail-pill">0</span>
+            </button>
+          </nav>
+
+          <!-- Rail Telemetry Footer -->
+          <div class="rail-footer" aria-live="polite">
+            <button
+              id="rail-server-toggle"
+              type="button"
+              class="telemetry-status-btn"
+              title="Klik untuk Start / Stop MCP Server"
+            >
+              <span class="dot-wrap">
+                <span id="rail-server-dot" class="live-dot offline" aria-hidden="true"></span>
+                <span id="rail-server-label" class="telemetry-full">Server Offline</span>
+              </span>
+              <span id="status-server-badge" class="telemetry-full">OFF</span>
+            </button>
+
+            <div class="telemetry-full">
+              <div class="telemetry-row">
+                <span class="telemetry-key">Tunnel</span>
+                <span id="status-tunnel-badge" class="telemetry-val">IDLE</span>
+              </div>
+              <div class="telemetry-row">
+                <span class="telemetry-key">Tokens Saved</span>
+                <span id="metric-tokens-saved" class="telemetry-val accent">0</span>
+              </div>
+              <div class="telemetry-row">
+                <span class="telemetry-key">Turns Saved</span>
+                <span id="metric-turns-saved" class="telemetry-val">0</span>
+              </div>
+            </div>
+          </div>
+        </aside>
+
+        <!-- MAIN VIEWPORT CANVAS -->
+        <main class="main-canvas">
+          <!-- VIEW 1: LOCAL AGENT -->
+          <section id="panel-agent" role="tabpanel" aria-labelledby="tab-btn-agent" class="view-panel active">
+            <div class="view-header">
+              <div>
+                <h1 id="heading-agent" class="view-title" tabindex="-1">Local Agent</h1>
+                <p class="view-subtitle">Agentic loop SSE langsung di localhost dengan Smart Tools &amp; Token Guard aktif.</p>
+              </div>
+              <button
+                id="btn-toggle-drawer"
+                type="button"
+                class="provider-pill-btn"
+                aria-expanded="false"
+                aria-controls="agent-drawer"
+              >
+                <span id="provider-pill-dot" class="live-dot warn" aria-hidden="true"></span>
+                <span id="provider-pill-label">Gemini · gemini-2.5-flash</span>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                  <circle cx="12" cy="12" r="3"></circle>
+                  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.85 1 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                </svg>
+              </button>
+            </div>
+
+            <div id="agent-shell" class="agent-shell">
+              <div class="chat-surface">
+                <div class="chat-sessions-bar">
+                  <div class="session-cluster">
+                    <label for="chat-session-select" class="bar-label">SESSION</label>
+                    <select id="chat-session-select" class="mono-select session-select">
+                      <option value="">Sesi Baru</option>
+                    </select>
+                  </div>
+                  <div class="btn-row">
+                    <button id="btn-new-session" type="button" class="btn btn-secondary btn-xs">New Chat</button>
+                    <button id="btn-clear-chat" type="button" class="btn btn-secondary btn-xs">Clear Chat</button>
+                    <button id="btn-delete-session" type="button" class="btn btn-danger btn-xs" disabled>Delete</button>
+                  </div>
+                </div>
+
+                <div id="chat-messages" class="chat-transcript" aria-live="polite">
+                  <div class="chat-empty">
+                    Konfigurasi provider AI melalui tombol config di kanan atas (disimpan aman dengan Windows DPAPI), lalu ketik tugas coding untuk workspace aktif.
+                  </div>
+                </div>
+
+                <form id="chat-form" class="chat-composer">
+                  <div class="prompt-chips" role="group" aria-label="Prompt templates">
+                    <button
+                      type="button"
+                      class="prompt-chip"
+                      data-prompt="Lakukan project_overview pada workspace ini dan jelaskan arsitektur serta entry point utamanya secara ringkas."
+                    >
+                      Overview Proyek
+                    </button>
+                    <button
+                      type="button"
+                      class="prompt-chip"
+                      data-prompt="Jalankan git_ops status dan diff lalu review potensi bug serta edge case pada perubahan terbaru."
+                    >
+                      Review Git Diff
+                    </button>
+                    <button
+                      type="button"
+                      class="prompt-chip"
+                      data-prompt="Audit folder kode utama di workspace ini menggunakan find_files, code_outline, dan read_file_range untuk mencari bug."
+                    >
+                      Audit Bug
+                    </button>
+                    <button
+                      type="button"
+                      class="prompt-chip"
+                      data-prompt="Identifikasi modul kritis yang belum memiliki cakupan unit test memadai dan usulkan atau tambahkan unit test-nya."
+                    >
+                      Tulis Unit Test
+                    </button>
+                  </div>
+
+                  <div id="attachment-chips" class="attachment-chips" hidden></div>
+                  <div class="attachment-bar">
+                    <label for="attach-file-path" class="sr-only">Path file workspace yang dilampirkan</label>
+                    <input
+                      id="attach-file-path"
+                      type="text"
+                      class="mono-input attach-input"
+                      placeholder="@file: src/main.rs"
+                      spellcheck="false"
+                    />
+                    <button id="btn-attach-file" type="button" class="btn btn-secondary btn-xs">+ @File</button>
+                    <input id="attach-image-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden />
+                    <button id="btn-attach-image" type="button" class="btn btn-secondary btn-xs">+ Image</button>
+                    <span class="mono-muted attach-hint">Tip: tempel gambar (Ctrl+V) · Ctrl+Enter kirim</span>
+                  </div>
+
+                  <label for="chat-input" class="sr-only">Perintah untuk Local Agent</label>
+                  <textarea
+                    id="chat-input"
+                    rows="2"
+                    placeholder="Contoh: Periksa struktur proyek ini, cari fungsi yang menangani autentikasi, dan perbaiki bug validasi... (Ctrl+Enter untuk kirim)"
+                  ></textarea>
+                  <div class="composer-actions">
+                    <span id="agent-run-status" class="mono-status">Ready</span>
+                    <div class="btn-row">
+                      <button id="btn-stop-agent" type="button" class="btn btn-danger btn-xs" hidden>Stop</button>
+                      <button id="btn-send-chat" type="submit" class="btn btn-primary">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" aria-hidden="true">
+                          <line x1="22" y1="2" x2="11" y2="13"></line>
+                          <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                        </svg>
+                        Run Local Agent
+                      </button>
+                    </div>
+                  </div>
+                </form>
+              </div>
+
+              <!-- Collapsible Right Drawer: Provider Config & Smart Tools -->
+              <aside id="agent-drawer" class="agent-drawer" inert aria-label="Konfigurasi Agent dan Smart Tools">
+                <div class="card">
+                  <h2 id="agent-card-title" class="card-heading">Multi-Provider Agent (SSE)</h2>
+                  <p class="card-desc" style="margin-bottom: 12px">
+                    Streaming langsung di localhost ke Gemini, OpenAI-Compatible, atau Anthropic.
+                  </p>
+
+                  <div class="form-group">
+                    <label for="agent-provider">Provider LLM</label>
+                    <select id="agent-provider" class="mono-select">
+                      <option value="gemini" selected>Google Gemini (AI Studio)</option>
+                      <option value="openai_compat">OpenAI-Compatible (Local / Cloud)</option>
+                      <option value="anthropic">Anthropic Claude</option>
+                    </select>
+                  </div>
+
+                  <div id="openai-compat-fields" hidden>
+                    <div class="form-group">
+                      <label for="agent-base-url">OpenAI-Compatible Base URL</label>
+                      <input
+                        id="agent-base-url"
+                        type="text"
+                        class="mono-input"
+                        placeholder="http://127.0.0.1:11434/v1"
+                        spellcheck="false"
+                      />
+                    </div>
+                    <div class="provider-preset-row" role="group" aria-label="Preset URL Provider">
+                      <button type="button" class="prompt-chip preset-url-btn" data-url="http://127.0.0.1:11434/v1">Ollama</button>
+                      <button type="button" class="prompt-chip preset-url-btn" data-url="http://127.0.0.1:1234/v1">LM Studio</button>
+                      <button type="button" class="prompt-chip preset-url-btn" data-url="https://openrouter.ai/api/v1">OpenRouter</button>
+                      <button type="button" class="prompt-chip preset-url-btn" data-url="https://api.groq.com/openai/v1">Groq</button>
+                      <button type="button" class="prompt-chip preset-url-btn" data-url="https://api.deepseek.com/v1">DeepSeek</button>
+                      <button type="button" class="prompt-chip preset-url-btn" data-url="https://api.openai.com/v1">OpenAI</button>
+                    </div>
+                  </div>
+
+                  <div class="form-group">
+                    <div class="label-action-row">
+                      <label id="agent-api-key-label" for="agent-api-key">API Key (Windows DPAPI)</label>
+                      <button id="btn-clear-api-key" type="button" class="btn btn-secondary btn-xs">Clear Key</button>
+                    </div>
+                    <input
+                      id="agent-api-key"
+                      type="password"
+                      class="mono-input"
+                      placeholder="Isi API Key (disimpan terenkripsi DPAPI)..."
+                      autocomplete="off"
+                    />
+                  </div>
+
+                  <div class="form-group">
+                    <div class="label-action-row">
+                      <label for="agent-model">Model Target</label>
+                      <button id="btn-fetch-models" type="button" class="btn btn-secondary btn-xs">Fetch Models</button>
+                    </div>
+                    <select id="agent-model" class="mono-select">
+                      <option value="gemini-2.5-flash">gemini-2.5-flash (Cepat &amp; Hemat)</option>
+                      <option value="gemini-2.5-pro">gemini-2.5-pro (Reasoning Kompleks)</option>
+                      <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite (Ultra Ringan)</option>
+                      <option value="gemini-3-flash-preview">gemini-3-flash-preview (Preview)</option>
+                      <option value="gemini-2.0-flash">gemini-2.0-flash (Fallback Stabil)</option>
+                    </select>
+                  </div>
+
+                  <div class="form-group">
+                    <label for="agent-custom-model">Custom Model ID (Opsional)</label>
+                    <input
+                      id="agent-custom-model"
+                      type="text"
+                      class="mono-input"
+                      placeholder="misal: qwen2.5-coder:7b / claude-sonnet-4-5"
+                      spellcheck="false"
+                    />
+                  </div>
+
+                  <div class="form-group">
+                    <label for="toggle-auto-rules" class="inline-check">
+                      <input id="toggle-auto-rules" type="checkbox" class="tactile-switch" checked />
+                      <span>Auto-inject AGENTS.md / CLAUDE.md</span>
+                    </label>
+                  </div>
+
+                  <button id="btn-save-agent" type="button" class="btn btn-primary" style="width: 100%">Save Config</button>
+                </div>
+
+                <div class="card">
+                  <h2 id="active-tools-heading" class="card-heading">Smart Tools Aktif (14)</h2>
+                  <ul class="tool-list">
+                    <li><code>project_overview</code> <span>Tree + Git status</span></li>
+                    <li><code>smart_search</code> <span>Ripgrep + 2-line ctx</span></li>
+                    <li><code>read_file_range</code> <span>Batch / line slice</span></li>
+                    <li><code>surgical_edit</code> <span>Block diff replace</span></li>
+                    <li><code>patch_and_verify</code> <span>Edit + test 1 turn</span></li>
+                    <li><code>run_command_compressed</code> <span>Token Guard log</span></li>
+                    <li><code>write_file_jailed</code> <span>Snapshot rollback</span></li>
+                    <li><code>find_files</code> <span>Glob / metadata</span></li>
+                    <li><code>code_outline</code> <span>AST symbol map</span></li>
+                    <li><code>git_ops</code> <span>Structured Git ops</span></li>
+                    <li><code>file_ops</code> <span>Mkdir / Move / Delete</span></li>
+                    <li><code>start_command_job</code> <span>Async bg job</span></li>
+                    <li><code>poll_command_job</code> <span>Incremental job log</span></li>
+                    <li><code>stop_command_job</code> <span>Terminate bg job</span></li>
+                  </ul>
+                </div>
+              </aside>
+            </div>
+          </section>
+
+          <!-- VIEW 2: MCP BRIDGE & SECURITY -->
+          <section id="panel-bridge" role="tabpanel" aria-labelledby="tab-btn-bridge" class="view-panel">
+            <div class="view-header">
+              <div>
+                <h1 id="heading-bridge" class="view-title" tabindex="-1">MCP Bridge &amp; Security</h1>
+                <p class="view-subtitle">Embedded HTTP JSON-RPC 2.0 server, remote tunnel exposure, dan kontrol OAuth 2.1.</p>
+              </div>
+              <div class="btn-row">
+                <button id="btn-self-diag" type="button" class="btn btn-secondary">Self-Test</button>
+                <button id="btn-toggle-server" type="button" class="btn btn-primary">Start Server</button>
+              </div>
+            </div>
+
+            <div class="bridge-grid">
+              <article class="card">
+                <div class="card-header-row">
+                  <div>
+                    <h2 class="card-heading">Embedded MCP Server (Route A)</h2>
+                    <p class="card-desc">Streamable HTTP JSON-RPC 2.0 + Bearer Token Auth di localhost.</p>
+                  </div>
+                  <span id="bridge-server-pill" class="badge badge-muted">OFFLINE</span>
+                </div>
+
+                <div class="kv-grid">
+                  <div class="kv-item">
+                    <span class="kv-label">Local Endpoint &amp; Port</span>
+                    <div class="port-row">
+                      <code id="local-mcp-url" class="kv-value">http://127.0.0.1:9494/mcp</code>
+                      <label for="server-port-input" class="sr-only">Port Server MCP</label>
+                      <input
+                        id="server-port-input"
+                        type="number"
+                        min="1024"
+                        max="65535"
+                        class="mono-input port-input"
+                        value="9494"
+                      />
+                      <button id="btn-apply-port" type="button" class="btn btn-secondary btn-xs">Apply Port</button>
+                    </div>
+                  </div>
+                  <div class="kv-item">
+                    <span class="kv-label">Bearer Token</span>
+                    <div class="token-row">
+                      <code id="mcp-auth-token" class="kv-value">---</code>
+                      <button
+                        id="btn-toggle-secrets"
+                        type="button"
+                        class="btn btn-secondary btn-xs"
+                        aria-pressed="false"
+                        aria-label="Tampilkan atau sembunyikan kredensial"
+                      >
+                        Show
+                      </button>
+                      <button id="btn-rotate-token" type="button" class="btn btn-secondary btn-xs">Rotate</button>
+                    </div>
+                  </div>
+                  <div class="kv-item">
+                    <label for="mcp-preset-select" class="kv-label">1-Click Client Config Preset</label>
+                    <div class="preset-row">
+                      <select id="mcp-preset-select" class="mono-select"></select>
+                      <button id="btn-copy-preset" type="button" class="btn btn-secondary btn-xs">Copy</button>
+                      <button id="btn-preview-preset" type="button" class="btn btn-secondary btn-xs">Preview</button>
+                    </div>
+                  </div>
+                </div>
+
+                <button id="btn-copy-mcp-url" type="button" class="btn btn-primary" style="width: 100%">1-Click Copy URL + Token</button>
+              </article>
+
+              <article class="card">
+                <div class="card-header-row">
+                  <div>
+                    <h2 class="card-heading">Remote Tunnel &amp; Auto-Kill Idle</h2>
+                    <p class="card-desc">Ekspos server MCP ke Gemini Web via Cloudflare atau Tailscale Funnel permanen.</p>
+                  </div>
+                  <button id="btn-toggle-tunnel" type="button" class="btn btn-secondary">Start Tunnel</button>
+                </div>
+
+                <div class="kv-grid">
+                  <div class="kv-item">
+                    <label for="tunnel-provider-select" class="kv-label">Tunnel Provider</label>
+                    <select id="tunnel-provider-select" class="mono-select">
+                      <option value="cloudflare" selected>Cloudflare Quick Tunnel (HTTP/2)</option>
+                      <option value="cloudflare_named">Cloudflare Named Tunnel (Domain Permanen)</option>
+                      <option value="tailscale">Tailscale Funnel (Link Permanen &amp; Anti-Blokir)</option>
+                    </select>
+                  </div>
+
+                  <div id="cf-named-fields" class="cf-named-box" hidden>
+                    <div class="form-group">
+                      <label for="cf-named-token">Cloudflare Tunnel Token (Zero Trust)</label>
+                      <input
+                        id="cf-named-token"
+                        type="password"
+                        class="mono-input"
+                        placeholder="eyJhIjoi..."
+                        autocomplete="off"
+                      />
+                    </div>
+                    <div class="form-group">
+                      <label for="cf-named-url">Public Hostname URL</label>
+                      <input
+                        id="cf-named-url"
+                        type="text"
+                        class="mono-input"
+                        placeholder="https://mcp.domain-anda.com"
+                        spellcheck="false"
+                      />
+                    </div>
+                    <div class="btn-row">
+                      <button id="btn-save-cf-named" type="button" class="btn btn-primary btn-xs">Save Named Tunnel</button>
+                      <button id="btn-clear-cf-named" type="button" class="btn btn-secondary btn-xs">Clear Token</button>
+                    </div>
+                  </div>
+
+                  <div class="kv-item">
+                    <span class="kv-label">Public Tunnel URL</span>
+                    <code id="public-tunnel-url" class="kv-value">Belum aktif</code>
+                  </div>
+                  <div class="kv-item">
+                    <label for="idle-timeout-select" class="kv-label">Auto-Kill Idle Timer</label>
+                    <select id="idle-timeout-select" class="mono-select">
+                      <option value="0" selected>Nonaktif (Direkomendasikan)</option>
+                      <option value="15">15 Menit</option>
+                      <option value="30">30 Menit</option>
+                      <option value="60">60 Menit</option>
+                    </select>
+                  </div>
+                </div>
+
+                <details id="tunnel-logs-drawer" class="tunnel-logs-drawer">
+                  <summary>
+                    <span>Live Tunnel Logs</span>
+                    <button id="btn-clear-tunnel-logs" type="button" class="btn btn-secondary btn-xs">Clear</button>
+                  </summary>
+                  <pre id="tunnel-logs-pre" class="mono-pre tunnel-logs-pre">Belum ada log tunnel.</pre>
+                </details>
+              </article>
+
+              <article class="card card-span-2">
+                <div class="card-header-row">
+                  <div>
+                    <h2 class="card-heading">Security &amp; Desktop Behavior Guardrails</h2>
+                    <p class="card-desc">Kontrol proteksi file sensitif serta perilaku tombol tutup jendela aplikasi.</p>
+                  </div>
+                </div>
+                <div class="toggle-grid">
+                  <label for="toggle-sensitive-guard" class="toggle-row">
+                    <div>
+                      <span class="toggle-title">Blokir baca/edit file sensitif (.env, *.key, auth.json)</span>
+                      <span class="toggle-hint">Mencegah token atau kunci rahasia terbaca oleh LLM lokal maupun remote MCP.</span>
+                    </div>
+                    <input id="toggle-sensitive-guard" type="checkbox" class="tactile-switch" checked />
+                  </label>
+                  <label for="toggle-close-to-tray" class="toggle-row">
+                    <div>
+                      <span class="toggle-title">Minimize to Tray saat tutup jendela</span>
+                      <span class="toggle-hint">Menjaga MCP Server dan Tunnel tetap aktif di latar belakang saat tombol X ditekan.</span>
+                    </div>
+                    <input id="toggle-close-to-tray" type="checkbox" class="tactile-switch" checked />
+                  </label>
+                </div>
+              </article>
+
+              <article class="card card-span-2">
+                <div class="card-header-row">
+                  <div>
+                    <h2 class="card-heading">Authorized OAuth Clients (Interactive Consent)</h2>
+                    <p class="card-desc">Setiap koneksi OAuth baru membutuhkan persetujuan popup di aplikasi sebelum memperoleh akses MCP.</p>
+                  </div>
+                  <button id="btn-revoke-all-oauth" type="button" class="btn btn-danger btn-xs">Revoke All</button>
+                </div>
+                <div class="traffic-table-wrap">
+                  <table class="traffic-table">
+                    <thead>
+                      <tr>
+                        <th scope="col">Client</th>
+                        <th scope="col">Trust</th>
+                        <th scope="col">Active Tokens</th>
+                        <th scope="col">Redirect URI</th>
+                        <th scope="col">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody id="oauth-clients-body">
+                      <tr>
+                        <td colspan="5" class="traffic-empty">Belum ada OAuth client yang terdaftar.</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+            </div>
+          </section>
+
+          <!-- VIEW 3: HUB & TOOLS -->
+          <section id="panel-hub" role="tabpanel" aria-labelledby="tab-btn-hub" class="view-panel">
+            <div class="view-header">
+              <div>
+                <h1 id="heading-hub" class="view-title" tabindex="-1">Hub &amp; Smart Tools</h1>
+                <p class="view-subtitle">Gabungkan downstream MCP servers (<code class="md-inline-code">namespace__tool</code>) dan uji 14 tool hemat token.</p>
+              </div>
+              <button id="btn-add-mcp" type="button" class="btn btn-primary">+ Add MCP Server</button>
+            </div>
+
+            <div class="scroll-grid">
+              <article class="card card-span-2">
+                <div class="card-header-row">
+                  <div>
+                    <h2 class="card-heading">Downstream MCP Aggregator (Multiplexer)</h2>
+                    <p class="card-desc">Gabungkan tools dari MCP server lain (HTTP atau Stdio lokal) dengan prefix <code class="md-inline-code">namespace__tool</code>.</p>
+                  </div>
+                </div>
+                <div class="traffic-table-wrap">
+                  <table class="traffic-table">
+                    <thead>
+                      <tr>
+                        <th scope="col">Server</th>
+                        <th scope="col">Namespace</th>
+                        <th scope="col">Transport</th>
+                        <th scope="col">Tools</th>
+                        <th scope="col">Status</th>
+                        <th scope="col">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody id="mcp-hub-body">
+                      <tr>
+                        <td colspan="6" class="traffic-empty">Belum ada downstream MCP server terdaftar.</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+
+              <article class="card card-span-2">
+                <div class="card-header-row">
+                  <div>
+                    <h2 class="card-heading">Built-in Smart Tool Simulator &amp; Self-Test</h2>
+                    <p class="card-desc">Uji langsung eksekusi tool hemat kuota terhadap folder workspace tanpa perlu koneksi web.</p>
+                  </div>
+                  <div class="sim-controls">
+                    <label for="sim-tool-select" class="sr-only">Pilih tool simulasi</label>
+                    <select id="sim-tool-select" class="mono-select">
+                      <option value="project_overview">project_overview</option>
+                      <option value="smart_search">smart_search</option>
+                      <option value="read_file_range">read_file_range</option>
+                      <option value="surgical_edit">surgical_edit</option>
+                      <option value="patch_and_verify">patch_and_verify</option>
+                      <option value="run_command_compressed">run_command_compressed</option>
+                      <option value="write_file_jailed">write_file_jailed</option>
+                      <option value="find_files">find_files</option>
+                      <option value="code_outline">code_outline</option>
+                      <option value="git_ops">git_ops</option>
+                      <option value="file_ops">file_ops</option>
+                      <option value="start_command_job">start_command_job</option>
+                      <option value="poll_command_job">poll_command_job</option>
+                      <option value="stop_command_job">stop_command_job</option>
+                    </select>
+                    <button id="btn-copy-sim-rpc" type="button" class="btn btn-secondary">Copy JSON-RPC</button>
+                    <button id="btn-run-sim" type="button" class="btn btn-primary">Execute Tool</button>
+                  </div>
+                </div>
+                <div class="sim-grid">
+                  <div>
+                    <label for="sim-args-input" class="bar-label">JSON Arguments</label>
+                    <textarea id="sim-args-input" class="mono-textarea" rows="7">{}</textarea>
+                  </div>
+                  <div>
+                    <span class="bar-label">Tool Output</span>
+                    <pre id="sim-output" class="mono-pre">Klik "Execute Tool" untuk melihat output...</pre>
+                  </div>
+                </div>
+              </article>
+            </div>
+          </section>
+
+          <!-- VIEW 4: LIVE MONITOR -->
+          <section id="panel-monitor" role="tabpanel" aria-labelledby="tab-btn-monitor" class="view-panel">
+            <div class="view-header">
+              <div>
+                <h1 id="heading-monitor" class="view-title" tabindex="-1">Live Monitor</h1>
+                <p class="view-subtitle">Pantau request HTTP JSON-RPC real-time (klik baris untuk Payload Inspector) &amp; async background jobs.</p>
+              </div>
+              <div class="filter-bar">
+                <label for="traffic-filter-input" class="sr-only">Filter traffic HTTP</label>
+                <input
+                  id="traffic-filter-input"
+                  type="search"
+                  class="mono-input filter-input"
+                  placeholder="Filter method/RPC/note..."
+                />
+                <label for="traffic-status-filter" class="sr-only">Filter status HTTP</label>
+                <select id="traffic-status-filter" class="mono-select filter-select">
+                  <option value="all">All Status</option>
+                  <option value="2xx">2xx OK</option>
+                  <option value="err">4xx / 5xx</option>
+                </select>
+                <button id="btn-clear-traffic" type="button" class="btn btn-secondary btn-xs">Clear</button>
+              </div>
+            </div>
+
+            <div class="scroll-grid">
+              <article class="card card-span-2">
+                <div class="card-header-row">
+                  <div>
+                    <h2 class="card-heading">Live HTTP Traffic Monitor</h2>
+                    <p class="card-desc">Klik baris untuk memeriksa raw request &amp; response payload (redacted).</p>
+                  </div>
+                  <span id="traffic-count-label" class="badge badge-muted">0 requests</span>
+                </div>
+                <div class="traffic-table-wrap">
+                  <table class="traffic-table">
+                    <thead>
+                      <tr>
+                        <th scope="col">Time</th>
+                        <th scope="col">Method</th>
+                        <th scope="col">Path / RPC</th>
+                        <th scope="col">Status</th>
+                        <th scope="col">Duration</th>
+                        <th scope="col">Note</th>
+                      </tr>
+                    </thead>
+                    <tbody id="http-traffic-body">
+                      <tr>
+                        <td colspan="6" class="traffic-empty">Belum ada traffic HTTP masuk pada sesi ini.</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+
+              <article class="card card-span-2">
+                <div class="card-header-row">
+                  <div>
+                    <h2 class="card-heading">Background Command Jobs (Async)</h2>
+                    <p class="card-desc">Pantau build/test panjang via <code class="md-inline-code">start_command_job</code> tanpa terkena timeout WebMCP.</p>
+                  </div>
+                  <button id="btn-clear-finished-jobs" type="button" class="btn btn-secondary btn-xs">Clear Finished</button>
+                </div>
+                <div class="traffic-table-wrap">
+                  <table class="traffic-table">
+                    <thead>
+                      <tr>
+                        <th scope="col">Job ID</th>
+                        <th scope="col">Label / Command</th>
+                        <th scope="col">Status</th>
+                        <th scope="col">Runtime</th>
+                        <th scope="col">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody id="jobs-body">
+                      <tr>
+                        <td colspan="5" class="traffic-empty">Belum ada background command job yang dijalankan.</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+            </div>
+          </section>
+
+          <!-- VIEW 5: DIFF & AUDIT -->
+          <section id="panel-audit" role="tabpanel" aria-labelledby="tab-btn-audit" class="view-panel">
+            <div class="view-header">
+              <div>
+                <h1 id="heading-audit" class="view-title" tabindex="-1">Diff &amp; Audit</h1>
+                <p class="view-subtitle">Riwayat perubahan dengan SHA-256 snapshot rollback per file maupun per Turn Group.</p>
+              </div>
+              <button id="btn-refresh-audit" type="button" class="btn btn-secondary btn-xs">Refresh</button>
+            </div>
+
+            <div class="audit-layout">
+              <div class="audit-list-pane">
+                <div class="pane-header">
+                  <h2 class="card-heading">Live Audit Trail</h2>
+                </div>
+                <div class="audit-filter-stack">
+                  <label for="audit-search-input" class="sr-only">Cari entri audit</label>
+                  <input
+                    id="audit-search-input"
+                    type="search"
+                    class="mono-input"
+                    placeholder="Cari file, tool, atau ringkasan..."
+                  />
+                  <div class="audit-filter-row">
+                    <label for="audit-source-filter" class="sr-only">Filter sumber audit</label>
+                    <select id="audit-source-filter" class="mono-select">
+                      <option value="ALL">Semua Source</option>
+                      <option value="WebMCP">WebMCP</option>
+                      <option value="LocalAgent">LocalAgent</option>
+                      <option value="Simulator">Simulator</option>
+                    </select>
+                    <label for="audit-revertable-only" class="inline-check">
+                      <input id="audit-revertable-only" type="checkbox" />
+                      <span>Bisa Revert</span>
+                    </label>
+                  </div>
+                </div>
+                <div id="audit-list" class="audit-list">
+                  <div class="chat-empty">Belum ada aktivitas tool pada sesi ini.</div>
+                </div>
+              </div>
+
+              <div class="diff-pane">
+                <div class="pane-header">
+                  <div>
+                    <h2 id="diff-title" class="card-heading">Visual Diff Inspector</h2>
+                    <p id="diff-meta" class="card-desc">Pilih entri log di sebelah kiri untuk melihat detail atau melakukan 1-Click Revert.</p>
+                  </div>
+                  <div class="btn-row">
+                    <button id="btn-open-vscode" type="button" class="btn btn-secondary btn-xs" disabled>VS Code</button>
+                    <button id="btn-open-explorer" type="button" class="btn btn-secondary btn-xs" disabled>Explorer</button>
+                    <button id="btn-revert-group" type="button" class="btn btn-secondary btn-xs" hidden>Revert Turn Group</button>
+                    <button id="btn-revert-selected" type="button" class="btn btn-danger btn-xs" disabled>1-Click Revert File</button>
+                  </div>
+                </div>
+                <div id="diff-viewer" class="diff-viewer">
+                  <div class="chat-empty">Tidak ada diff yang dipilih.</div>
+                </div>
+              </div>
+            </div>
+          </section>
+        </main>
+      </div>
+
+      <footer class="statusbar">
+        <span id="toast-region" role="status" aria-live="polite">Ready</span>
+        <div class="statusbar-right">
+          <button id="btn-toggle-accent" type="button" class="preview-pill" title="Ganti warna aksen Obsidian Studio">
+            Accent: <strong id="accent-name-label" style="color: var(--accent-fg)">Electric Mint</strong>
+          </button>
+          <span id="statusbar-meta" class="mono-muted">Port 9494 · Jailed FS · Token Guard Active</span>
+        </div>
+      </footer>
+    </div>
+
+    <!-- Floating Toast Stack -->
+    <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
+
+    <!-- OAuth Consent Approval Modal (Security critical: closedby="none") -->
+    <dialog id="oauth-consent-dialog" closedby="none" class="modal-dialog" aria-labelledby="oauth-dialog-title">
+      <div class="modal-header">
+        <h2 id="oauth-dialog-title" class="card-heading">Permintaan Koneksi OAuth Baru</h2>
+        <p class="card-desc">Aplikasi eksternal meminta izin akses penuh ke MCP Server pada workspace aktif Anda.</p>
+      </div>
+      <div class="modal-body">
+        <div class="kv-grid">
+          <div class="kv-item">
+            <span class="kv-label">Client</span>
+            <code id="oauth-req-client" class="kv-value">-</code>
+          </div>
+          <div class="kv-item">
+            <span class="kv-label">Redirect URI</span>
+            <code id="oauth-req-redirect" class="kv-value">-</code>
+          </div>
+          <div class="kv-item">
+            <span class="kv-label">Requested Scope</span>
+            <code id="oauth-req-scope" class="kv-value">mcp</code>
+          </div>
+        </div>
+        <p class="modal-warning">
+          Hanya setujui jika Anda sendiri yang baru saja memicu autentikasi dari klien MCP (seperti Gemini Web).
+        </p>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-oauth-deny" type="button" class="btn btn-danger">Deny</button>
+        <button id="btn-oauth-once" type="button" class="btn btn-secondary">Approve Once</button>
+        <button id="btn-oauth-trust" type="button" class="btn btn-primary">Approve &amp; Trust</button>
+      </div>
+    </dialog>
+
+    <!-- Revert Conflict Confirmation Modal (Destructive confirmation: closedby="none") -->
+    <dialog id="revert-conflict-dialog" closedby="none" class="modal-dialog" aria-labelledby="revert-dialog-title">
+      <div class="modal-header">
+        <h2 id="revert-dialog-title" class="card-heading">Konflik Revert Terdeteksi</h2>
+        <p class="card-desc">File target mengalami perubahan setelah entri audit ini dibuat.</p>
+      </div>
+      <div class="modal-body">
+        <p id="revert-conflict-message" class="modal-warning"></p>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-revert-cancel" type="button" class="btn btn-secondary">Cancel</button>
+        <button id="btn-revert-force" type="button" class="btn btn-danger">Force Revert</button>
+      </div>
+    </dialog>
+
+    <!-- HTTP Traffic Payload Inspector Modal -->
+    <dialog id="traffic-inspector-dialog" closedby="any" class="modal-dialog modal-dialog-wide" aria-labelledby="traffic-insp-title">
+      <div class="modal-header">
+        <h2 id="traffic-insp-title" class="card-heading">HTTP Traffic Payload Inspector</h2>
+        <p id="traffic-insp-meta" class="card-desc">-</p>
+      </div>
+      <div class="modal-body">
+        <div class="insp-section">
+          <div class="label-action-row">
+            <span class="bar-label">REQUEST PAYLOAD (REDACTED)</span>
+            <button id="btn-copy-insp-req" type="button" class="btn btn-secondary btn-xs">Copy Request</button>
+          </div>
+          <pre id="traffic-insp-req" class="mono-pre insp-pre">-</pre>
+        </div>
+        <div class="insp-section">
+          <div class="label-action-row">
+            <span class="bar-label">RESPONSE PAYLOAD (REDACTED)</span>
+            <button id="btn-copy-insp-res" type="button" class="btn btn-secondary btn-xs">Copy Response</button>
+          </div>
+          <pre id="traffic-insp-res" class="mono-pre insp-pre">-</pre>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-close-traffic-insp" type="button" class="btn btn-secondary">Close</button>
+      </div>
+    </dialog>
+
+    <!-- MCP Client Preset Preview Modal -->
+    <dialog id="preset-preview-dialog" closedby="any" class="modal-dialog modal-dialog-wide" aria-labelledby="preset-modal-title">
+      <div class="modal-header">
+        <h2 id="preset-modal-title" class="card-heading">MCP Client Config Preset</h2>
+        <p id="preset-modal-desc" class="card-desc">-</p>
+      </div>
+      <div class="modal-body">
+        <div class="label-action-row" style="margin-bottom: 8px">
+          <code id="preset-modal-file" class="kv-label">-</code>
+          <label for="preset-modal-use-tunnel" class="inline-check">
+            <input id="preset-modal-use-tunnel" type="checkbox" />
+            <span>Gunakan Public Tunnel URL</span>
+          </label>
+        </div>
+        <pre id="preset-modal-code" class="mono-pre insp-pre">-</pre>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-close-preset-modal" type="button" class="btn btn-secondary">Close</button>
+        <button id="btn-preset-modal-copy" type="button" class="btn btn-primary">Copy Config</button>
+      </div>
+    </dialog>
+
+    <!-- Self-Diagnostic Report Modal -->
+    <dialog id="diagnostic-dialog" closedby="any" class="modal-dialog" aria-labelledby="diag-modal-title">
+      <div class="modal-header">
+        <h2 id="diag-modal-title" class="card-heading">MCP Self-Diagnostic Report</h2>
+        <p class="card-desc">Hasil pengecekan loopback HTTP, handshake initialize, daftar tools, dan status tunnel.</p>
+      </div>
+      <div class="modal-body">
+        <div id="diagnostic-checks-grid" class="diag-grid"></div>
+        <ul id="diagnostic-notes-list" class="diag-notes"></ul>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-close-diag" type="button" class="btn btn-primary">Done</button>
+      </div>
+    </dialog>
+
+    <!-- Command Palette Modal (Ctrl+K) -->
+    <dialog id="command-palette-dialog" closedby="any" class="modal-dialog" aria-labelledby="palette-title">
+      <div class="modal-header">
+        <h2 id="palette-title" class="sr-only">Command Palette</h2>
+        <div class="palette-search-row">
+          <label for="palette-search-input" class="sr-only">Cari perintah</label>
+          <input
+            id="palette-search-input"
+            type="search"
+            class="mono-input"
+            placeholder="Ketik perintah (server, tunnel, workspace, VS Code, mint, cyan)..."
+          />
+          <button id="btn-close-palette" type="button" class="btn btn-secondary btn-xs">Esc</button>
+        </div>
+      </div>
+      <div id="palette-results" class="palette-results"></div>
+    </dialog>
+
+    <!-- HITL Tool Execution Approval Modal (Security critical: closedby="none") -->
+    <dialog id="tool-approval-dialog" closedby="none" class="modal-dialog modal-dialog-wide" aria-labelledby="tool-approval-title">
+      <div class="modal-header">
+        <h2 id="tool-approval-title" class="card-heading">Konfirmasi Eksekusi Tool (Safe Edit Mode)</h2>
+        <p id="tool-req-summary" class="card-desc">-</p>
+      </div>
+      <div class="modal-body">
+        <div class="kv-grid">
+          <div class="kv-item">
+            <span class="kv-label">Source</span>
+            <code id="tool-req-source" class="kv-value">-</code>
+          </div>
+          <div class="kv-item">
+            <span class="kv-label">Tool Name</span>
+            <code id="tool-req-name" class="kv-value">-</code>
+          </div>
+        </div>
+        <div class="insp-section">
+          <span class="bar-label">ARGUMENTS</span>
+          <pre id="tool-req-args" class="mono-pre insp-pre">{}</pre>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-tool-deny" type="button" class="btn btn-danger">Deny</button>
+        <button id="btn-tool-once" type="button" class="btn btn-secondary">Approve Once</button>
+        <button id="btn-tool-session" type="button" class="btn btn-primary">Approve for Session</button>
+      </div>
+    </dialog>
+
+    <!-- Background Job Logs Modal -->
+    <dialog id="job-logs-dialog" closedby="any" class="modal-dialog modal-dialog-wide" aria-labelledby="job-logs-title">
+      <div class="modal-header">
+        <h2 id="job-logs-title" class="card-heading">Background Job Output</h2>
+        <p id="job-logs-meta" class="card-desc">-</p>
+      </div>
+      <div class="modal-body">
+        <pre id="job-logs-pre" class="mono-pre insp-pre">Memuat log...</pre>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-refresh-job-logs" type="button" class="btn btn-secondary">Refresh</button>
+        <button id="btn-copy-job-logs" type="button" class="btn btn-secondary">Copy Output</button>
+        <button id="btn-close-job-logs" type="button" class="btn btn-primary">Close</button>
+      </div>
+    </dialog>
+
+    <!-- Add Downstream MCP Server Modal -->
+    <dialog id="add-mcp-dialog" closedby="any" class="modal-dialog" aria-labelledby="add-mcp-title">
+      <form id="add-mcp-form">
+        <div class="modal-header">
+          <h2 id="add-mcp-title" class="card-heading">Tambah Downstream MCP Server</h2>
+          <p class="card-desc">Hubungkan server MCP HTTP/SSE atau proses CLI stdio untuk digabungkan ke <code class="md-inline-code">tools/list</code>.</p>
+        </div>
+        <div class="modal-body">
+          <div class="form-group">
+            <label for="mcp-name">Nama Server</label>
+            <input id="mcp-name" type="text" class="mono-input" required placeholder="misal: GitHub / Context7 / Postgres" />
+          </div>
+          <div class="form-group">
+            <label for="mcp-namespace">Namespace Prefix (ASCII lowercase/angka)</label>
+            <input id="mcp-namespace" type="text" class="mono-input" required placeholder="misal: github" spellcheck="false" />
+          </div>
+          <div class="form-group">
+            <label for="mcp-transport">Transport</label>
+            <select id="mcp-transport" class="mono-select">
+              <option value="http" selected>HTTP / Streamable HTTP</option>
+              <option value="stdio">Local Stdio Subprocess</option>
+            </select>
+          </div>
+          <div id="mcp-http-fields">
+            <div class="form-group">
+              <label for="mcp-url">Endpoint URL</label>
+              <input id="mcp-url" type="url" class="mono-input" placeholder="https://example.com/mcp" spellcheck="false" />
+            </div>
+            <div class="form-group">
+              <label for="mcp-bearer">Bearer Token (Opsional)</label>
+              <input id="mcp-bearer" type="password" class="mono-input" placeholder="Opsional..." autocomplete="off" />
+            </div>
+          </div>
+          <div id="mcp-stdio-fields" hidden>
+            <div class="form-group">
+              <label for="mcp-command">Command Executable</label>
+              <input id="mcp-command" type="text" class="mono-input" placeholder="npx / uvx / python" spellcheck="false" />
+            </div>
+            <div class="form-group">
+              <label for="mcp-args">Arguments (pisahkan spasi atau koma)</label>
+              <input id="mcp-args" type="text" class="mono-input" placeholder="-y @modelcontextprotocol/server-filesystem C:\path" spellcheck="false" />
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button id="btn-cancel-add-mcp" type="button" class="btn btn-secondary">Cancel</button>
+          <button id="btn-save-add-mcp" type="submit" class="btn btn-primary">Connect &amp; Save</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,3981 @@
+<!doctype html>
+<html lang="id" data-accent="mint">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Airlock — Obsidian Studio Preview</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./tokens.css" />
+    <style>
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        background: var(--bg-canvas);
+        color: var(--text-primary);
+        font-family: var(--font-ui);
+        font-size: 13.5px;
+        line-height: 1.5;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+      }
+
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        border: 0;
+      }
+
+      /* Custom Scrollbars */
+      ::-webkit-scrollbar {
+        width: 7px;
+        height: 7px;
+      }
+      ::-webkit-scrollbar-track {
+        background: transparent;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: var(--border-default);
+        border-radius: 999px;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: var(--border-strong);
+      }
+
+      button:focus-visible,
+      input:focus-visible,
+      select:focus-visible,
+      textarea:focus-visible,
+      summary:focus-visible,
+      [tabindex]:focus-visible {
+        outline: var(--focus-ring);
+        outline-offset: 2px;
+      }
+
+      /* =================================================================
+         SHELL ARCHITECTURE: TOP BAR (48px) + LEFT RAIL + WORKSPACE CANVAS
+         ================================================================= */
+      .app-shell {
+        display: grid;
+        grid-template-rows: 48px 1fr 30px;
+        height: 100vh;
+        overflow: hidden;
+        background: var(--bg-canvas);
+      }
+
+      /* --- Top Command Bar --- */
+      .cmdbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-3);
+        padding: 0 var(--space-4);
+        background: var(--bg-rail);
+        border-bottom: 1px solid var(--border-subtle);
+        z-index: 20;
+      }
+
+      .cmdbar-left {
+        display: flex;
+        align-items: center;
+        gap: var(--space-3);
+        min-width: 0;
+        flex: 1;
+      }
+
+      .brand-lockup {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        padding-right: var(--space-2);
+        flex-shrink: 0;
+      }
+
+      .brand-mark {
+        display: grid;
+        place-items: center;
+        width: 28px;
+        height: 28px;
+        border-radius: var(--radius-md);
+        background: var(--accent-tint);
+        border: 1px solid var(--accent-border);
+        color: var(--accent-fg);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+      }
+
+      .brand-name {
+        font-size: 14px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        color: var(--text-primary);
+      }
+
+      .rail-toggle-btn {
+        display: grid;
+        place-items: center;
+        width: 28px;
+        height: 28px;
+        border-radius: var(--radius-sm);
+        border: 1px solid var(--border-subtle);
+        background: var(--bg-surface);
+        color: var(--text-secondary);
+        cursor: pointer;
+        flex-shrink: 0;
+        transition:
+          color var(--dur-fast) ease,
+          border-color var(--dur-fast) ease,
+          background-color var(--dur-fast) ease;
+      }
+
+      .rail-toggle-btn:hover {
+        color: var(--text-primary);
+        border-color: var(--border-default);
+        background: var(--bg-elevated);
+      }
+
+      /* --- Workspace Capsule --- */
+      .workspace-capsule {
+        position: relative;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 3px 6px 3px 10px;
+        background: var(--bg-surface);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-md);
+        min-width: 0;
+        max-width: 520px;
+        flex: 1;
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+      }
+
+      .ws-root-label {
+        font-family: var(--font-mono);
+        font-size: 11px;
+        font-weight: 600;
+        color: var(--text-muted);
+        flex-shrink: 0;
+      }
+
+      .ws-input {
+        flex: 1;
+        min-width: 110px;
+        border: 0;
+        background: transparent;
+        color: var(--text-primary);
+        font-family: var(--font-mono);
+        font-size: 12px;
+        padding: 3px 4px;
+        text-overflow: ellipsis;
+      }
+
+      .ws-input:focus-visible {
+        outline: none;
+      }
+
+      .workspace-capsule:focus-within {
+        border-color: var(--accent-border);
+      }
+
+      .git-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 2px 7px;
+        border-radius: var(--radius-sm);
+        background: var(--accent-tint);
+        border: 1px solid var(--accent-border);
+        color: var(--accent-fg);
+        font-family: var(--font-mono);
+        font-size: 11px;
+        font-weight: 500;
+        white-space: nowrap;
+        flex-shrink: 0;
+      }
+
+      .icon-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 24px;
+        height: 24px;
+        border-radius: var(--radius-sm);
+        border: 1px solid transparent;
+        background: transparent;
+        color: var(--text-secondary);
+        cursor: pointer;
+        flex-shrink: 0;
+        transition:
+          color var(--dur-fast) ease,
+          background-color var(--dur-fast) ease,
+          border-color var(--dur-fast) ease;
+      }
+
+      .icon-btn:hover {
+        color: var(--text-primary);
+        background: var(--bg-elevated);
+      }
+
+      .icon-btn[aria-pressed="true"] {
+        color: var(--status-warn);
+        background: var(--status-warn-bg);
+      }
+
+      .workspace-dropdown {
+        position: absolute;
+        top: calc(100% + 8px);
+        left: 0;
+        right: 0;
+        background: var(--bg-surface);
+        border: 1px solid var(--border-default);
+        border-radius: var(--radius-lg);
+        padding: 8px;
+        z-index: 60;
+        box-shadow: var(--shadow-elevated);
+      }
+
+      .workspace-dropdown[hidden] {
+        display: none;
+      }
+
+      .ws-drop-hdr {
+        padding: 4px 8px;
+        font-family: var(--font-mono);
+        font-size: 10px;
+        font-weight: 600;
+        color: var(--text-muted);
+        letter-spacing: 0.05em;
+      }
+
+      .ws-drop-item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        width: 100%;
+        padding: 6px 8px;
+        border: 0;
+        border-radius: var(--radius-sm);
+        background: transparent;
+        color: var(--text-primary);
+        font-family: var(--font-mono);
+        font-size: 11.5px;
+        cursor: pointer;
+        text-align: left;
+        transition: background-color var(--dur-fast) ease;
+      }
+
+      .ws-drop-item:hover {
+        background: var(--bg-elevated);
+      }
+
+      .ws-drop-branch {
+        font-size: 10.5px;
+        color: var(--accent-fg);
+      }
+
+      /* --- Right Command Bar Controls --- */
+      .cmdbar-right {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-shrink: 0;
+      }
+
+      /* Sliding Guardrail Switcher */
+      .guardrail-track {
+        position: relative;
+        display: inline-grid;
+        grid-auto-flow: column;
+        grid-auto-columns: 1fr;
+        align-items: center;
+        padding: 3px;
+        background: var(--bg-surface);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-md);
+      }
+
+      .guardrail-glider {
+        position: absolute;
+        top: 3px;
+        bottom: 3px;
+        left: 0;
+        width: 100%;
+        border-radius: var(--radius-sm);
+        background: var(--accent-tint);
+        border: 1px solid var(--accent-border);
+        transform-origin: 0 50%;
+        pointer-events: none;
+        transition:
+          background-color var(--dur-med) ease,
+          border-color var(--dur-med) ease;
+      }
+
+      @media (prefers-reduced-motion: no-preference) {
+        .guardrail-glider {
+          transition:
+            transform var(--dur-med) var(--ease-out-expo),
+            background-color var(--dur-med) ease,
+            border-color var(--dur-med) ease;
+        }
+      }
+
+      .guardrail-track[data-mode="read_only"] .guardrail-glider {
+        background: var(--status-info-bg);
+        border-color: var(--status-info-border);
+      }
+
+      .guardrail-track[data-mode="safe_edit"] .guardrail-glider {
+        background: var(--status-warn-bg);
+        border-color: var(--status-warn-border);
+      }
+
+      .guardrail-btn {
+        position: relative;
+        z-index: 1;
+        border: 0;
+        background: transparent;
+        color: var(--text-secondary);
+        font-family: var(--font-mono);
+        font-size: 11px;
+        font-weight: 500;
+        padding: 4px 10px;
+        border-radius: var(--radius-sm);
+        cursor: pointer;
+        white-space: nowrap;
+        transition: color var(--dur-fast) ease;
+      }
+
+      .guardrail-btn:hover {
+        color: var(--text-primary);
+      }
+
+      .guardrail-btn.active {
+        color: var(--accent-fg);
+        font-weight: 600;
+      }
+
+      .guardrail-btn[data-guardrail="read_only"].active {
+        color: var(--status-info);
+      }
+
+      .guardrail-btn[data-guardrail="safe_edit"].active {
+        color: var(--status-warn);
+      }
+
+      .palette-trigger {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 5px 10px;
+        border-radius: var(--radius-md);
+        border: 1px solid var(--border-default);
+        background: var(--bg-surface);
+        color: var(--text-secondary);
+        font-family: var(--font-ui);
+        font-size: 12px;
+        font-weight: 500;
+        cursor: pointer;
+        transition:
+          border-color var(--dur-fast) ease,
+          color var(--dur-fast) ease,
+          background-color var(--dur-fast) ease;
+      }
+
+      .palette-trigger:hover {
+        color: var(--text-primary);
+        border-color: var(--border-strong);
+        background: var(--bg-elevated);
+      }
+
+      kbd {
+        font-family: var(--font-mono);
+        font-size: 10.5px;
+        padding: 1px 5px;
+        border-radius: 4px;
+        background: var(--bg-canvas);
+        border: 1px solid var(--border-default);
+        color: var(--text-muted);
+      }
+
+      /* =================================================================
+         WORKSPACE BODY: LEFT SIDEBAR RAIL + MAIN VIEW CANVAS
+         ================================================================= */
+      .workspace-body {
+        display: grid;
+        grid-template-columns: 216px 1fr;
+        min-height: 0;
+        overflow: hidden;
+        transition: grid-template-columns var(--dur-med) var(--ease-out-expo);
+      }
+
+      .app-shell.rail-collapsed .workspace-body {
+        grid-template-columns: 64px 1fr;
+      }
+
+      /* --- Left Sidebar Rail --- */
+      .side-rail {
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        padding: var(--space-3) var(--space-2);
+        background: var(--bg-rail);
+        border-right: 1px solid var(--border-subtle);
+        overflow: hidden;
+        user-select: none;
+      }
+
+      .rail-nav {
+        position: relative;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+
+      .rail-indicator {
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 3px;
+        height: 20px;
+        border-radius: 999px;
+        background: var(--accent-fg);
+        pointer-events: none;
+      }
+
+      @media (prefers-reduced-motion: no-preference) {
+        .rail-indicator {
+          transition: transform var(--dur-med) var(--ease-out-expo);
+        }
+      }
+
+      .rail-btn {
+        position: relative;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        width: 100%;
+        height: 36px;
+        padding: 0 10px;
+        border: 1px solid transparent;
+        border-radius: var(--radius-md);
+        background: transparent;
+        color: var(--text-secondary);
+        font-family: var(--font-ui);
+        font-size: 13px;
+        font-weight: 500;
+        cursor: pointer;
+        text-align: left;
+        overflow: hidden;
+        transition:
+          color var(--dur-fast) ease,
+          background-color var(--dur-fast) ease,
+          border-color var(--dur-fast) ease;
+      }
+
+      .rail-btn svg {
+        flex-shrink: 0;
+        transform: translateY(0.5px);
+      }
+
+      .rail-btn:hover {
+        color: var(--text-primary);
+        background: var(--bg-surface);
+      }
+
+      .rail-btn.active {
+        color: var(--text-primary);
+        background: var(--bg-elevated);
+        border-color: var(--border-subtle);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+      }
+
+      .rail-btn.active svg {
+        color: var(--accent-fg);
+      }
+
+      .rail-label {
+        flex: 1;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        transition: opacity var(--dur-fast) ease;
+      }
+
+      .rail-pill {
+        font-family: var(--font-mono);
+        font-size: 10.5px;
+        font-variant-numeric: tabular-nums;
+        padding: 1px 6px;
+        border-radius: var(--radius-pill);
+        background: var(--bg-canvas);
+        border: 1px solid var(--border-subtle);
+        color: var(--text-secondary);
+        flex-shrink: 0;
+      }
+
+      .app-shell.rail-collapsed .rail-btn {
+        justify-content: center;
+        padding: 0;
+      }
+
+      .app-shell.rail-collapsed .rail-label,
+      .app-shell.rail-collapsed .rail-pill,
+      .app-shell.rail-collapsed .telemetry-full {
+        display: none;
+      }
+
+      /* --- Rail Telemetry Footer --- */
+      .rail-footer {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-2);
+        padding: 10px;
+        border-radius: var(--radius-lg);
+        background: var(--bg-surface);
+        border: 1px solid var(--border-subtle);
+        box-shadow: var(--shadow-card);
+      }
+
+      .app-shell.rail-collapsed .rail-footer {
+        padding: 8px 4px;
+        align-items: center;
+      }
+
+      .telemetry-status-btn {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        width: 100%;
+        padding: 5px 7px;
+        border-radius: var(--radius-sm);
+        border: 1px solid transparent;
+        background: var(--bg-elevated);
+        color: var(--text-primary);
+        font-family: var(--font-mono);
+        font-size: 11px;
+        font-variant-numeric: tabular-nums;
+        cursor: pointer;
+        transition:
+          border-color var(--dur-fast) ease,
+          background-color var(--dur-fast) ease;
+      }
+
+      .telemetry-status-btn:hover {
+        border-color: var(--border-default);
+      }
+
+      .app-shell.rail-collapsed .telemetry-status-btn {
+        justify-content: center;
+        width: 34px;
+        height: 30px;
+        padding: 0;
+      }
+
+      .dot-wrap {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+      }
+
+      .live-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--status-ok);
+        flex-shrink: 0;
+      }
+
+      .live-dot.offline {
+        background: var(--text-muted);
+      }
+
+      .live-dot.warn {
+        background: var(--status-warn);
+      }
+
+      @media (prefers-reduced-motion: no-preference) {
+        .live-dot.online {
+          animation: pulse-dot 2.4s ease-in-out infinite;
+        }
+      }
+
+      @keyframes pulse-dot {
+        0%,
+        100% {
+          box-shadow: 0 0 0 0 color-mix(in oklab, var(--status-ok) 55%, transparent);
+        }
+        50% {
+          box-shadow: 0 0 0 5px transparent;
+        }
+      }
+
+      .telemetry-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-family: var(--font-mono);
+        font-size: 11px;
+        font-variant-numeric: tabular-nums;
+        padding: 2px 4px;
+      }
+
+      .telemetry-key {
+        color: var(--text-muted);
+      }
+
+      .telemetry-val {
+        color: var(--text-primary);
+        font-weight: 600;
+      }
+
+      .telemetry-val.accent {
+        color: var(--accent-fg);
+      }
+
+      /* =================================================================
+         MAIN VIEW CANVAS + SAME-DOCUMENT VIEW TRANSITIONS
+         ================================================================= */
+      .main-canvas {
+        position: relative;
+        overflow: hidden;
+        padding: var(--space-4);
+        min-width: 0;
+        min-height: 0;
+      }
+
+      .view-panel {
+        display: none;
+        height: 100%;
+        min-height: 0;
+        flex-direction: column;
+        gap: var(--space-4);
+      }
+
+      .view-panel.active {
+        display: flex;
+        view-transition-name: airlock-view;
+      }
+
+      ::view-transition-old(airlock-view),
+      ::view-transition-new(airlock-view) {
+        animation-duration: 180ms;
+        animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        ::view-transition-group(*),
+        ::view-transition-old(*),
+        ::view-transition-new(*) {
+          animation: none !important;
+        }
+      }
+
+      .view-header {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: var(--space-4);
+        flex-shrink: 0;
+      }
+
+      .view-title {
+        margin: 0;
+        font-size: 18px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        color: var(--text-primary);
+      }
+
+      .view-subtitle {
+        margin: 2px 0 0 0;
+        font-size: 12.5px;
+        color: var(--text-secondary);
+      }
+
+      /* =================================================================
+         CARDS, SPOTLIGHT BORDER SHEEN & COMMON CONTROLS
+         ================================================================= */
+      .card {
+        position: relative;
+        background: var(--bg-surface);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-lg);
+        padding: var(--space-4);
+        box-shadow: var(--shadow-card);
+        overflow: clip;
+      }
+
+      @media (prefers-reduced-motion: no-preference) {
+        .card::before {
+          content: "";
+          position: absolute;
+          inset: 0;
+          pointer-events: none;
+          border-radius: inherit;
+          opacity: 0;
+          background: radial-gradient(
+            360px circle at var(--spot-x, 50%) var(--spot-y, 0%),
+            var(--accent-spotlight),
+            transparent 65%
+          );
+          transition: opacity 220ms ease;
+        }
+        .card:hover::before {
+          opacity: 1;
+        }
+      }
+
+      .card-hdr {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: var(--space-3);
+        margin-bottom: var(--space-3);
+      }
+
+      .card-title {
+        margin: 0;
+        font-size: 14px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        color: var(--text-primary);
+      }
+
+      .card-desc {
+        margin: 3px 0 0 0;
+        font-size: 12px;
+        color: var(--text-secondary);
+      }
+
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        padding: 7px 13px;
+        border-radius: var(--radius-md);
+        border: 1px solid transparent;
+        font-family: var(--font-ui);
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        white-space: nowrap;
+        transition:
+          background-color var(--dur-fast) ease,
+          border-color var(--dur-fast) ease,
+          color var(--dur-fast) ease;
+      }
+
+      .btn:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+
+      .btn-xs {
+        padding: 4px 9px;
+        font-size: 11px;
+        border-radius: var(--radius-sm);
+      }
+
+      .btn-primary {
+        background: var(--accent);
+        color: var(--on-accent);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22);
+      }
+
+      .btn-primary:hover:not(:disabled) {
+        background: var(--accent-hover);
+      }
+
+      .btn-secondary {
+        background: var(--bg-elevated);
+        border-color: var(--border-default);
+        color: var(--text-primary);
+      }
+
+      .btn-secondary:hover:not(:disabled) {
+        border-color: var(--border-strong);
+        background: #20232d;
+      }
+
+      .btn-danger {
+        background: var(--status-danger-bg);
+        border-color: var(--status-danger-border);
+        color: var(--status-danger);
+      }
+
+      .btn-danger:hover:not(:disabled) {
+        background: color-mix(in oklab, #ef4444 24%, transparent);
+      }
+
+      .btn-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .mono-input,
+      .mono-select,
+      .mono-textarea {
+        width: 100%;
+        padding: 7px 10px;
+        background: var(--bg-code);
+        border: 1px solid var(--border-default);
+        border-radius: var(--radius-md);
+        color: var(--text-primary);
+        font-family: var(--font-mono);
+        font-size: 12px;
+        transition: border-color var(--dur-fast) ease;
+      }
+
+      .mono-input:hover,
+      .mono-select:hover,
+      .mono-textarea:hover {
+        border-color: var(--border-strong);
+      }
+
+      .form-group {
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+        margin-bottom: var(--space-3);
+      }
+
+      .form-group label {
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--text-secondary);
+      }
+
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 2px 8px;
+        border-radius: var(--radius-pill);
+        font-family: var(--font-mono);
+        font-size: 11px;
+        font-weight: 500;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .badge-ok {
+        background: var(--status-ok-bg);
+        border: 1px solid var(--status-ok-border);
+        color: var(--status-ok);
+      }
+
+      .badge-warn {
+        background: var(--status-warn-bg);
+        border: 1px solid var(--status-warn-border);
+        color: var(--status-warn);
+      }
+
+      .badge-info {
+        background: var(--status-info-bg);
+        border: 1px solid var(--status-info-border);
+        color: var(--status-info);
+      }
+
+      .badge-danger {
+        background: var(--status-danger-bg);
+        border: 1px solid var(--status-danger-border);
+        color: var(--status-danger);
+      }
+
+      .badge-muted {
+        background: var(--bg-elevated);
+        border: 1px solid var(--border-default);
+        color: var(--text-secondary);
+      }
+
+      /* =================================================================
+         VIEW 1: LOCAL AGENT (SPACIOUS CHAT + COLLAPSIBLE DRAWER)
+         ================================================================= */
+      .agent-shell {
+        display: grid;
+        grid-template-columns: 1fr 0px;
+        gap: 0;
+        flex: 1;
+        min-height: 0;
+        transition:
+          grid-template-columns var(--dur-med) var(--ease-out-expo),
+          gap var(--dur-med) var(--ease-out-expo);
+      }
+
+      .agent-shell.drawer-open {
+        grid-template-columns: 1fr 310px;
+        gap: var(--space-4);
+      }
+
+      .chat-surface {
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+        min-height: 0;
+        min-width: 0;
+        background: var(--bg-surface);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-lg);
+        box-shadow: var(--shadow-card);
+        overflow: hidden;
+      }
+
+      .chat-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 10px 14px;
+        background: var(--bg-rail);
+        border-bottom: 1px solid var(--border-subtle);
+        flex-wrap: wrap;
+      }
+
+      .session-cluster {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex: 1;
+        min-width: 220px;
+      }
+
+      .session-select {
+        max-width: 260px;
+        padding: 5px 8px;
+      }
+
+      .provider-pill-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        padding: 5px 10px;
+        border-radius: var(--radius-pill);
+        border: 1px solid var(--border-default);
+        background: var(--bg-elevated);
+        color: var(--text-primary);
+        font-family: var(--font-mono);
+        font-size: 11.5px;
+        cursor: pointer;
+        transition:
+          border-color var(--dur-fast) ease,
+          background-color var(--dur-fast) ease;
+      }
+
+      .provider-pill-btn:hover,
+      .provider-pill-btn[aria-expanded="true"] {
+        border-color: var(--accent-border);
+        background: var(--accent-tint);
+        color: var(--accent-fg);
+      }
+
+      .chat-transcript {
+        overflow-y: auto;
+        padding: var(--space-4);
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-3);
+      }
+
+      .msg-card {
+        padding: 12px 14px;
+        border-radius: var(--radius-lg);
+        border: 1px solid var(--border-subtle);
+        background: var(--bg-code);
+      }
+
+      .msg-card.msg-user {
+        background: var(--bg-elevated);
+        border-color: var(--border-default);
+        align-self: flex-end;
+        max-width: 82%;
+      }
+
+      .msg-hdr {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 6px;
+        font-family: var(--font-mono);
+        font-size: 11px;
+        color: var(--text-muted);
+      }
+
+      .msg-role {
+        font-weight: 600;
+        color: var(--accent-fg);
+      }
+
+      .msg-user .msg-role {
+        color: var(--text-primary);
+      }
+
+      .msg-body {
+        font-size: 13.5px;
+        line-height: 1.55;
+        color: var(--text-primary);
+        max-width: 78ch;
+      }
+
+      .msg-body p {
+        margin: 0 0 8px 0;
+      }
+      .msg-body p:last-child {
+        margin-bottom: 0;
+      }
+
+      .md-inline-code {
+        font-family: var(--font-mono);
+        font-size: 12px;
+        padding: 1px 5px;
+        border-radius: 4px;
+        background: var(--bg-elevated);
+        color: var(--accent-fg);
+      }
+
+      .md-code-block {
+        margin: 10px 0 4px 0;
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-md);
+        overflow: hidden;
+        background: var(--bg-canvas);
+      }
+
+      .md-code-hdr {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 5px 10px;
+        background: var(--bg-elevated);
+        border-bottom: 1px solid var(--border-subtle);
+        font-family: var(--font-mono);
+        font-size: 11px;
+        color: var(--text-secondary);
+      }
+
+      .md-code-block pre {
+        margin: 0;
+        padding: 10px 12px;
+        font-family: var(--font-mono);
+        font-size: 12px;
+        line-height: 1.5;
+        overflow-x: auto;
+        color: #d6dde9;
+      }
+
+      .thought-box {
+        margin-bottom: 10px;
+        padding: 7px 10px;
+        border-radius: var(--radius-md);
+        background: var(--bg-surface);
+        border: 1px solid var(--border-subtle);
+      }
+
+      .thought-box summary {
+        cursor: pointer;
+        font-family: var(--font-mono);
+        font-size: 11.5px;
+        color: var(--text-secondary);
+      }
+
+      .thought-pre {
+        margin: 8px 0 0 0;
+        font-family: var(--font-mono);
+        font-size: 11.5px;
+        color: var(--text-secondary);
+        white-space: pre-wrap;
+      }
+
+      .step-badges {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-bottom: 8px;
+      }
+
+      .step-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 2px 8px;
+        border-radius: var(--radius-sm);
+        background: var(--accent-tint);
+        border: 1px solid var(--accent-border);
+        color: var(--accent-fg);
+        font-family: var(--font-mono);
+        font-size: 11px;
+      }
+
+      .shimmer-bar {
+        display: inline-block;
+        height: 10px;
+        width: 140px;
+        border-radius: 999px;
+        background: linear-gradient(
+          90deg,
+          var(--bg-elevated) 25%,
+          var(--accent-tint) 50%,
+          var(--bg-elevated) 75%
+        );
+        background-size: 200% 100%;
+      }
+
+      @media (prefers-reduced-motion: no-preference) {
+        .shimmer-bar {
+          animation: shimmer-slide 1.4s linear infinite;
+        }
+      }
+
+      @keyframes shimmer-slide {
+        0% {
+          background-position: 200% 0;
+        }
+        100% {
+          background-position: -200% 0;
+        }
+      }
+
+      /* Composer */
+      .chat-composer {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 12px 14px;
+        background: var(--bg-rail);
+        border-top: 1px solid var(--border-subtle);
+      }
+
+      .prompt-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      .prompt-chip {
+        padding: 4px 10px;
+        border-radius: var(--radius-pill);
+        border: 1px solid var(--border-default);
+        background: var(--bg-surface);
+        color: var(--text-secondary);
+        font-family: var(--font-ui);
+        font-size: 11.5px;
+        cursor: pointer;
+        transition:
+          border-color var(--dur-fast) ease,
+          color var(--dur-fast) ease,
+          background-color var(--dur-fast) ease;
+      }
+
+      .prompt-chip:hover {
+        border-color: var(--accent-border);
+        color: var(--text-primary);
+        background: var(--bg-elevated);
+      }
+
+      .attach-row {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      .attach-input {
+        max-width: 210px;
+        padding: 4px 8px;
+      }
+
+      .attach-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 2px 8px;
+        border-radius: var(--radius-sm);
+        background: var(--bg-elevated);
+        border: 1px solid var(--border-default);
+        font-family: var(--font-mono);
+        font-size: 11px;
+        color: var(--text-primary);
+      }
+
+      .attach-chip button {
+        border: 0;
+        background: transparent;
+        color: var(--text-muted);
+        cursor: pointer;
+        padding: 0 2px;
+      }
+
+      .attach-chip button:hover {
+        color: var(--status-danger);
+      }
+
+      .composer-textarea {
+        width: 100%;
+        padding: 10px 12px;
+        background: var(--bg-code);
+        border: 1px solid var(--border-default);
+        border-radius: var(--radius-md);
+        color: var(--text-primary);
+        font-family: var(--font-ui);
+        font-size: 13px;
+        resize: vertical;
+        min-height: 62px;
+      }
+
+      .composer-footer {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      /* Collapsible Right Config Drawer */
+      .agent-drawer {
+        overflow-y: auto;
+        overflow-x: hidden;
+        opacity: 0;
+        visibility: hidden;
+        pointer-events: none;
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-3);
+        padding-bottom: var(--space-4);
+        transition:
+          opacity var(--dur-fast) ease,
+          visibility var(--dur-fast) ease;
+      }
+
+      .agent-drawer > .card {
+        flex-shrink: 0;
+      }
+
+      .agent-shell.drawer-open .agent-drawer {
+        opacity: 1;
+        visibility: visible;
+        pointer-events: auto;
+      }
+
+      .tool-mini-list {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+
+      .tool-mini-list li {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        font-size: 11.5px;
+      }
+
+      .tool-mini-list code {
+        font-family: var(--font-mono);
+        color: var(--accent-fg);
+      }
+
+      .tool-mini-list span {
+        color: var(--text-muted);
+      }
+
+      /* =================================================================
+         SCROLLABLE GRID VIEWS (MCP BRIDGE / HUB & TOOLS / LIVE MONITOR)
+         ================================================================= */
+      .scroll-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-auto-rows: max-content;
+        gap: var(--space-4);
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+        padding-right: 4px;
+        padding-bottom: var(--space-4);
+        align-content: start;
+      }
+
+      .span-2 {
+        grid-column: span 2;
+      }
+
+      .kv-stack {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        margin-bottom: var(--space-3);
+      }
+
+      .kv-label {
+        display: block;
+        font-family: var(--font-mono);
+        font-size: 10.5px;
+        font-weight: 600;
+        color: var(--text-muted);
+        letter-spacing: 0.04em;
+        margin-bottom: 4px;
+      }
+
+      .kv-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .kv-code {
+        flex: 1;
+        padding: 7px 10px;
+        background: var(--bg-code);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-md);
+        font-family: var(--font-mono);
+        font-size: 12px;
+        color: var(--text-primary);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      /* Tactile Native Toggle Switch */
+      .switch-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: var(--space-3);
+      }
+
+      .switch-card {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 14px;
+        padding: 12px 14px;
+        border-radius: var(--radius-md);
+        background: var(--bg-code);
+        border: 1px solid var(--border-subtle);
+        cursor: pointer;
+        transition: border-color var(--dur-fast) ease;
+      }
+
+      .switch-card:hover {
+        border-color: var(--border-default);
+      }
+
+      .switch-title {
+        display: block;
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--text-primary);
+      }
+
+      .switch-hint {
+        display: block;
+        margin-top: 2px;
+        font-size: 11.5px;
+        color: var(--text-secondary);
+      }
+
+      .tactile-switch {
+        appearance: none;
+        position: relative;
+        width: 38px;
+        height: 22px;
+        border-radius: 999px;
+        background: var(--bg-elevated);
+        border: 1px solid var(--border-default);
+        flex-shrink: 0;
+        cursor: pointer;
+        transition:
+          background-color var(--dur-fast) ease,
+          border-color var(--dur-fast) ease;
+      }
+
+      .tactile-switch::after {
+        content: "";
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background: var(--text-secondary);
+        transition:
+          transform var(--dur-med) var(--ease-out-expo),
+          background-color var(--dur-fast) ease;
+      }
+
+      .tactile-switch:checked {
+        background: var(--accent-tint);
+        border-color: var(--accent-border);
+      }
+
+      .tactile-switch:checked::after {
+        transform: translateX(16px);
+        background: var(--accent-fg);
+      }
+
+      /* Data Tables */
+      .table-wrap {
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-md);
+        background: var(--bg-code);
+        overflow: auto;
+        max-height: 250px;
+      }
+
+      .data-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-family: var(--font-mono);
+        font-size: 11.5px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .data-table th,
+      .data-table td {
+        padding: 8px 12px;
+        text-align: left;
+        border-bottom: 1px solid var(--border-subtle);
+        white-space: nowrap;
+      }
+
+      .data-table th {
+        position: sticky;
+        top: 0;
+        background: var(--bg-elevated);
+        color: var(--text-secondary);
+        font-weight: 600;
+        z-index: 2;
+      }
+
+      .data-table tr.row-clickable {
+        cursor: pointer;
+        transition: background-color var(--dur-fast) ease;
+      }
+
+      .data-table tr.row-clickable:hover,
+      .data-table tr.row-clickable:focus-visible {
+        background: var(--bg-surface);
+      }
+
+      .sim-grid {
+        display: grid;
+        grid-template-columns: 330px 1fr;
+        gap: var(--space-3);
+      }
+
+      .mono-pre {
+        margin: 0;
+        padding: 10px 12px;
+        background: var(--bg-code);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-md);
+        font-family: var(--font-mono);
+        font-size: 11.5px;
+        line-height: 1.5;
+        max-height: 220px;
+        overflow: auto;
+        white-space: pre-wrap;
+        word-break: break-word;
+        color: var(--text-primary);
+      }
+
+      /* =================================================================
+         VIEW 5: DIFF & AUDIT MASTER-DETAIL
+         ================================================================= */
+      .audit-split {
+        display: grid;
+        grid-template-columns: 340px 1fr;
+        gap: var(--space-4);
+        flex: 1;
+        min-height: 0;
+      }
+
+      .audit-pane,
+      .diff-pane {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        background: var(--bg-surface);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-lg);
+        padding: var(--space-4);
+        box-shadow: var(--shadow-card);
+      }
+
+      .audit-list {
+        flex: 1;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        margin-top: 10px;
+      }
+
+      .audit-item {
+        width: 100%;
+        text-align: left;
+        padding: 10px 12px;
+        border-radius: var(--radius-md);
+        border: 1px solid var(--border-subtle);
+        background: var(--bg-code);
+        color: var(--text-primary);
+        cursor: pointer;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        transition:
+          border-color var(--dur-fast) ease,
+          background-color var(--dur-fast) ease;
+      }
+
+      .audit-item:hover {
+        border-color: var(--border-default);
+      }
+
+      .audit-item.selected {
+        background: var(--bg-elevated);
+        border-color: var(--accent-border);
+      }
+
+      .audit-item-top {
+        display: flex;
+        justify-content: space-between;
+        font-family: var(--font-mono);
+        font-size: 11px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .diff-viewer {
+        flex: 1;
+        overflow: auto;
+        background: var(--bg-code);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-md);
+        padding: 10px 0;
+        font-family: var(--font-mono);
+        font-size: 12px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .diff-line {
+        display: grid;
+        grid-template-columns: 44px 1fr;
+        padding: 1px 12px;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      .diff-ln {
+        color: var(--text-muted);
+        user-select: none;
+      }
+
+      .diff-add {
+        background: var(--diff-add-bg);
+        color: var(--diff-add-fg);
+      }
+
+      .diff-del {
+        background: var(--diff-del-bg);
+        color: var(--diff-del-fg);
+      }
+
+      .diff-hunk {
+        color: var(--diff-hunk-fg);
+        background: color-mix(in oklab, #f59e0b 8%, transparent);
+        padding-top: 4px;
+        padding-bottom: 4px;
+      }
+
+      /* =================================================================
+         BOTTOM STATUSBAR + PREVIEW CONTROLS + FLOATING TOAST STACK
+         ================================================================= */
+      .statusbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 0 var(--space-4);
+        background: var(--bg-rail);
+        border-top: 1px solid var(--border-subtle);
+        font-family: var(--font-mono);
+        font-size: 11px;
+        color: var(--text-secondary);
+        font-variant-numeric: tabular-nums;
+      }
+
+      .preview-controls {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .preview-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 2px 6px;
+        border-radius: var(--radius-sm);
+        background: var(--bg-surface);
+        border: 1px solid var(--border-default);
+        color: var(--text-primary);
+        font-family: var(--font-mono);
+        font-size: 10.5px;
+        cursor: pointer;
+        transition: border-color var(--dur-fast) ease;
+      }
+
+      .preview-pill:hover {
+        border-color: var(--accent-border);
+      }
+
+      .toast-stack {
+        position: fixed;
+        right: 18px;
+        bottom: 42px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        z-index: 80;
+        pointer-events: none;
+      }
+
+      .toast-item {
+        pointer-events: auto;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        min-width: 240px;
+        max-width: 360px;
+        padding: 9px 12px;
+        border-radius: var(--radius-md);
+        background: var(--bg-elevated);
+        border: 1px solid var(--border-default);
+        box-shadow: var(--shadow-elevated);
+        color: var(--text-primary);
+        font-size: 12px;
+      }
+
+      @media (prefers-reduced-motion: no-preference) {
+        .toast-item {
+          animation: toast-in 200ms var(--ease-out-expo);
+        }
+      }
+
+      @keyframes toast-in {
+        from {
+          opacity: 0;
+          transform: translateY(8px) scale(0.97);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0) scale(1);
+        }
+      }
+
+      /* =================================================================
+         ANIMATED TOP-LAYER <dialog> MODALS (modern-web-guidance compliant)
+         ================================================================= */
+      dialog {
+        width: min(520px, calc(100vw - 32px));
+        padding: 0;
+        border: 1px solid var(--border-default);
+        border-radius: var(--radius-xl);
+        background: var(--bg-surface);
+        color: var(--text-primary);
+        box-shadow: var(--shadow-elevated);
+        opacity: 0;
+        transition-property: opacity, transform, display, overlay;
+        transition-duration: 0.24s;
+        transition-timing-function: var(--ease-out-expo);
+        transition-behavior: allow-discrete;
+
+        @media (prefers-reduced-motion: no-preference) {
+          transform: scale(0.95) translateY(6px);
+        }
+      }
+
+      dialog.dialog-wide {
+        width: min(720px, calc(100vw - 32px));
+      }
+
+      dialog:is([open]):where(:not([data-closing])) {
+        opacity: 1;
+
+        @starting-style {
+          opacity: 0;
+        }
+
+        @media (prefers-reduced-motion: no-preference) {
+          transform: scale(1) translateY(0);
+
+          @starting-style {
+            transform: scale(0.95) translateY(6px);
+          }
+        }
+      }
+
+      dialog::backdrop {
+        background-color: rgba(4, 5, 8, 0);
+        backdrop-filter: blur(0px);
+        transition-property: background-color, backdrop-filter, display, overlay;
+        transition-duration: 0.24s;
+        transition-timing-function: ease-out;
+        transition-behavior: allow-discrete;
+      }
+
+      dialog:is([open]):where(:not([data-closing]))::backdrop {
+        background-color: rgba(4, 5, 8, 0.74);
+        backdrop-filter: blur(6px);
+
+        @starting-style {
+          background-color: rgba(4, 5, 8, 0);
+          backdrop-filter: blur(0px);
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        dialog,
+        dialog::backdrop {
+          transition-duration: 0.1s;
+        }
+      }
+
+      .modal-hdr {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 16px 18px 12px 18px;
+        border-bottom: 1px solid var(--border-subtle);
+      }
+
+      .modal-body {
+        padding: 16px 18px;
+        max-height: 70vh;
+        overflow-y: auto;
+      }
+
+      .modal-ftr {
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+        padding: 12px 18px 16px 18px;
+        border-top: 1px solid var(--border-subtle);
+      }
+
+      .palette-results {
+        padding: 8px;
+        max-height: 320px;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+
+      .palette-item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        width: 100%;
+        padding: 9px 12px;
+        border-radius: var(--radius-md);
+        border: 1px solid transparent;
+        background: var(--bg-code);
+        color: var(--text-primary);
+        cursor: pointer;
+        text-align: left;
+      }
+
+      .palette-item:hover,
+      .palette-item.selected {
+        background: var(--bg-elevated);
+        border-color: var(--accent-border);
+      }
+
+      /* Responsive auto-compact below 1060px (minWidth 960px safe) */
+      @media (max-width: 1060px) {
+        .workspace-body {
+          grid-template-columns: 64px 1fr;
+        }
+        .rail-btn {
+          justify-content: center;
+          padding: 0;
+        }
+        .rail-label,
+        .rail-pill,
+        .telemetry-full {
+          display: none;
+        }
+        .rail-footer {
+          padding: 8px 4px;
+          align-items: center;
+        }
+        .telemetry-status-btn {
+          justify-content: center;
+          width: 34px;
+          height: 30px;
+          padding: 0;
+        }
+        .scroll-grid {
+          grid-template-columns: 1fr;
+        }
+        .span-2 {
+          grid-column: span 1;
+        }
+        .switch-grid,
+        .sim-grid,
+        .audit-split {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app-shell" class="app-shell">
+      <!-- TOP COMMAND BAR (48px) -->
+      <header class="cmdbar">
+        <div class="cmdbar-left">
+          <button
+            id="btn-toggle-rail"
+            type="button"
+            class="rail-toggle-btn"
+            aria-label="Toggle Left Sidebar Rail"
+            aria-expanded="true"
+            title="Toggle Sidebar ([)"
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+              <rect x="3" y="3" width="18" height="18" rx="3"></rect>
+              <line x1="9" y1="3" x2="9" y2="21"></line>
+            </svg>
+          </button>
+
+          <div class="brand-lockup">
+            <div class="brand-mark" aria-hidden="true">
+              <!-- Airlock Dual-Gate Emblem -->
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M5 4h5v16H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"></path>
+                <path d="M19 4h-5v16h5a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2z"></path>
+                <circle cx="12" cy="12" r="2.2" fill="currentColor" stroke="none"></circle>
+              </svg>
+            </div>
+            <span class="brand-name">Airlock</span>
+          </div>
+
+          <div class="workspace-capsule">
+            <span class="ws-root-label">ROOT</span>
+            <label for="workspace-input" class="sr-only">Jailed Workspace Root</label>
+            <input
+              id="workspace-input"
+              type="text"
+              class="ws-input"
+              value="D:\tauri-mcp-hub"
+              readonly
+              aria-label="Active workspace path"
+            />
+            <span id="workspace-git-branch" class="git-pill">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <line x1="6" y1="3" x2="6" y2="15"></line>
+                <circle cx="18" cy="6" r="3"></circle>
+                <circle cx="6" cy="18" r="3"></circle>
+                <path d="M18 9a9 9 0 0 1-9 9"></path>
+              </svg>
+              main
+            </span>
+            <button
+              id="btn-pin-workspace"
+              type="button"
+              class="icon-btn"
+              aria-pressed="true"
+              aria-label="Pin workspace"
+              title="Pin / Unpin Workspace"
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+                <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+              </svg>
+            </button>
+            <button
+              id="btn-recent-workspaces"
+              type="button"
+              class="icon-btn"
+              aria-expanded="false"
+              aria-controls="workspace-dropdown"
+              aria-label="Recent and pinned workspaces"
+              title="Recent & Pinned Workspaces"
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <polyline points="6 9 12 15 18 9"></polyline>
+              </svg>
+            </button>
+            <button
+              id="btn-pick-workspace"
+              type="button"
+              class="icon-btn"
+              aria-label="Browse folder"
+              title="Browse Workspace Folder"
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
+                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+              </svg>
+            </button>
+
+            <div id="workspace-dropdown" class="workspace-dropdown" hidden>
+              <div class="ws-drop-hdr">PINNED WORKSPACES</div>
+              <button type="button" class="ws-drop-item" data-ws="D:\tauri-mcp-hub" data-branch="main">
+                <span>D:\tauri-mcp-hub</span><span class="ws-drop-branch">git:main</span>
+              </button>
+              <button type="button" class="ws-drop-item" data-ws="D:\projects\pulse-api" data-branch="feat/oauth2">
+                <span>D:\projects\pulse-api</span><span class="ws-drop-branch">git:feat/oauth2</span>
+              </button>
+              <div class="ws-drop-hdr">RECENT</div>
+              <button type="button" class="ws-drop-item" data-ws="D:\sandbox\rust-cli" data-branch="dev">
+                <span>D:\sandbox\rust-cli</span><span class="ws-drop-branch">git:dev</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="cmdbar-right">
+          <div id="guardrail-track" class="guardrail-track" data-mode="autonomous" role="group" aria-label="Guardrail Mode">
+            <div id="guardrail-glider" class="guardrail-glider" aria-hidden="true"></div>
+            <button type="button" class="guardrail-btn" data-guardrail="read_only" aria-pressed="false">Read-Only</button>
+            <button type="button" class="guardrail-btn" data-guardrail="safe_edit" aria-pressed="false">Safe Edit</button>
+            <button type="button" class="guardrail-btn active" data-guardrail="autonomous" aria-pressed="true">Auto</button>
+          </div>
+
+          <button id="btn-open-palette" type="button" class="palette-trigger" aria-label="Buka Command Palette">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <circle cx="11" cy="11" r="8"></circle>
+              <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+            </svg>
+            <span>Commands</span>
+            <kbd>Ctrl+K</kbd>
+          </button>
+        </div>
+      </header>
+
+      <!-- WORKSPACE BODY -->
+      <div class="workspace-body">
+        <!-- LEFT SIDEBAR RAIL -->
+        <aside class="side-rail" aria-label="Navigasi Utama">
+          <nav class="rail-nav" role="tablist" aria-orientation="vertical" aria-label="Workspace Views">
+            <div id="rail-indicator" class="rail-indicator" aria-hidden="true"></div>
+
+            <button
+              id="tab-btn-agent"
+              type="button"
+              role="tab"
+              aria-selected="true"
+              aria-controls="panel-agent"
+              class="rail-btn active"
+              data-tab="agent"
+              title="Local Agent (Ctrl+1)"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+              </svg>
+              <span class="rail-label">Local Agent</span>
+              <span class="rail-pill">SSE</span>
+            </button>
+
+            <button
+              id="tab-btn-bridge"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              aria-controls="panel-bridge"
+              class="rail-btn"
+              data-tab="bridge"
+              title="MCP Bridge (Ctrl+2)"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+                <rect x="2" y="3" width="20" height="7" rx="2"></rect>
+                <rect x="2" y="14" width="20" height="7" rx="2"></rect>
+                <line x1="6" y1="6.5" x2="6.01" y2="6.5"></line>
+                <line x1="6" y1="17.5" x2="6.01" y2="17.5"></line>
+              </svg>
+              <span class="rail-label">MCP Bridge</span>
+              <span id="rail-port-pill" class="rail-pill">:9494</span>
+            </button>
+
+            <button
+              id="tab-btn-hub"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              aria-controls="panel-hub"
+              class="rail-btn"
+              data-tab="hub"
+              title="Hub & Tools (Ctrl+3)"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+                <circle cx="12" cy="5" r="3"></circle>
+                <circle cx="5" cy="19" r="3"></circle>
+                <circle cx="19" cy="19" r="3"></circle>
+                <line x1="10.5" y1="7.5" x2="6.5" y2="16.5"></line>
+                <line x1="13.5" y1="7.5" x2="17.5" y2="16.5"></line>
+              </svg>
+              <span class="rail-label">Hub &amp; Tools</span>
+              <span class="rail-pill">14+14</span>
+            </button>
+
+            <button
+              id="tab-btn-monitor"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              aria-controls="panel-monitor"
+              class="rail-btn"
+              data-tab="monitor"
+              title="Live Monitor (Ctrl+4)"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+              </svg>
+              <span class="rail-label">Live Monitor</span>
+              <span class="rail-pill">4</span>
+            </button>
+
+            <button
+              id="tab-btn-audit"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              aria-controls="panel-audit"
+              class="rail-btn"
+              data-tab="audit"
+              title="Diff & Audit (Ctrl+5)"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                <polyline points="14 2 14 8 20 8"></polyline>
+                <line x1="9" y1="15" x2="15" y2="15"></line>
+              </svg>
+              <span class="rail-label">Diff &amp; Audit</span>
+              <span id="audit-count-badge" class="rail-pill">4</span>
+            </button>
+          </nav>
+
+          <!-- Rail Telemetry Footer -->
+          <div class="rail-footer">
+            <button
+              id="rail-server-toggle"
+              type="button"
+              class="telemetry-status-btn"
+              title="Klik untuk toggle status MCP Server"
+            >
+              <span class="dot-wrap">
+                <span id="rail-server-dot" class="live-dot online" aria-hidden="true"></span>
+                <span class="telemetry-full">Server Online</span>
+              </span>
+              <span id="status-server-badge" class="telemetry-full">:9494</span>
+            </button>
+
+            <div class="telemetry-full">
+              <div class="telemetry-row">
+                <span class="telemetry-key">Tunnel</span>
+                <span id="status-tunnel-badge" class="telemetry-val accent">Cloudflare</span>
+              </div>
+              <div class="telemetry-row">
+                <span class="telemetry-key">Tokens Saved</span>
+                <span id="metric-tokens-saved" class="telemetry-val accent">48,920</span>
+              </div>
+              <div class="telemetry-row">
+                <span class="telemetry-key">Turns Saved</span>
+                <span id="metric-turns-saved" class="telemetry-val">37</span>
+              </div>
+            </div>
+          </div>
+        </aside>
+
+        <!-- MAIN VIEWPORT CANVAS -->
+        <main class="main-canvas">
+          <!-- VIEW 1: LOCAL AGENT -->
+          <section id="panel-agent" role="tabpanel" aria-labelledby="tab-btn-agent" class="view-panel active">
+            <div class="view-header">
+              <div>
+                <h1 id="heading-agent" class="view-title" tabindex="-1">Local Agent</h1>
+                <p class="view-subtitle">Streaming SSE langsung di localhost dengan 14 Smart Tools &amp; Token Guard aktif.</p>
+              </div>
+              <button
+                id="btn-toggle-drawer"
+                type="button"
+                class="provider-pill-btn"
+                aria-expanded="false"
+                aria-controls="agent-drawer"
+              >
+                <span class="live-dot online" aria-hidden="true"></span>
+                <span id="provider-pill-label">Gemini · gemini-2.5-flash</span>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                  <circle cx="12" cy="12" r="3"></circle>
+                  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.85 1 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                </svg>
+              </button>
+            </div>
+
+            <div id="agent-shell" class="agent-shell">
+              <div class="chat-surface">
+                <div class="chat-toolbar">
+                  <div class="session-cluster">
+                    <label for="chat-session-select" class="kv-label" style="margin: 0">SESSION</label>
+                    <select id="chat-session-select" class="mono-select session-select">
+                      <option value="s1">Refactor OAuth PKCE Guard (Hari ini)</option>
+                      <option value="s2">Audit Snapshot Conflict Check</option>
+                    </select>
+                  </div>
+                  <div class="btn-row">
+                    <button id="btn-new-session" type="button" class="btn btn-secondary btn-xs">New Chat</button>
+                    <button id="btn-clear-chat" type="button" class="btn btn-secondary btn-xs">Clear</button>
+                  </div>
+                </div>
+
+                <div id="chat-messages" class="chat-transcript" aria-live="polite">
+                  <article class="msg-card msg-user">
+                    <div class="msg-hdr">
+                      <span class="msg-role">You</span>
+                      <span>12:38:14</span>
+                    </div>
+                    <div class="msg-body">
+                      <p>Periksa validasi PKCE <code class="md-inline-code">code_verifier</code> di <code class="md-inline-code">src-tauri/src/oauth.rs</code>. Pastikan rejection mengembalikan error OAuth standar tanpa membocorkan detail state internal.</p>
+                      <div style="margin-top: 8px">
+                        <span class="attach-chip">@src-tauri/src/oauth.rs</span>
+                      </div>
+                    </div>
+                  </article>
+
+                  <article class="msg-card">
+                    <div class="msg-hdr">
+                      <span class="msg-role">Airlock Agent · gemini-2.5-flash</span>
+                      <span>12:38:21 · 1,140 tok (680 saved)</span>
+                    </div>
+                    <details class="thought-box">
+                      <summary>Thinking Trace (1.4s · 3 tool steps)</summary>
+                      <pre class="thought-pre">1. Inspect oauth.rs symbols via code_outline.
+2. Read handle_oauth_token lines 240-310 via read_file_range.
+3. Verify constant-time challenge check and invalid_grant error response.</pre>
+                    </details>
+                    <div class="step-badges">
+                      <span class="step-badge">code_outline · oauth.rs</span>
+                      <span class="step-badge">read_file_range · L240-310</span>
+                      <span class="step-badge">surgical_edit · +4/-2</span>
+                    </div>
+                    <div class="msg-body">
+                      <p>Validasi PKCE di <code class="md-inline-code">oauth.rs</code> sudah menggunakan SHA-256 URL-safe base64, namun fallback saat <code class="md-inline-code">code_verifier</code> kosong masih mengembalikan pesan internal. Sudah diperketat agar mengembalikan <code class="md-inline-code">invalid_grant</code> standar:</p>
+                      <div class="md-code-block">
+                        <div class="md-code-hdr">
+                          <span>rust</span>
+                          <button type="button" class="btn btn-secondary btn-xs copy-code-btn">Copy</button>
+                        </div>
+                        <pre><code>if verifier.is_empty() || !verify_pkce(&amp;code.challenge, verifier) {
+    return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "PKCE verification failed");
+}</code></pre>
+                      </div>
+                    </div>
+                  </article>
+                </div>
+
+                <form id="chat-form" class="chat-composer">
+                  <div class="prompt-chips">
+                    <button type="button" class="prompt-chip" data-prompt="Lakukan project_overview pada workspace ini dan jelaskan entry point utamanya secara ringkas.">Overview Proyek</button>
+                    <button type="button" class="prompt-chip" data-prompt="Jalankan git_ops status dan diff lalu review potensi bug pada perubahan terbaru.">Review Git Diff</button>
+                    <button type="button" class="prompt-chip" data-prompt="Audit modul auth &amp; security untuk mencari edge case validasi input.">Audit Security</button>
+                    <button type="button" class="prompt-chip" data-prompt="Identifikasi modul kritis yang belum memiliki unit test dan buatkan rencananya.">Tulis Unit Test</button>
+                  </div>
+
+                  <div id="attachment-chips" class="attach-row" hidden></div>
+
+                  <div class="attach-row">
+                    <label for="attach-file-path" class="sr-only">Lampirkan path file</label>
+                    <input id="attach-file-path" type="text" class="mono-input attach-input" placeholder="@file: src/main.ts" spellcheck="false" />
+                    <button id="btn-attach-file" type="button" class="btn btn-secondary btn-xs">+ @File</button>
+                    <button id="btn-attach-image" type="button" class="btn btn-secondary btn-xs">+ Image</button>
+                    <span style="font-size: 11px; color: var(--text-muted); margin-left: auto">Ctrl+Enter untuk kirim</span>
+                  </div>
+
+                  <label for="chat-input" class="sr-only">Perintah ke Local Agent</label>
+                  <textarea
+                    id="chat-input"
+                    class="composer-textarea"
+                    rows="2"
+                    placeholder="Ketik tugas coding di jailed workspace... (coba klik salah satu chip atau kirim pesan untuk simulasi live stream)"
+                  ></textarea>
+
+                  <div class="composer-footer">
+                    <span id="agent-run-status" style="font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary)">Ready · Auto-inject AGENTS.md active</span>
+                    <div class="btn-row">
+                      <button id="btn-stop-agent" type="button" class="btn btn-danger btn-xs" hidden>Stop</button>
+                      <button id="btn-send-chat" type="submit" class="btn btn-primary">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true">
+                          <line x1="22" y1="2" x2="11" y2="13"></line>
+                          <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                        </svg>
+                        Run Local Agent
+                      </button>
+                    </div>
+                  </div>
+                </form>
+              </div>
+
+              <!-- Collapsible Right Drawer: Provider Config & Smart Tools -->
+              <aside id="agent-drawer" class="agent-drawer" inert aria-label="Konfigurasi Agent dan Smart Tools">
+                <div class="card">
+                  <div class="card-hdr">
+                    <div>
+                      <h2 class="card-title">Provider Config</h2>
+                      <p class="card-desc">Tersimpan aman via Windows DPAPI.</p>
+                    </div>
+                  </div>
+
+                  <div class="form-group">
+                    <label for="agent-provider">Provider LLM</label>
+                    <select id="agent-provider" class="mono-select">
+                      <option value="gemini" selected>Google Gemini (AI Studio)</option>
+                      <option value="openai_compat">OpenAI-Compatible (Ollama / OpenRouter)</option>
+                      <option value="anthropic">Anthropic Claude</option>
+                    </select>
+                  </div>
+
+                  <div id="openai-compat-fields" hidden>
+                    <div class="form-group">
+                      <label for="agent-base-url">Base URL</label>
+                      <input id="agent-base-url" type="text" class="mono-input" value="http://127.0.0.1:11434/v1" />
+                    </div>
+                    <div class="prompt-chips" style="margin-bottom: 10px">
+                      <button type="button" class="prompt-chip preset-url-btn" data-url="http://127.0.0.1:11434/v1">Ollama</button>
+                      <button type="button" class="prompt-chip preset-url-btn" data-url="http://127.0.0.1:1234/v1">LM Studio</button>
+                      <button type="button" class="prompt-chip preset-url-btn" data-url="https://openrouter.ai/api/v1">OpenRouter</button>
+                    </div>
+                  </div>
+
+                  <div class="form-group">
+                    <label for="agent-api-key">API Key (DPAPI)</label>
+                    <input id="agent-api-key" type="password" class="mono-input" value="AIzaSy••••••••••••demo" />
+                  </div>
+
+                  <div class="form-group">
+                    <label for="agent-model">Target Model</label>
+                    <select id="agent-model" class="mono-select">
+                      <option value="gemini-2.5-flash" selected>gemini-2.5-flash</option>
+                      <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+                      <option value="gemini-3-flash-preview">gemini-3-flash-preview</option>
+                    </select>
+                  </div>
+
+                  <div class="form-group" style="margin-bottom: 10px">
+                    <label style="display: flex; align-items: center; gap: 8px; cursor: pointer">
+                      <input id="toggle-auto-rules" type="checkbox" class="tactile-switch" checked />
+                      <span>Auto-inject AGENTS.md</span>
+                    </label>
+                  </div>
+
+                  <button id="btn-save-agent" type="button" class="btn btn-primary" style="width: 100%">Save Config</button>
+                </div>
+
+                <div class="card">
+                  <div class="card-hdr">
+                    <h2 class="card-title">Smart Tools (14 Active)</h2>
+                  </div>
+                  <ul class="tool-mini-list">
+                    <li><code>project_overview</code><span>Tree + Git</span></li>
+                    <li><code>smart_search</code><span>Ripgrep + ctx</span></li>
+                    <li><code>read_file_range</code><span>Batch slice</span></li>
+                    <li><code>surgical_edit</code><span>Block diff</span></li>
+                    <li><code>patch_and_verify</code><span>Edit + test</span></li>
+                    <li><code>run_command_compressed</code><span>Token Guard</span></li>
+                    <li><code>write_file_jailed</code><span>Snapshot</span></li>
+                    <li><code>code_outline</code><span>Symbol map</span></li>
+                    <li><code>git_ops</code><span>Structured git</span></li>
+                    <li><code>start_command_job</code><span>Async job</span></li>
+                  </ul>
+                </div>
+              </aside>
+            </div>
+          </section>
+
+          <!-- VIEW 2: MCP BRIDGE -->
+          <section id="panel-bridge" role="tabpanel" aria-labelledby="tab-btn-bridge" class="view-panel">
+            <div class="view-header">
+              <div>
+                <h1 id="heading-bridge" class="view-title" tabindex="-1">MCP Bridge &amp; Security</h1>
+                <p class="view-subtitle">Embedded HTTP JSON-RPC 2.0 server, remote tunnel exposure, dan kontrol OAuth 2.1.</p>
+              </div>
+              <div class="btn-row">
+                <button id="btn-self-diag" type="button" class="btn btn-secondary">Self-Test</button>
+                <button id="btn-toggle-server" type="button" class="btn btn-danger">Stop Server</button>
+              </div>
+            </div>
+
+            <div class="scroll-grid">
+              <!-- Card 1: Embedded Server -->
+              <article class="card">
+                <div class="card-hdr">
+                  <div>
+                    <h2 class="card-title">Embedded MCP Server (Route A)</h2>
+                    <p class="card-desc">Streamable HTTP + Bearer Auth di localhost.</p>
+                  </div>
+                  <span id="bridge-server-pill" class="badge badge-ok">ONLINE</span>
+                </div>
+
+                <div class="kv-stack">
+                  <div>
+                    <span class="kv-label">LOCAL ENDPOINT &amp; PORT</span>
+                    <div class="kv-row">
+                      <code id="local-mcp-url" class="kv-code">http://127.0.0.1:9494/mcp</code>
+                      <label for="server-port-input" class="sr-only">Port Server</label>
+                      <input id="server-port-input" type="number" class="mono-input" style="width: 82px" value="9494" />
+                      <button id="btn-apply-port" type="button" class="btn btn-secondary btn-xs">Apply</button>
+                    </div>
+                  </div>
+
+                  <div>
+                    <span class="kv-label">BEARER TOKEN</span>
+                    <div class="kv-row">
+                      <code id="mcp-auth-token" class="kv-code">••••••••••••a9f4</code>
+                      <button id="btn-toggle-secrets" type="button" class="btn btn-secondary btn-xs" aria-pressed="false">Show</button>
+                      <button id="btn-rotate-token" type="button" class="btn btn-secondary btn-xs">Rotate</button>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label for="mcp-preset-select" class="kv-label">1-CLICK CLIENT CONFIG PRESET</label>
+                    <div class="kv-row">
+                      <select id="mcp-preset-select" class="mono-select">
+                        <option value="gemini-web">Gemini Web (Remote OAuth / URL)</option>
+                        <option value="cursor">Cursor (.cursor/mcp.json)</option>
+                        <option value="claude-desktop">Claude Desktop (mcpServers HTTP)</option>
+                        <option value="vscode">VS Code Copilot (.vscode/mcp.json)</option>
+                        <option value="antigravity">Antigravity (mcp_config.json)</option>
+                      </select>
+                      <button id="btn-copy-preset" type="button" class="btn btn-secondary btn-xs">Copy</button>
+                      <button id="btn-preview-preset" type="button" class="btn btn-secondary btn-xs">Preview</button>
+                    </div>
+                  </div>
+                </div>
+
+                <button id="btn-copy-mcp-url" type="button" class="btn btn-primary" style="width: 100%">1-Click Copy URL + Token</button>
+              </article>
+
+              <!-- Card 2: Remote Tunnel -->
+              <article class="card">
+                <div class="card-hdr">
+                  <div>
+                    <h2 class="card-title">Remote Tunnel &amp; Auto-Kill Idle</h2>
+                    <p class="card-desc">Ekspos endpoint HTTPS aman ke klien remote.</p>
+                  </div>
+                  <button id="btn-toggle-tunnel" type="button" class="btn btn-secondary btn-xs">Stop Tunnel</button>
+                </div>
+
+                <div class="kv-stack">
+                  <div>
+                    <label for="tunnel-provider-select" class="kv-label">TUNNEL PROVIDER</label>
+                    <select id="tunnel-provider-select" class="mono-select">
+                      <option value="cloudflare" selected>Cloudflare Quick Tunnel (HTTP/2)</option>
+                      <option value="cloudflare_named">Cloudflare Named Tunnel (Zero Trust)</option>
+                      <option value="tailscale">Tailscale Funnel (Permanen)</option>
+                    </select>
+                  </div>
+
+                  <div id="cf-named-fields" hidden style="padding: 10px; border-radius: var(--radius-md); background: var(--bg-code); border: 1px solid var(--border-subtle)">
+                    <div class="form-group">
+                      <label for="cf-named-token">Cloudflare Tunnel Token</label>
+                      <input id="cf-named-token" type="password" class="mono-input" placeholder="eyJhIjoi..." />
+                    </div>
+                    <div class="form-group" style="margin-bottom: 0">
+                      <label for="cf-named-url">Public Hostname URL</label>
+                      <input id="cf-named-url" type="text" class="mono-input" placeholder="https://mcp.domain.dev" />
+                    </div>
+                  </div>
+
+                  <div>
+                    <span class="kv-label">PUBLIC TUNNEL URL</span>
+                    <div class="kv-row">
+                      <code id="public-tunnel-url" class="kv-code">https://airlock-gate.trycloudflare.com/mcp/••••a9f4</code>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label for="idle-timeout-select" class="kv-label">AUTO-KILL IDLE WATCHER</label>
+                    <select id="idle-timeout-select" class="mono-select">
+                      <option value="0" selected>Nonaktif (Always On)</option>
+                      <option value="15">15 Menit Idle</option>
+                      <option value="30">30 Menit Idle</option>
+                      <option value="60">60 Menit Idle</option>
+                    </select>
+                  </div>
+                </div>
+
+                <details>
+                  <summary style="cursor: pointer; font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary)">Live Tunnel Logs</summary>
+                  <pre class="mono-pre" style="margin-top: 8px; max-height: 110px">2026-11-23T12:35:04Z INF Registered tunnel connection connIndex=0
+2026-11-23T12:35:06Z INF Your quick Tunnel: https://airlock-gate.trycloudflare.com</pre>
+                </details>
+              </article>
+
+              <!-- Card 3: Security & Desktop Guardrails -->
+              <article class="card span-2">
+                <div class="card-hdr">
+                  <div>
+                    <h2 class="card-title">Security &amp; Desktop Guardrails</h2>
+                    <p class="card-desc">Proteksi kredensial sensitif dan perilaku jendela sistem tray.</p>
+                  </div>
+                </div>
+                <div class="switch-grid">
+                  <label class="switch-card" for="toggle-sensitive-guard">
+                    <div>
+                      <span class="switch-title">Sensitive File Guard (.env, *.key, auth.json)</span>
+                      <span class="switch-hint">Memblokir pembacaan/penulisan file rahasia oleh agent lokal maupun remote MCP.</span>
+                    </div>
+                    <input id="toggle-sensitive-guard" type="checkbox" class="tactile-switch" checked />
+                  </label>
+                  <label class="switch-card" for="toggle-close-to-tray">
+                    <div>
+                      <span class="switch-title">Minimize to System Tray saat tutup jendela</span>
+                      <span class="switch-hint">Menjaga HTTP bridge dan tunnel tetap hidup di background saat tombol X ditekan.</span>
+                    </div>
+                    <input id="toggle-close-to-tray" type="checkbox" class="tactile-switch" checked />
+                  </label>
+                </div>
+              </article>
+
+              <!-- Card 4: OAuth Clients -->
+              <article class="card span-2">
+                <div class="card-hdr">
+                  <div>
+                    <h2 class="card-title">Authorized OAuth 2.1 Clients</h2>
+                    <p class="card-desc">Koneksi PKCE eksternal membutuhkan persetujuan interaktif di aplikasi.</p>
+                  </div>
+                  <div class="btn-row">
+                    <button id="btn-preview-oauth" type="button" class="btn btn-secondary btn-xs">Test OAuth Popup</button>
+                    <button id="btn-revoke-all-oauth" type="button" class="btn btn-danger btn-xs">Revoke All</button>
+                  </div>
+                </div>
+                <div class="table-wrap">
+                  <table class="data-table">
+                    <thead>
+                      <tr>
+                        <th scope="col">Client</th>
+                        <th scope="col">Trust</th>
+                        <th scope="col">Active Tokens</th>
+                        <th scope="col">Redirect URI</th>
+                        <th scope="col">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody id="oauth-clients-body">
+                      <tr>
+                        <td>Gemini Web Connected Apps</td>
+                        <td><span class="badge badge-ok">Trusted</span></td>
+                        <td>1 access / 1 refresh</td>
+                        <td>https://gemini.google.com/oauth/callback</td>
+                        <td><button type="button" class="btn btn-danger btn-xs revoke-oauth-btn">Revoke</button></td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+            </div>
+          </section>
+
+          <!-- VIEW 3: HUB & TOOLS -->
+          <section id="panel-hub" role="tabpanel" aria-labelledby="tab-btn-hub" class="view-panel">
+            <div class="view-header">
+              <div>
+                <h1 id="heading-hub" class="view-title" tabindex="-1">Hub &amp; Smart Tools</h1>
+                <p class="view-subtitle">Multiplex downstream MCP servers (<code class="md-inline-code">namespace__tool</code>) dan uji langsung 14 tool hemat token.</p>
+              </div>
+              <button id="btn-add-mcp" type="button" class="btn btn-primary">+ Add MCP Server</button>
+            </div>
+
+            <div class="scroll-grid">
+              <article class="card span-2">
+                <div class="card-hdr">
+                  <div>
+                    <h2 class="card-title">Downstream MCP Aggregator</h2>
+                    <p class="card-desc">Tools dari server eksternal digabungkan dengan Token Guard &amp; audit logging terpusat.</p>
+                  </div>
+                </div>
+                <div class="table-wrap">
+                  <table class="data-table">
+                    <thead>
+                      <tr>
+                        <th scope="col">Server</th>
+                        <th scope="col">Namespace</th>
+                        <th scope="col">Transport</th>
+                        <th scope="col">Tools</th>
+                        <th scope="col">Status</th>
+                        <th scope="col">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody id="mcp-hub-body">
+                      <tr>
+                        <td>GitHub MCP</td>
+                        <td><code>github__</code></td>
+                        <td>HTTP</td>
+                        <td>12</td>
+                        <td><span class="badge badge-ok">Connected</span></td>
+                        <td><button type="button" class="btn btn-secondary btn-xs refresh-mcp-btn">Refresh</button></td>
+                      </tr>
+                      <tr>
+                        <td>Context7 Docs</td>
+                        <td><code>docs__</code></td>
+                        <td>Stdio</td>
+                        <td>2</td>
+                        <td><span class="badge badge-ok">Connected</span></td>
+                        <td><button type="button" class="btn btn-secondary btn-xs refresh-mcp-btn">Refresh</button></td>
+                      </tr>
+                      <tr>
+                        <td>Postgres Readonly</td>
+                        <td><code>pg__</code></td>
+                        <td>Stdio</td>
+                        <td>0</td>
+                        <td><span class="badge badge-muted">Standby</span></td>
+                        <td><button type="button" class="btn btn-secondary btn-xs refresh-mcp-btn">Connect</button></td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+
+              <article class="card span-2">
+                <div class="card-hdr">
+                  <div>
+                    <h2 class="card-title">Built-in Smart Tool Simulator</h2>
+                    <p class="card-desc">Eksekusi tool langsung terhadap jailed workspace tanpa koneksi eksternal.</p>
+                  </div>
+                  <div class="btn-row">
+                    <label for="sim-tool-select" class="sr-only">Pilih Tool</label>
+                    <select id="sim-tool-select" class="mono-select" style="width: 210px">
+                      <option value="project_overview">project_overview</option>
+                      <option value="smart_search">smart_search</option>
+                      <option value="code_outline">code_outline</option>
+                      <option value="git_ops">git_ops</option>
+                    </select>
+                    <button id="btn-copy-sim-rpc" type="button" class="btn btn-secondary btn-xs">Copy JSON-RPC</button>
+                    <button id="btn-run-sim" type="button" class="btn btn-primary btn-xs">Execute Tool</button>
+                  </div>
+                </div>
+
+                <div class="sim-grid">
+                  <div>
+                    <label for="sim-args-input" class="kv-label">JSON ARGUMENTS</label>
+                    <textarea id="sim-args-input" class="mono-textarea" rows="8">{}</textarea>
+                  </div>
+                  <div>
+                    <span class="kv-label">COMPRESSED OUTPUT</span>
+                    <pre id="sim-output" class="mono-pre">Klik "Execute Tool" untuk simulasi Token Guard output...</pre>
+                  </div>
+                </div>
+              </article>
+            </div>
+          </section>
+
+          <!-- VIEW 4: LIVE MONITOR -->
+          <section id="panel-monitor" role="tabpanel" aria-labelledby="tab-btn-monitor" class="view-panel">
+            <div class="view-header">
+              <div>
+                <h1 id="heading-monitor" class="view-title" tabindex="-1">Live Monitor</h1>
+                <p class="view-subtitle">Traffic HTTP JSON-RPC real-time (klik baris untuk Payload Inspector) &amp; async background jobs.</p>
+              </div>
+              <div class="btn-row">
+                <label for="traffic-filter-input" class="sr-only">Filter traffic</label>
+                <input id="traffic-filter-input" type="search" class="mono-input" style="width: 200px" placeholder="Filter method/RPC/note..." />
+                <label for="traffic-status-filter" class="sr-only">Filter status HTTP</label>
+                <select id="traffic-status-filter" class="mono-select" style="width: 120px">
+                  <option value="all">All Status</option>
+                  <option value="2xx">2xx OK</option>
+                  <option value="err">4xx / 5xx</option>
+                </select>
+                <button id="btn-clear-traffic" type="button" class="btn btn-secondary btn-xs">Clear</button>
+              </div>
+            </div>
+
+            <div class="scroll-grid">
+              <article class="card span-2">
+                <div class="card-hdr">
+                  <div>
+                    <h2 class="card-title">Live HTTP Traffic</h2>
+                    <p class="card-desc">Klik baris mana saja untuk memeriksa request &amp; response payload (redacted).</p>
+                  </div>
+                  <span id="traffic-count-label" class="badge badge-muted">4 requests</span>
+                </div>
+                <div class="table-wrap">
+                  <table class="data-table">
+                    <thead>
+                      <tr>
+                        <th scope="col">Time</th>
+                        <th scope="col">Method</th>
+                        <th scope="col">Path / RPC</th>
+                        <th scope="col">Status</th>
+                        <th scope="col">Duration</th>
+                        <th scope="col">Note</th>
+                      </tr>
+                    </thead>
+                    <tbody id="http-traffic-body"></tbody>
+                  </table>
+                </div>
+              </article>
+
+              <article class="card span-2">
+                <div class="card-hdr">
+                  <div>
+                    <h2 class="card-title">Background Command Jobs (Async)</h2>
+                    <p class="card-desc">Pantau build/test jangka panjang tanpa timeout WebMCP.</p>
+                  </div>
+                  <button id="btn-clear-finished-jobs" type="button" class="btn btn-secondary btn-xs">Clear Finished</button>
+                </div>
+                <div class="table-wrap">
+                  <table class="data-table">
+                    <thead>
+                      <tr>
+                        <th scope="col">Job ID</th>
+                        <th scope="col">Label / Command</th>
+                        <th scope="col">Status</th>
+                        <th scope="col">Runtime</th>
+                        <th scope="col">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody id="jobs-body">
+                      <tr>
+                        <td><code>job-a1f9</code></td>
+                        <td>cargo test --lib</td>
+                        <td><span class="badge badge-warn">Running</span></td>
+                        <td>14.2 s</td>
+                        <td>
+                          <div class="btn-row">
+                            <button type="button" class="btn btn-secondary btn-xs open-job-logs-btn">Logs</button>
+                            <button type="button" class="btn btn-danger btn-xs stop-job-btn">Stop</button>
+                          </div>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td><code>job-9c2e</code></td>
+                        <td>npm run build</td>
+                        <td><span class="badge badge-ok">Completed</span></td>
+                        <td>3.1 s</td>
+                        <td>
+                          <button type="button" class="btn btn-secondary btn-xs open-job-logs-btn">Logs</button>
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+            </div>
+          </section>
+
+          <!-- VIEW 5: DIFF & AUDIT -->
+          <section id="panel-audit" role="tabpanel" aria-labelledby="tab-btn-audit" class="view-panel">
+            <div class="view-header">
+              <div>
+                <h1 id="heading-audit" class="view-title" tabindex="-1">Diff &amp; Audit</h1>
+                <p class="view-subtitle">Riwayat perubahan dengan SHA-256 snapshot rollback per file maupun per Turn Group.</p>
+              </div>
+              <button id="btn-refresh-audit" type="button" class="btn btn-secondary btn-xs">Refresh</button>
+            </div>
+
+            <div class="audit-split">
+              <div class="audit-pane">
+                <div style="display: flex; flex-direction: column; gap: 8px">
+                  <label for="audit-search-input" class="sr-only">Cari audit</label>
+                  <input id="audit-search-input" type="search" class="mono-input" placeholder="Cari file atau tool..." />
+                  <div style="display: flex; gap: 8px; align-items: center">
+                    <label for="audit-source-filter" class="sr-only">Filter source</label>
+                    <select id="audit-source-filter" class="mono-select">
+                      <option value="ALL">Semua Source</option>
+                      <option value="LocalAgent">LocalAgent</option>
+                      <option value="WebMCP">WebMCP</option>
+                      <option value="Simulator">Simulator</option>
+                    </select>
+                    <label style="display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); white-space: nowrap; cursor: pointer">
+                      <input id="audit-revertable-only" type="checkbox" style="accent-color: var(--accent)" />
+                      <span>Revertable</span>
+                    </label>
+                  </div>
+                </div>
+                <div id="audit-list" class="audit-list"></div>
+              </div>
+
+              <div class="diff-pane">
+                <div class="card-hdr">
+                  <div>
+                    <h2 id="diff-title" class="card-title">Visual Diff Inspector</h2>
+                    <p id="diff-meta" class="card-desc">Pilih entri audit di kiri.</p>
+                  </div>
+                  <div class="btn-row">
+                    <button id="btn-open-vscode" type="button" class="btn btn-secondary btn-xs">VS Code</button>
+                    <button id="btn-open-explorer" type="button" class="btn btn-secondary btn-xs">Explorer</button>
+                    <button id="btn-revert-group" type="button" class="btn btn-secondary btn-xs">Revert Turn Group (2)</button>
+                    <button id="btn-revert-selected" type="button" class="btn btn-danger btn-xs">1-Click Revert File</button>
+                  </div>
+                </div>
+                <div id="diff-viewer" class="diff-viewer"></div>
+              </div>
+            </div>
+          </section>
+        </main>
+      </div>
+
+      <!-- BOTTOM STATUSBAR + PREVIEW SWITCHER -->
+      <footer class="statusbar">
+        <span id="toast-region" role="status" aria-live="polite">Ready · Obsidian Studio Prototype</span>
+        <div class="preview-controls">
+          <span style="color: var(--text-muted)">Preview Controls:</span>
+          <button id="btn-toggle-accent" type="button" class="preview-pill">
+            Accent: <strong id="accent-name-label" style="color: var(--accent-fg)">Electric Mint</strong>
+          </button>
+          <button id="btn-footer-oauth" type="button" class="preview-pill">Preview OAuth Modal</button>
+          <span id="statusbar-meta" style="color: var(--text-muted)">Ctrl+K Palette · Ctrl+1–5 Views · [ Rail</span>
+        </div>
+      </footer>
+    </div>
+
+    <!-- FLOATING TOAST STACK -->
+    <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
+
+    <!-- DIALOG 1: COMMAND PALETTE (closedby="any") -->
+    <dialog id="command-palette-dialog" closedby="any" aria-labelledby="palette-title">
+      <div class="modal-hdr">
+        <h2 id="palette-title" class="sr-only">Command Palette</h2>
+        <div style="display: flex; gap: 8px; width: 100%; align-items: center">
+          <label for="palette-search-input" class="sr-only">Cari perintah</label>
+          <input id="palette-search-input" type="search" class="mono-input" placeholder="Ketik perintah (agent, bridge, mint, cyan, oauth, diagnostic)..." />
+          <button id="btn-close-palette" type="button" class="btn btn-secondary btn-xs">Esc</button>
+        </div>
+      </div>
+      <div id="palette-results" class="palette-results"></div>
+    </dialog>
+
+    <!-- DIALOG 2: HTTP TRAFFIC PAYLOAD INSPECTOR (closedby="any") -->
+    <dialog id="traffic-inspector-dialog" class="dialog-wide" closedby="any" aria-labelledby="traffic-insp-title">
+      <div class="modal-hdr">
+        <div>
+          <h2 id="traffic-insp-title" class="card-title">HTTP Payload Inspector</h2>
+          <p id="traffic-insp-meta" class="card-desc">-</p>
+        </div>
+        <button id="btn-close-traffic-insp" type="button" class="btn btn-secondary btn-xs">Close</button>
+      </div>
+      <div class="modal-body">
+        <div style="margin-bottom: 12px">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px">
+            <span class="kv-label" style="margin: 0">REQUEST PAYLOAD (REDACTED)</span>
+            <button id="btn-copy-insp-req" type="button" class="btn btn-secondary btn-xs">Copy</button>
+          </div>
+          <pre id="traffic-insp-req" class="mono-pre"></pre>
+        </div>
+        <div>
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px">
+            <span class="kv-label" style="margin: 0">RESPONSE PAYLOAD (REDACTED)</span>
+            <button id="btn-copy-insp-res" type="button" class="btn btn-secondary btn-xs">Copy</button>
+          </div>
+          <pre id="traffic-insp-res" class="mono-pre"></pre>
+        </div>
+      </div>
+    </dialog>
+
+    <!-- DIALOG 3: OAUTH CONSENT (closedby="none" - security prompt) -->
+    <dialog id="oauth-consent-dialog" closedby="none" aria-labelledby="oauth-dialog-title">
+      <div class="modal-hdr">
+        <div>
+          <h2 id="oauth-dialog-title" class="card-title">Permintaan Koneksi OAuth 2.1</h2>
+          <p class="card-desc">Aplikasi eksternal meminta akses MCP ke workspace jailed Anda.</p>
+        </div>
+        <span class="badge badge-warn">Interactive Consent</span>
+      </div>
+      <div class="modal-body">
+        <div class="kv-stack">
+          <div>
+            <span class="kv-label">CLIENT</span>
+            <code class="kv-code" style="display: block">Gemini Web Connected Apps (client_94b1e8)</code>
+          </div>
+          <div>
+            <span class="kv-label">REDIRECT URI</span>
+            <code class="kv-code" style="display: block">https://gemini.google.com/oauth/callback</code>
+          </div>
+          <div>
+            <span class="kv-label">REQUESTED SCOPE</span>
+            <code class="kv-code" style="display: block">mcp:tools mcp:resources</code>
+          </div>
+        </div>
+        <p style="margin: 0; padding: 10px 12px; border-radius: var(--radius-md); background: var(--status-warn-bg); border: 1px solid var(--status-warn-border); color: var(--status-warn); font-size: 12px">
+          Hanya setujui jika Anda sendiri yang baru saja memicu autentikasi dari klien MCP.
+        </p>
+      </div>
+      <div class="modal-ftr">
+        <button id="btn-oauth-deny" type="button" class="btn btn-danger">Deny</button>
+        <button id="btn-oauth-once" type="button" class="btn btn-secondary">Approve Once</button>
+        <button id="btn-oauth-trust" type="button" class="btn btn-primary">Approve &amp; Trust</button>
+      </div>
+    </dialog>
+
+    <!-- DIALOG 4: ADD DOWNSTREAM MCP SERVER (closedby="any") -->
+    <dialog id="add-mcp-dialog" closedby="any" aria-labelledby="add-mcp-title">
+      <form id="add-mcp-form">
+        <div class="modal-hdr">
+          <div>
+            <h2 id="add-mcp-title" class="card-title">Tambah Downstream MCP Server</h2>
+            <p class="card-desc">Gabungkan tools eksternal di bawah prefix <code class="md-inline-code">namespace__tool</code>.</p>
+          </div>
+        </div>
+        <div class="modal-body">
+          <div class="form-group">
+            <label for="mcp-name">Nama Server</label>
+            <input id="mcp-name" type="text" class="mono-input" required placeholder="Linear / Playwright / GitHub" />
+          </div>
+          <div class="form-group">
+            <label for="mcp-namespace">Namespace Prefix</label>
+            <input id="mcp-namespace" type="text" class="mono-input" required placeholder="linear" />
+          </div>
+          <div class="form-group">
+            <label for="mcp-transport">Transport</label>
+            <select id="mcp-transport" class="mono-select">
+              <option value="http" selected>HTTP / Streamable HTTP</option>
+              <option value="stdio">Local Stdio Subprocess</option>
+            </select>
+          </div>
+          <div id="mcp-http-fields">
+            <div class="form-group" style="margin-bottom: 0">
+              <label for="mcp-url">Endpoint URL</label>
+              <input id="mcp-url" type="url" class="mono-input" placeholder="https://mcp.linear.app/mcp" />
+            </div>
+          </div>
+          <div id="mcp-stdio-fields" hidden>
+            <div class="form-group" style="margin-bottom: 0">
+              <label for="mcp-command">Command</label>
+              <input id="mcp-command" type="text" class="mono-input" placeholder="npx -y @playwright/mcp" />
+            </div>
+          </div>
+        </div>
+        <div class="modal-ftr">
+          <button id="btn-cancel-add-mcp" type="button" class="btn btn-secondary">Cancel</button>
+          <button type="submit" class="btn btn-primary">Connect &amp; Save</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- DIALOG 5: DIAGNOSTIC REPORT (closedby="any") -->
+    <dialog id="diagnostic-dialog" closedby="any" aria-labelledby="diag-modal-title">
+      <div class="modal-hdr">
+        <div>
+          <h2 id="diag-modal-title" class="card-title">MCP Self-Diagnostic Report</h2>
+          <p class="card-desc">Verifikasi loopback HTTP, initialize handshake, tools/list, dan tunnel.</p>
+        </div>
+        <span class="badge badge-ok">ALL PASS</span>
+      </div>
+      <div class="modal-body">
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px">
+          <div class="card" style="padding: 10px"><span class="kv-label">HTTP /health</span><span class="badge badge-ok">200 OK (2ms)</span></div>
+          <div class="card" style="padding: 10px"><span class="kv-label">MCP initialize</span><span class="badge badge-ok">2026-compat OK</span></div>
+          <div class="card" style="padding: 10px"><span class="kv-label">Tools Exposed</span><span class="badge badge-ok">28 (14 + 14 hub)</span></div>
+          <div class="card" style="padding: 10px"><span class="kv-label">Remote Tunnel</span><span class="badge badge-ok">Connected</span></div>
+        </div>
+      </div>
+      <div class="modal-ftr">
+        <button id="btn-close-diag" type="button" class="btn btn-primary">Done</button>
+      </div>
+    </dialog>
+
+    <!-- DIALOG 6: PRESET PREVIEW (closedby="any") -->
+    <dialog id="preset-preview-dialog" class="dialog-wide" closedby="any" aria-labelledby="preset-modal-title">
+      <div class="modal-hdr">
+        <div>
+          <h2 id="preset-modal-title" class="card-title">Client Config Preset Preview</h2>
+          <p id="preset-modal-desc" class="card-desc">Salin konfigurasi ke klien MCP Anda.</p>
+        </div>
+        <button id="btn-close-preset-modal" type="button" class="btn btn-secondary btn-xs">Close</button>
+      </div>
+      <div class="modal-body">
+        <pre id="preset-modal-code" class="mono-pre"></pre>
+      </div>
+      <div class="modal-ftr">
+        <button id="btn-preset-modal-copy" type="button" class="btn btn-primary">Copy Config</button>
+      </div>
+    </dialog>
+
+    <!-- DIALOG 7: JOB LOGS (closedby="any") -->
+    <dialog id="job-logs-dialog" class="dialog-wide" closedby="any" aria-labelledby="job-logs-title">
+      <div class="modal-hdr">
+        <div>
+          <h2 id="job-logs-title" class="card-title">Background Job Output</h2>
+          <p class="card-desc">cargo test --lib · compressed stdout/stderr</p>
+        </div>
+        <button id="btn-close-job-logs" type="button" class="btn btn-secondary btn-xs">Close</button>
+      </div>
+      <div class="modal-body">
+        <pre class="mono-pre">running 18 tests
+test security::tests::blocks_sensitive_auth_json ... ok
+test oauth::tests::pkce_verifier_rejects_mismatch ... ok
+test snapshots::tests::turn_group_revert_detects_conflict ... ok
+test result: ok. 18 passed; 0 failed; 0 ignored</pre>
+      </div>
+    </dialog>
+
+    <script>
+      (() => {
+        const $ = (id) => document.getElementById(id);
+
+        // --- Feature Detection & Top-Layer Dialog Helpers (modern-web-guidance) ---
+        let supportsDisplayTransition;
+        function canTransitionDisplay() {
+          if (supportsDisplayTransition !== undefined) return supportsDisplayTransition;
+          if (!window.CSS?.supports?.("transition-behavior", "allow-discrete") || !document.body) {
+            supportsDisplayTransition = false;
+            return false;
+          }
+          const probe = document.createElement("div");
+          probe.style.cssText = "transition: display 1s allow-discrete !important; display: block;";
+          document.body.appendChild(probe);
+          getComputedStyle(probe).display;
+          probe.style.display = "none";
+          supportsDisplayTransition = getComputedStyle(probe).display === "block";
+          probe.remove();
+          return supportsDisplayTransition;
+        }
+
+        function supportsTopLayerExit() {
+          return Boolean(window.CSS?.supports?.("overlay", "auto") && canTransitionDisplay());
+        }
+
+        async function closeTopLayer(dialog) {
+          if (!dialog.open) return;
+          if (!supportsTopLayerExit()) {
+            dialog.setAttribute("data-closing", "");
+            const animations = dialog.getAnimations({ subtree: true });
+            if (animations.length > 0) {
+              await Promise.race([
+                Promise.allSettled(animations.map((a) => a.finished)),
+                new Promise((r) => setTimeout(r, 600)),
+              ]);
+            }
+            if (!dialog.hasAttribute("data-closing")) return;
+            dialog.removeAttribute("data-closing");
+          }
+          dialog.close();
+        }
+
+        function setupDialogLightDismiss(dialog) {
+          dialog.addEventListener("cancel", (event) => {
+            if (dialog.getAttribute("closedby") === "none") {
+              event.preventDefault();
+              return;
+            }
+            if (!supportsTopLayerExit()) {
+              event.preventDefault();
+              void closeTopLayer(dialog);
+            }
+          });
+
+          if (!("closedBy" in HTMLDialogElement.prototype) && dialog.getAttribute("closedby") === "any") {
+            dialog.addEventListener("click", (event) => {
+              if (event.target !== dialog) return;
+              const rect = dialog.getBoundingClientRect();
+              const inside =
+                rect.top <= event.clientY &&
+                event.clientY <= rect.top + rect.height &&
+                rect.left <= event.clientX &&
+                event.clientX <= rect.left + rect.width;
+              if (!inside) void closeTopLayer(dialog);
+            });
+          }
+        }
+
+        document.querySelectorAll("dialog").forEach(setupDialogLightDismiss);
+
+        // --- Floating Toast Stack ---
+        function pushToast(message, kind = "info") {
+          $("toast-region").textContent = message;
+          const stack = $("toast-stack");
+          const item = document.createElement("div");
+          item.className = "toast-item";
+          const dot = document.createElement("span");
+          dot.className = `live-dot ${kind === "warn" ? "warn" : kind === "offline" ? "offline" : "online"}`;
+          dot.setAttribute("aria-hidden", "true");
+          const text = document.createElement("span");
+          text.textContent = message;
+          item.append(dot, text);
+          stack.appendChild(item);
+          setTimeout(() => item.remove(), 3400);
+        }
+
+        // --- State & Counters ---
+        let tokensSaved = 48920;
+        let turnsSaved = 37;
+        let serverOnline = true;
+        let tunnelActive = true;
+        let secretsVisible = false;
+        let currentToken = "ak_live_98f2c4e17b3d8041e9a2a9f4";
+        let currentTab = "agent";
+
+        function bumpSavings(tokens, turns = 1) {
+          tokensSaved += tokens;
+          turnsSaved += turns;
+          $("metric-tokens-saved").textContent = tokensSaved.toLocaleString("en-US");
+          $("metric-turns-saved").textContent = turnsSaved.toLocaleString("en-US");
+        }
+
+        // --- Delegated Card Spotlight (compositor radial highlight) ---
+        document.addEventListener("pointermove", (e) => {
+          const card = e.target instanceof Element ? e.target.closest(".card") : null;
+          if (!card) return;
+          const rect = card.getBoundingClientRect();
+          card.style.setProperty("--spot-x", `${e.clientX - rect.left}px`);
+          card.style.setProperty("--spot-y", `${e.clientY - rect.top}px`);
+        });
+
+        // --- Left Rail Indicator & Navigation with View Transitions ---
+        function syncRailIndicator() {
+          const activeBtn = document.querySelector(".rail-btn.active");
+          const indicator = $("rail-indicator");
+          if (!activeBtn || !indicator) return;
+          const y = activeBtn.offsetTop + 8;
+          indicator.style.transform = `translateY(${y}px)`;
+        }
+
+        function switchView(tabName) {
+          if (tabName === currentTab) return;
+          const applyDomSwitch = () => {
+            currentTab = tabName;
+            document.querySelectorAll(".rail-btn").forEach((btn) => {
+              const active = btn.dataset.tab === tabName;
+              btn.classList.toggle("active", active);
+              btn.setAttribute("aria-selected", active ? "true" : "false");
+            });
+            document.querySelectorAll(".view-panel").forEach((panel) => {
+              panel.classList.toggle("active", panel.id === `panel-${tabName}`);
+            });
+            syncRailIndicator();
+          };
+
+          const targetHeading = $(`heading-${tabName}`);
+          if (!document.startViewTransition) {
+            applyDomSwitch();
+            targetHeading?.focus({ preventScroll: true });
+            return;
+          }
+
+          const transition = document.startViewTransition(applyDomSwitch);
+          transition.finished.finally(() => {
+            targetHeading?.focus({ preventScroll: true });
+          });
+        }
+
+        document.querySelectorAll(".rail-btn").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            if (btn.dataset.tab) switchView(btn.dataset.tab);
+          });
+        });
+
+        // --- Toggle Left Sidebar Rail ---
+        function toggleRail() {
+          const shell = $("app-shell");
+          const collapsed = shell.classList.toggle("rail-collapsed");
+          $("btn-toggle-rail").setAttribute("aria-expanded", collapsed ? "false" : "true");
+          requestAnimationFrame(syncRailIndicator);
+        }
+        $("btn-toggle-rail").addEventListener("click", toggleRail);
+
+        // --- Sliding Guardrail Glider (transform-only GPU glide) ---
+        function positionGuardrailGlider() {
+          const track = $("guardrail-track");
+          const glider = $("guardrail-glider");
+          const activeBtn = track.querySelector(".guardrail-btn.active");
+          if (!activeBtn) return;
+          const trackW = track.clientWidth;
+          if (!trackW) return;
+          const x = activeBtn.offsetLeft;
+          const sx = activeBtn.offsetWidth / trackW;
+          glider.style.transform = `translateX(${x}px) scaleX(${sx})`;
+        }
+
+        document.querySelectorAll(".guardrail-btn").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            const mode = btn.dataset.guardrail;
+            if (!mode) return;
+            $("guardrail-track").dataset.mode = mode;
+            document.querySelectorAll(".guardrail-btn").forEach((b) => {
+              const isAct = b === btn;
+              b.classList.toggle("active", isAct);
+              b.setAttribute("aria-pressed", isAct ? "true" : "false");
+            });
+            positionGuardrailGlider();
+            const labels = {
+              read_only: "Guardrail: Read-Only (mutasi & shell diblokir)",
+              safe_edit: "Guardrail: Safe Edit (butuh konfirmasi HITL)",
+              autonomous: "Guardrail: Auto (eksekusi jailed workspace)",
+            };
+            pushToast(labels[mode], mode === "safe_edit" ? "warn" : "info");
+          });
+        });
+
+        // --- Workspace Capsule Interactions ---
+        const wsDropdown = $("workspace-dropdown");
+        $("btn-recent-workspaces").addEventListener("click", (e) => {
+          e.stopPropagation();
+          wsDropdown.hidden = !wsDropdown.hidden;
+          $("btn-recent-workspaces").setAttribute("aria-expanded", wsDropdown.hidden ? "false" : "true");
+        });
+
+        document.querySelectorAll(".ws-drop-item").forEach((item) => {
+          item.addEventListener("click", () => {
+            const path = item.dataset.ws;
+            const branch = item.dataset.branch;
+            $("workspace-input").value = path;
+            $("workspace-git-branch").lastChild.textContent = ` ${branch}`;
+            wsDropdown.hidden = true;
+            $("btn-recent-workspaces").setAttribute("aria-expanded", "false");
+            pushToast(`Workspace dikunci ke ${path}`);
+          });
+        });
+
+        document.addEventListener("click", (e) => {
+          if (!wsDropdown.hidden && !wsDropdown.contains(e.target) && e.target !== $("btn-recent-workspaces")) {
+            wsDropdown.hidden = true;
+            $("btn-recent-workspaces").setAttribute("aria-expanded", "false");
+          }
+        });
+
+        $("btn-pin-workspace").addEventListener("click", () => {
+          const btn = $("btn-pin-workspace");
+          const pinned = btn.getAttribute("aria-pressed") === "true";
+          btn.setAttribute("aria-pressed", pinned ? "false" : "true");
+          pushToast(pinned ? "Workspace dilepas dari pin." : "Workspace disematkan (pinned).");
+        });
+
+        $("btn-pick-workspace").addEventListener("click", () => {
+          pushToast("Dialog pemilih folder native dibuka (simulasi preview).");
+        });
+
+        // --- View 1: Local Agent Drawer & Streaming Simulation ---
+        $("btn-toggle-drawer").addEventListener("click", () => {
+          const shell = $("agent-shell");
+          const open = shell.classList.toggle("drawer-open");
+          $("btn-toggle-drawer").setAttribute("aria-expanded", open ? "true" : "false");
+          $("agent-drawer").inert = !open;
+        });
+
+        $("btn-save-agent").addEventListener("click", () => {
+          const prov = $("agent-provider").value;
+          const model = $("agent-model").value;
+          const prefix = prov === "openai_compat" ? "OpenAI-Compat" : prov === "anthropic" ? "Claude" : "Gemini";
+          $("provider-pill-label").textContent = `${prefix} · ${model}`;
+          pushToast(`Konfigurasi ${prefix} (${model}) disimpan ke DPAPI.`);
+        });
+
+        $("btn-new-session").addEventListener("click", () => {
+          $("chat-messages").innerHTML =
+            '<div style="margin:auto;text-align:center;color:var(--text-secondary);max-width:400px;font-size:13px">Sesi baru siap. Pilih prompt template di bawah atau ketik perintah coding untuk workspace aktif.</div>';
+          pushToast("Sesi chat baru dimulai.");
+        });
+
+        $("btn-clear-chat").addEventListener("click", () => {
+          $("chat-messages").innerHTML =
+            '<div style="margin:auto;text-align:center;color:var(--text-secondary);max-width:400px;font-size:13px">Percakapan dibersihkan.</div>';
+          pushToast("Riwayat percakapan pada tampilan dibersihkan.");
+        });
+
+        $("chat-input").addEventListener("keydown", (e) => {
+          if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+            e.preventDefault();
+            $("chat-form").requestSubmit();
+          }
+        });
+
+        $("attach-file-path").addEventListener("keydown", (e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            $("btn-attach-file").click();
+          }
+        });
+
+        $("agent-provider").addEventListener("change", (e) => {
+          const prov = e.target.value;
+          $("openai-compat-fields").hidden = prov !== "openai_compat";
+          const labelMap = {
+            gemini: "Gemini · gemini-2.5-flash",
+            openai_compat: "Ollama · qwen2.5-coder:7b",
+            anthropic: "Claude · claude-sonnet-4-5",
+          };
+          $("provider-pill-label").textContent = labelMap[prov];
+          pushToast(`Provider dialihkan ke ${labelMap[prov]}`);
+        });
+
+        document.querySelectorAll(".preset-url-btn").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            $("agent-base-url").value = btn.dataset.url;
+            pushToast(`Base URL diset ke ${btn.textContent}`);
+          });
+        });
+
+        document.querySelectorAll(".prompt-chip[data-prompt]").forEach((chip) => {
+          chip.addEventListener("click", () => {
+            const input = $("chat-input");
+            input.value = chip.dataset.prompt;
+            input.focus();
+          });
+        });
+
+        const attachments = [];
+        function renderAttachments() {
+          const box = $("attachment-chips");
+          box.innerHTML = "";
+          box.hidden = attachments.length === 0;
+          attachments.forEach((name, idx) => {
+            const chip = document.createElement("span");
+            chip.className = "attach-chip";
+            const lbl = document.createElement("span");
+            lbl.textContent = name;
+            const rm = document.createElement("button");
+            rm.type = "button";
+            rm.textContent = "×";
+            rm.setAttribute("aria-label", `Hapus ${name}`);
+            rm.addEventListener("click", () => {
+              attachments.splice(idx, 1);
+              renderAttachments();
+            });
+            chip.append(lbl, rm);
+            box.appendChild(chip);
+          });
+        }
+
+        $("btn-attach-file").addEventListener("click", () => {
+          const input = $("attach-file-path");
+          const val = input.value.trim().replace(/^@+/, "");
+          if (!val) return;
+          attachments.push(`@${val}`);
+          input.value = "";
+          renderAttachments();
+        });
+
+        $("btn-attach-image").addEventListener("click", () => {
+          attachments.push("screenshot-ui.png");
+          renderAttachments();
+          pushToast("Lampiran gambar ditambahkan ke composer.");
+        });
+
+        document.addEventListener("click", (e) => {
+          if (e.target instanceof Element && e.target.classList.contains("copy-code-btn")) {
+            const pre = e.target.closest(".md-code-block")?.querySelector("pre");
+            if (pre) {
+              navigator.clipboard?.writeText(pre.textContent || "").catch(() => {});
+              pushToast("Code block disalin ke clipboard.");
+            }
+          }
+        });
+
+        let streamTimer = null;
+        $("chat-form").addEventListener("submit", (e) => {
+          e.preventDefault();
+          if (streamTimer) return;
+          const input = $("chat-input");
+          const prompt = input.value.trim();
+          if (!prompt) return;
+
+          const transcript = $("chat-messages");
+          const userCard = document.createElement("article");
+          userCard.className = "msg-card msg-user";
+          userCard.innerHTML = `<div class="msg-hdr"><span class="msg-role">You</span><span>${new Date().toLocaleTimeString()}</span></div><div class="msg-body"></div>`;
+          userCard.querySelector(".msg-body").textContent = prompt;
+          transcript.appendChild(userCard);
+
+          input.value = "";
+          attachments.length = 0;
+          renderAttachments();
+
+          const botCard = document.createElement("article");
+          botCard.className = "msg-card";
+          botCard.innerHTML = `
+            <div class="msg-hdr">
+              <span class="msg-role">Airlock Agent · streaming</span>
+              <span class="shimmer-bar" aria-label="Sedang memproses"></span>
+            </div>
+            <div class="step-badges"></div>
+            <div class="msg-body"><p style="color: var(--text-secondary)">Menganalisis workspace via Smart Tools...</p></div>
+          `;
+          transcript.appendChild(botCard);
+          transcript.scrollTop = transcript.scrollHeight;
+
+          $("btn-stop-agent").hidden = false;
+          $("btn-send-chat").disabled = true;
+          $("agent-run-status").textContent = "Streaming response...";
+
+          const steps = ["project_overview", "smart_search · auth", "read_file_range · L1-60"];
+          const chunks = [
+            "Ringkasan cepat dari workspace aktif: ",
+            "struktur modul `oauth.rs`, `mcp_server.rs`, dan `snapshots.rs` berjalan normal dengan ",
+            "Token Guard aktif. Tidak ditemukan kebocoran secret pada path jailed.",
+          ];
+
+          let tick = 0;
+          streamTimer = setInterval(() => {
+            if (tick < steps.length) {
+              const pill = document.createElement("span");
+              pill.className = "step-badge";
+              pill.textContent = steps[tick];
+              botCard.querySelector(".step-badges").appendChild(pill);
+            }
+            if (tick === steps.length) {
+              botCard.querySelector(".msg-body").innerHTML = "<p></p>";
+            }
+            const chunkIdx = tick - steps.length;
+            if (chunkIdx >= 0 && chunkIdx < chunks.length) {
+              botCard.querySelector(".msg-body p").textContent += chunks[chunkIdx];
+            }
+            transcript.scrollTop = transcript.scrollHeight;
+            tick++;
+            if (tick >= steps.length + chunks.length) {
+              clearInterval(streamTimer);
+              streamTimer = null;
+              botCard.querySelector(".msg-hdr").innerHTML =
+                `<span class="msg-role">Airlock Agent · ${$("agent-model").value}</span><span>${new Date().toLocaleTimeString()} · 540 tok saved</span>`;
+              $("btn-stop-agent").hidden = true;
+              $("btn-send-chat").disabled = false;
+              $("agent-run-status").textContent = "Selesai (3 tool steps)";
+              bumpSavings(540, 1);
+            }
+          }, 340);
+        });
+
+        $("btn-stop-agent").addEventListener("click", () => {
+          if (streamTimer) {
+            clearInterval(streamTimer);
+            streamTimer = null;
+          }
+          $("btn-stop-agent").hidden = true;
+          $("btn-send-chat").disabled = false;
+          $("agent-run-status").textContent = "Dibatalkan";
+          pushToast("Streaming agent dihentikan.", "warn");
+        });
+
+        // --- View 2: MCP Bridge Interactions ---
+        function syncServerUi() {
+          const port = $("server-port-input").value || "9494";
+          $("local-mcp-url").textContent = `http://127.0.0.1:${port}/mcp`;
+          $("rail-port-pill").textContent = `:${port}`;
+          $("status-server-badge").textContent = serverOnline ? `:${port}` : "OFF";
+          $("rail-server-dot").className = `live-dot ${serverOnline ? "online" : "offline"}`;
+          $("rail-server-toggle").querySelector(".telemetry-full").textContent = serverOnline ? "Server Online" : "Server Offline";
+          $("bridge-server-pill").textContent = serverOnline ? "ONLINE" : "OFFLINE";
+          $("bridge-server-pill").className = `badge ${serverOnline ? "badge-ok" : "badge-muted"}`;
+          $("btn-toggle-server").textContent = serverOnline ? "Stop Server" : "Start Server";
+          $("btn-toggle-server").className = `btn ${serverOnline ? "btn-danger" : "btn-primary"}`;
+        }
+
+        function toggleServer() {
+          serverOnline = !serverOnline;
+          syncServerUi();
+          pushToast(serverOnline ? "MCP Server dijalankan." : "MCP Server dihentikan.", serverOnline ? "info" : "offline");
+        }
+
+        $("btn-toggle-server").addEventListener("click", toggleServer);
+        $("rail-server-toggle").addEventListener("click", toggleServer);
+
+        $("btn-apply-port").addEventListener("click", () => {
+          syncServerUi();
+          pushToast(`Port MCP diperbarui ke ${$("server-port-input").value}.`);
+        });
+
+        function renderSecrets() {
+          const masked = `••••••••••••${currentToken.slice(-4)}`;
+          $("mcp-auth-token").textContent = secretsVisible ? currentToken : masked;
+          const tUrl = tunnelActive ? "https://airlock-gate.trycloudflare.com" : "Tunnel Idle";
+          $("public-tunnel-url").textContent = tunnelActive
+            ? `${tUrl}/mcp/${secretsVisible ? currentToken : masked}`
+            : tUrl;
+          $("btn-toggle-secrets").textContent = secretsVisible ? "Hide" : "Show";
+          $("btn-toggle-secrets").setAttribute("aria-pressed", secretsVisible ? "true" : "false");
+        }
+
+        $("btn-toggle-secrets").addEventListener("click", () => {
+          secretsVisible = !secretsVisible;
+          renderSecrets();
+        });
+
+        $("btn-rotate-token").addEventListener("click", () => {
+          const suffix = Math.random().toString(16).slice(2, 6);
+          currentToken = `ak_live_${Math.random().toString(16).slice(2, 18)}${suffix}`;
+          renderSecrets();
+          pushToast("Bearer token dirotasi dengan aman.", "warn");
+        });
+
+        $("btn-copy-mcp-url").addEventListener("click", () => {
+          pushToast("Endpoint MCP + Bearer Token disalin ke clipboard.");
+        });
+
+        $("tunnel-provider-select").addEventListener("change", (e) => {
+          $("cf-named-fields").hidden = e.target.value !== "cloudflare_named";
+        });
+
+        $("btn-toggle-tunnel").addEventListener("click", () => {
+          tunnelActive = !tunnelActive;
+          $("btn-toggle-tunnel").textContent = tunnelActive ? "Stop Tunnel" : "Start Tunnel";
+          $("status-tunnel-badge").textContent = tunnelActive ? "Cloudflare" : "Idle";
+          $("status-tunnel-badge").className = `telemetry-val ${tunnelActive ? "accent" : ""}`;
+          renderSecrets();
+          pushToast(tunnelActive ? "Remote Tunnel aktif." : "Remote Tunnel dimatikan.", tunnelActive ? "info" : "offline");
+        });
+
+        $("btn-self-diag").addEventListener("click", () => $("diagnostic-dialog").showModal());
+        $("btn-close-diag").addEventListener("click", () => void closeTopLayer($("diagnostic-dialog")));
+
+        $("btn-preview-preset").addEventListener("click", () => {
+          const preset = $("mcp-preset-select").value;
+          const payload = {
+            mcpServers: {
+              airlock: {
+                url: `${$("local-mcp-url").textContent}`,
+                headers: { Authorization: `Bearer ${currentToken}` },
+              },
+            },
+          };
+          $("preset-modal-title").textContent = `Preset: ${preset}`;
+          $("preset-modal-code").textContent = JSON.stringify(payload, null, 2);
+          $("preset-preview-dialog").showModal();
+        });
+        $("btn-close-preset-modal").addEventListener("click", () => void closeTopLayer($("preset-preview-dialog")));
+        $("btn-preset-modal-copy").addEventListener("click", () => {
+          pushToast("Konfigurasi preset disalin.");
+          void closeTopLayer($("preset-preview-dialog"));
+        });
+
+        $("btn-preview-oauth").addEventListener("click", () => $("oauth-consent-dialog").showModal());
+        $("btn-footer-oauth").addEventListener("click", () => $("oauth-consent-dialog").showModal());
+        $("btn-copy-preset").addEventListener("click", () => {
+          pushToast(`Preset ${$("mcp-preset-select").value} disalin ke clipboard.`);
+        });
+        $("toggle-sensitive-guard").addEventListener("change", (e) => {
+          pushToast(
+            e.target.checked
+              ? "Sensitive File Guard aktif (.env, *.key, auth.json diblokir)."
+              : "Peringatan: Sensitive File Guard dimatikan.",
+            e.target.checked ? "info" : "warn"
+          );
+        });
+        $("toggle-close-to-tray").addEventListener("change", (e) => {
+          pushToast(
+            e.target.checked ? "Minimize to Tray diaktifkan." : "Tutup jendela akan menghentikan aplikasi."
+          );
+        });
+        $("idle-timeout-select").addEventListener("change", (e) => {
+          const val = e.target.value;
+          pushToast(val === "0" ? "Auto-Kill Idle dinonaktifkan." : `Auto-Kill Idle diset ke ${val} menit.`);
+        });
+        document.querySelectorAll(".revoke-oauth-btn").forEach((b) => {
+          b.addEventListener("click", (ev) => {
+            ev.target.closest("tr")?.remove();
+            pushToast("Client OAuth dicabut.", "warn");
+          });
+        });
+        $("btn-revoke-all-oauth").addEventListener("click", () => {
+          $("oauth-clients-body").innerHTML =
+            '<tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:14px">Belum ada OAuth client terdaftar.</td></tr>';
+          pushToast("Seluruh OAuth client dicabut.", "warn");
+        });
+        document.querySelectorAll(".refresh-mcp-btn").forEach((b) => {
+          b.addEventListener("click", () => pushToast("Sinkronisasi tool downstream selesai."));
+        });
+        document.querySelectorAll(".stop-job-btn").forEach((b) => {
+          b.addEventListener("click", (ev) => {
+            const tr = ev.target.closest("tr");
+            if (tr) {
+              tr.children[2].innerHTML = '<span class="badge badge-danger">Killed</span>';
+              ev.target.remove();
+            }
+            pushToast("Background job dihentikan.", "warn");
+          });
+        });
+        $("btn-clear-finished-jobs").addEventListener("click", () => {
+          document.querySelectorAll("#jobs-body tr").forEach((tr) => {
+            if (!tr.textContent.includes("Running")) tr.remove();
+          });
+          pushToast("Background job selesai dibersihkan.");
+        });
+        $("btn-open-vscode").addEventListener("click", () => pushToast("Membuka file target di VS Code..."));
+        $("btn-open-explorer").addEventListener("click", () => pushToast("Membuka lokasi file di Windows Explorer..."));
+        $("btn-refresh-audit").addEventListener("click", () => {
+          renderAudit();
+          pushToast("Audit trail diperbarui.");
+        });
+        const simDefaultArgs = {
+          project_overview: "{}",
+          smart_search: '{\n  "query": "verify_pkce",\n  "max_results": 20\n}',
+          code_outline: '{\n  "path": "src-tauri/src/oauth.rs",\n  "max_symbols": 60\n}',
+          git_ops: '{\n  "op": "status"\n}',
+        };
+        $("sim-tool-select").addEventListener("change", (e) => {
+          $("sim-args-input").value = simDefaultArgs[e.target.value] || "{}";
+        });
+        $("btn-oauth-deny").addEventListener("click", () => {
+          void closeTopLayer($("oauth-consent-dialog"));
+          pushToast("Permintaan OAuth ditolak.", "warn");
+        });
+        $("btn-oauth-once").addEventListener("click", () => {
+          void closeTopLayer($("oauth-consent-dialog"));
+          pushToast("OAuth disetujui sekali.");
+        });
+        $("btn-oauth-trust").addEventListener("click", () => {
+          void closeTopLayer($("oauth-consent-dialog"));
+          pushToast("OAuth disetujui dan dipercaya permanen.");
+        });
+
+        // --- View 3: Hub & Tools Simulator ---
+        $("btn-add-mcp").addEventListener("click", () => $("add-mcp-dialog").showModal());
+        $("btn-cancel-add-mcp").addEventListener("click", () => void closeTopLayer($("add-mcp-dialog")));
+        $("mcp-transport").addEventListener("change", (e) => {
+          const isStdio = e.target.value === "stdio";
+          $("mcp-http-fields").hidden = isStdio;
+          $("mcp-stdio-fields").hidden = !isStdio;
+        });
+        $("add-mcp-form").addEventListener("submit", (e) => {
+          e.preventDefault();
+          const name = $("mcp-name").value.trim() || "Custom MCP";
+          const ns = $("mcp-namespace").value.trim() || "custom";
+          const tr = $("mcp-transport").value.toUpperCase();
+          const row = document.createElement("tr");
+          row.innerHTML = `<td></td><td><code></code></td><td></td><td>4</td><td><span class="badge badge-ok">Connected</span></td><td><button type="button" class="btn btn-secondary btn-xs">Refresh</button></td>`;
+          row.children[0].textContent = name;
+          row.children[1].firstChild.textContent = `${ns}__`;
+          row.children[2].textContent = tr;
+          $("mcp-hub-body").prepend(row);
+          $("add-mcp-form").reset();
+          void closeTopLayer($("add-mcp-dialog"));
+          pushToast(`Downstream MCP '${name}' terhubung.`);
+        });
+
+        const simSamples = {
+          project_overview: `{
+  "root": "D:\\\\tauri-mcp-hub",
+  "git_branch": "main",
+  "entries": ["src/ (11 files)", "src-tauri/src/ (17 modules)", "design-system/airlock/"],
+  "tokens_saved": 840
+}`,
+          smart_search: `src-tauri/src/oauth.rs:248  verify_pkce(&code.challenge, verifier)
+src-tauri/src/oauth.rs:312  issue_access_token(&client, scope)
+[2 matches across 1 file · binary/target excluded · saved ~1,120 tok]`,
+          code_outline: `src-tauri/src/oauth.rs:
+  fn handle_oauth_protected_resource (L21)
+  fn handle_oauth_authorize (L118)
+  fn handle_oauth_token (L234)
+  fn verify_pkce (L302)`,
+          git_ops: `M  design-system/airlock/tokens.css
+M  design-system/airlock/MASTER.md
+M  design-system/airlock/preview.html`,
+        };
+
+        $("btn-run-sim").addEventListener("click", () => {
+          const tool = $("sim-tool-select").value;
+          $("sim-output").textContent = simSamples[tool] || "OK";
+          bumpSavings(420, 0);
+          pushToast(`Tool ${tool} selesai dieksekusi (+420 tok saved).`);
+        });
+
+        $("btn-copy-sim-rpc").addEventListener("click", () => {
+          pushToast("JSON-RPC payload simulator disalin.");
+        });
+
+        // --- View 4: Live Monitor & Payload Inspector ---
+        const trafficData = [
+          {
+            time: "12:41:08",
+            method: "POST",
+            path: "/mcp (tools/call: surgical_edit)",
+            status: 200,
+            dur: "18 ms",
+            note: "Saved ~640 tok",
+            req: '{\n  "jsonrpc": "2.0",\n  "method": "tools/call",\n  "params": { "name": "surgical_edit", "arguments": { "path": "src-tauri/src/oauth.rs" } }\n}',
+            res: '{\n  "jsonrpc": "2.0",\n  "result": { "applied": 1, "snapshot_id": "snap_84f1" }\n}',
+          },
+          {
+            time: "12:40:51",
+            method: "POST",
+            path: "/mcp (resources/read)",
+            status: 200,
+            dur: "6 ms",
+            note: "workspace://git/diff",
+            req: '{\n  "jsonrpc": "2.0",\n  "method": "resources/read",\n  "params": { "uri": "workspace://git/diff" }\n}',
+            res: '{\n  "jsonrpc": "2.0",\n  "result": { "contents": [{ "mimeType": "text/plain", "text": "+4 / -2 diff truncated" }] }\n}',
+          },
+          {
+            time: "12:39:14",
+            method: "POST",
+            path: "/oauth/token",
+            status: 200,
+            dur: "42 ms",
+            note: "PKCE verified",
+            req: '{\n  "grant_type": "authorization_code",\n  "code": "[REDACTED]",\n  "code_verifier": "[REDACTED]"\n}',
+            res: '{\n  "access_token": "[REDACTED]",\n  "token_type": "Bearer",\n  "expires_in": 3600\n}',
+          },
+          {
+            time: "12:38:03",
+            method: "POST",
+            path: "/mcp (tools/call: read_file_range)",
+            status: 403,
+            dur: "2 ms",
+            note: "Blocked by Sensitive Guard (.env)",
+            req: '{\n  "jsonrpc": "2.0",\n  "method": "tools/call",\n  "params": { "name": "read_file_range", "arguments": { "path": ".env" } }\n}',
+            res: '{\n  "error": { "code": -32001, "message": "Access denied by Sensitive File Guard (.env)" }\n}',
+          },
+        ];
+
+        function renderTraffic() {
+          const q = $("traffic-filter-input").value.trim().toLowerCase();
+          const st = $("traffic-status-filter").value;
+          const filtered = trafficData.filter((row) => {
+            if (st === "2xx" && (row.status < 200 || row.status >= 300)) return false;
+            if (st === "err" && row.status < 400) return false;
+            if (!q) return true;
+            return `${row.method} ${row.path} ${row.note}`.toLowerCase().includes(q);
+          });
+
+          $("traffic-count-label").textContent = `${filtered.length} requests`;
+          const body = $("http-traffic-body");
+          body.innerHTML = "";
+          filtered.forEach((row) => {
+            const tr = document.createElement("tr");
+            tr.className = "row-clickable";
+            tr.tabIndex = 0;
+            const stClass = row.status >= 400 ? "badge-danger" : "badge-ok";
+            tr.innerHTML = `<td></td><td></td><td></td><td><span class="badge ${stClass}"></span></td><td></td><td></td>`;
+            tr.children[0].textContent = row.time;
+            tr.children[1].textContent = row.method;
+            tr.children[2].textContent = row.path;
+            tr.children[3].firstChild.textContent = String(row.status);
+            tr.children[4].textContent = row.dur;
+            tr.children[5].textContent = row.note;
+
+            const openInsp = () => {
+              $("traffic-insp-meta").textContent = `${row.time} · ${row.method} ${row.path} · HTTP ${row.status} (${row.dur})`;
+              $("traffic-insp-req").textContent = row.req;
+              $("traffic-insp-res").textContent = row.res;
+              $("traffic-inspector-dialog").showModal();
+            };
+            tr.addEventListener("click", openInsp);
+            tr.addEventListener("keydown", (ev) => {
+              if (ev.key === "Enter" || ev.key === " ") {
+                ev.preventDefault();
+                openInsp();
+              }
+            });
+            body.appendChild(tr);
+          });
+        }
+
+        $("traffic-filter-input").addEventListener("input", renderTraffic);
+        $("traffic-status-filter").addEventListener("change", renderTraffic);
+        $("btn-clear-traffic").addEventListener("click", () => {
+          trafficData.length = 0;
+          renderTraffic();
+          pushToast("Riwayat traffic dibersihkan.");
+        });
+        $("btn-close-traffic-insp").addEventListener("click", () => void closeTopLayer($("traffic-inspector-dialog")));
+        $("btn-copy-insp-req").addEventListener("click", () => pushToast("Request payload disalin."));
+        $("btn-copy-insp-res").addEventListener("click", () => pushToast("Response payload disalin."));
+
+        document.querySelectorAll(".open-job-logs-btn").forEach((b) => {
+          b.addEventListener("click", () => $("job-logs-dialog").showModal());
+        });
+        $("btn-close-job-logs").addEventListener("click", () => void closeTopLayer($("job-logs-dialog")));
+
+        // --- View 5: Diff & Audit ---
+        const auditEntries = [
+          {
+            id: "a1",
+            tool: "surgical_edit",
+            source: "LocalAgent",
+            time: "12:38:21",
+            path: "src-tauri/src/oauth.rs",
+            summary: "Enforce standard invalid_grant on empty PKCE verifier",
+            group: "turn-042",
+            revertable: true,
+            reverted: false,
+            saved: 680,
+            diff: `@@ -246,4 +246,6 @@ fn handle_oauth_token(req: TokenRequest)\n     let verifier = req.code_verifier.trim();\n-    if !verify_pkce(&code.challenge, verifier) {\n-        return internal_err("pkce mismatch");\n+    if verifier.is_empty() || !verify_pkce(&code.challenge, verifier) {\n+        return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "PKCE verification failed");\n     }`,
+          },
+          {
+            id: "a2",
+            tool: "write_file_jailed",
+            source: "LocalAgent",
+            time: "12:36:05",
+            path: "src-tauri/tests/oauth_pkce.rs",
+            summary: "Add negative test for empty code_verifier",
+            group: "turn-042",
+            revertable: true,
+            reverted: false,
+            saved: 410,
+            diff: `@@ -0,0 +1,5 @@\n+#[test]\n+fn rejects_empty_pkce_verifier() {\n+    let res = verify_pkce("challenge", "");\n+    assert!(!res);\n+}`,
+          },
+          {
+            id: "a3",
+            tool: "surgical_edit",
+            source: "WebMCP",
+            time: "12:24:40",
+            path: "src/views/bridge.ts",
+            summary: "Redact bearer token prefix in preset preview",
+            group: null,
+            revertable: true,
+            reverted: false,
+            saved: 520,
+            diff: `@@ -64,2 +64,2 @@ function renderSecrets(snap)\n-  tokenEl.textContent = snap.auth_token;\n+  tokenEl.textContent = secretsVisible ? snap.auth_token : maskToken(snap.auth_token);`,
+          },
+          {
+            id: "a4",
+            tool: "run_command_compressed",
+            source: "Simulator",
+            time: "12:18:10",
+            path: null,
+            summary: "cargo check --tests (exit 0, 18 lines compressed)",
+            group: null,
+            revertable: false,
+            reverted: false,
+            saved: 960,
+            diff: `Finished dev profile [unoptimized + debuginfo] target(s) in 1.42s`,
+          },
+        ];
+
+        let selectedAuditId = "a1";
+
+        function renderAudit() {
+          const q = $("audit-search-input").value.trim().toLowerCase();
+          const src = $("audit-source-filter").value;
+          const revOnly = $("audit-revertable-only").checked;
+
+          const filtered = auditEntries.filter((e) => {
+            if (src !== "ALL" && e.source !== src) return false;
+            if (revOnly && !(e.revertable && !e.reverted)) return false;
+            if (!q) return true;
+            return `${e.tool} ${e.path || ""} ${e.summary}`.toLowerCase().includes(q);
+          });
+
+          const list = $("audit-list");
+          list.innerHTML = "";
+          filtered.forEach((entry) => {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = `audit-item ${entry.id === selectedAuditId ? "selected" : ""}`;
+            const top = document.createElement("div");
+            top.className = "audit-item-top";
+            const tName = document.createElement("span");
+            tName.style.color = "var(--accent-fg)";
+            tName.style.fontWeight = "600";
+            tName.textContent = `${entry.tool} [${entry.source}]`;
+            const tTime = document.createElement("span");
+            tTime.style.color = entry.reverted ? "var(--status-warn)" : "var(--text-muted)";
+            tTime.textContent = entry.reverted ? "REVERTED" : entry.time;
+            top.append(tName, tTime);
+
+            const sum = document.createElement("div");
+            sum.style.fontSize = "12px";
+            sum.style.color = "var(--text-secondary)";
+            sum.textContent = entry.path ? `${entry.path} — ${entry.summary}` : entry.summary;
+
+            btn.append(top, sum);
+            if (entry.group) {
+              const pill = document.createElement("span");
+              pill.className = "badge badge-muted";
+              pill.style.alignSelf = "flex-start";
+              pill.textContent = entry.group;
+              btn.appendChild(pill);
+            }
+            btn.addEventListener("click", () => {
+              selectedAuditId = entry.id;
+              renderAudit();
+            });
+            list.appendChild(btn);
+          });
+
+          const sel = auditEntries.find((e) => e.id === selectedAuditId) || filtered[0];
+          if (sel) renderDiff(sel);
+        }
+
+        function renderDiff(entry) {
+          $("diff-title").textContent = entry.path ? `${entry.tool}: ${entry.path}` : entry.tool;
+          $("diff-meta").textContent = `${entry.time} · ${entry.summary} · Hemat ~${entry.saved} tok`;
+          $("btn-revert-selected").disabled = !(entry.revertable && !entry.reverted);
+          $("btn-revert-group").hidden = !entry.group;
+          $("btn-open-vscode").disabled = !entry.path;
+          $("btn-open-explorer").disabled = !entry.path;
+
+          const viewer = $("diff-viewer");
+          viewer.innerHTML = "";
+          entry.diff.split("\n").forEach((line, idx) => {
+            const row = document.createElement("div");
+            row.className = "diff-line";
+            if (line.startsWith("+") && !line.startsWith("+++")) row.classList.add("diff-add");
+            else if (line.startsWith("-") && !line.startsWith("---")) row.classList.add("diff-del");
+            else if (line.startsWith("@@")) row.classList.add("diff-hunk");
+
+            const ln = document.createElement("span");
+            ln.className = "diff-ln";
+            ln.textContent = line.startsWith("@@") ? "..." : String(idx + 1);
+            const code = document.createElement("span");
+            code.textContent = line;
+            row.append(ln, code);
+            viewer.appendChild(row);
+          });
+        }
+
+        $("audit-search-input").addEventListener("input", renderAudit);
+        $("audit-source-filter").addEventListener("change", renderAudit);
+        $("audit-revertable-only").addEventListener("change", renderAudit);
+
+        $("btn-revert-selected").addEventListener("click", () => {
+          const sel = auditEntries.find((e) => e.id === selectedAuditId);
+          if (!sel) return;
+          sel.reverted = true;
+          renderAudit();
+          pushToast(`File ${sel.path} di-revert ke snapshot sebelumnya.`, "warn");
+        });
+
+        $("btn-revert-group").addEventListener("click", () => {
+          auditEntries.forEach((e) => {
+            if (e.group === "turn-042") e.reverted = true;
+          });
+          renderAudit();
+          pushToast("Seluruh perubahan pada Turn Group turn-042 di-revert.", "warn");
+        });
+
+        // --- Accent Preview Switcher (Mint <-> Cyan) ---
+        function setAccent(nextAccent) {
+          document.documentElement.dataset.accent = nextAccent;
+          $("accent-name-label").textContent = nextAccent === "cyan" ? "Ice Cyan" : "Electric Mint";
+          pushToast(`Accent Obsidian Studio: ${nextAccent === "cyan" ? "Ice Cyan" : "Electric Mint"}`);
+        }
+
+        $("btn-toggle-accent").addEventListener("click", () => {
+          const cur = document.documentElement.dataset.accent === "cyan" ? "cyan" : "mint";
+          setAccent(cur === "cyan" ? "mint" : "cyan");
+        });
+
+        // --- Command Palette (Ctrl+K) ---
+        const paletteActions = [
+          { label: "Buka View: Local Agent", hint: "Ctrl+1", run: () => switchView("agent") },
+          { label: "Buka View: MCP Bridge & Security", hint: "Ctrl+2", run: () => switchView("bridge") },
+          { label: "Buka View: Hub & Tools", hint: "Ctrl+3", run: () => switchView("hub") },
+          { label: "Buka View: Live Monitor", hint: "Ctrl+4", run: () => switchView("monitor") },
+          { label: "Buka View: Diff & Audit", hint: "Ctrl+5", run: () => switchView("audit") },
+          { label: "Toggle Left Sidebar Rail", hint: "[", run: toggleRail },
+          { label: "Switch Accent: Electric Mint", hint: "Theme", run: () => setAccent("mint") },
+          { label: "Switch Accent: Ice Cyan", hint: "Theme", run: () => setAccent("cyan") },
+          { label: "Preview OAuth Consent Modal", hint: "Security", run: () => $("oauth-consent-dialog").showModal() },
+          { label: "Jalankan MCP Self-Diagnostic", hint: "Test", run: () => $("diagnostic-dialog").showModal() },
+        ];
+
+        let selectedPaletteIdx = 0;
+        let filteredPalette = [...paletteActions];
+
+        function renderPalette() {
+          const box = $("palette-results");
+          box.innerHTML = "";
+          if (selectedPaletteIdx >= filteredPalette.length) selectedPaletteIdx = 0;
+          filteredPalette.forEach((act, idx) => {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = `palette-item ${idx === selectedPaletteIdx ? "selected" : ""}`;
+            const l = document.createElement("span");
+            l.textContent = act.label;
+            const h = document.createElement("kbd");
+            h.textContent = act.hint;
+            btn.append(l, h);
+            btn.addEventListener("click", () => {
+              void closeTopLayer($("command-palette-dialog"));
+              act.run();
+            });
+            box.appendChild(btn);
+          });
+        }
+
+        function openPalette() {
+          const inp = $("palette-search-input");
+          inp.value = "";
+          filteredPalette = [...paletteActions];
+          selectedPaletteIdx = 0;
+          renderPalette();
+          $("command-palette-dialog").showModal();
+          inp.focus();
+        }
+
+        $("btn-open-palette").addEventListener("click", openPalette);
+        $("btn-close-palette").addEventListener("click", () => void closeTopLayer($("command-palette-dialog")));
+
+        $("palette-search-input").addEventListener("input", (e) => {
+          const q = e.target.value.trim().toLowerCase();
+          filteredPalette = q
+            ? paletteActions.filter((a) => `${a.label} ${a.hint}`.toLowerCase().includes(q))
+            : [...paletteActions];
+          selectedPaletteIdx = 0;
+          renderPalette();
+        });
+
+        $("palette-search-input").addEventListener("keydown", (e) => {
+          if (e.key === "ArrowDown" && filteredPalette.length) {
+            e.preventDefault();
+            selectedPaletteIdx = (selectedPaletteIdx + 1) % filteredPalette.length;
+            renderPalette();
+          } else if (e.key === "ArrowUp" && filteredPalette.length) {
+            e.preventDefault();
+            selectedPaletteIdx = (selectedPaletteIdx - 1 + filteredPalette.length) % filteredPalette.length;
+            renderPalette();
+          } else if (e.key === "Enter" && filteredPalette[selectedPaletteIdx]) {
+            e.preventDefault();
+            const act = filteredPalette[selectedPaletteIdx];
+            void closeTopLayer($("command-palette-dialog"));
+            act.run();
+          }
+        });
+
+        // --- Global Shortcuts ---
+        document.addEventListener("keydown", (e) => {
+          if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+            e.preventDefault();
+            openPalette();
+            return;
+          }
+          const tabMap = { "1": "agent", "2": "bridge", "3": "hub", "4": "monitor", "5": "audit" };
+          if ((e.ctrlKey || e.metaKey) && tabMap[e.key]) {
+            e.preventDefault();
+            switchView(tabMap[e.key]);
+            return;
+          }
+          const tag = document.activeElement?.tagName;
+          if (e.key === "[" && tag !== "INPUT" && tag !== "TEXTAREA") {
+            toggleRail();
+          }
+        });
+
+        window.addEventListener("resize", () => {
+          positionGuardrailGlider();
+          syncRailIndicator();
+        });
+
+        // --- Initial Hydrate ---
+        renderTraffic();
+        renderAudit();
+        renderSecrets();
+        syncServerUi();
+        requestAnimationFrame(() => {
+          positionGuardrailGlider();
+          syncRailIndicator();
+        });
+      })();
+    </script>
+  </body>
+</html>
