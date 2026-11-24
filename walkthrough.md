@@ -6,9 +6,10 @@ Dokumen ini merangkum cara menjalankan, menguji langsung seluruh kemampuan MCP/A
 
 ## 1. Status Build & Verifikasi Terakhir
 
-- **Rust Test Suite (`cd src-tauri; cargo test`)**: `70 passed; 0 failed` (**0 compiler warnings**)
-- **Frontend Check & Build (`npx tsc --noEmit` & `npm run build`)**: lolos (`✓ built`)
+- **Rust Test Suite (`Set-Location d:\tauri-mcp-hub\src-tauri; cargo test`)**: `76 passed; 0 failed` (**0 compiler warnings**)
+- **Frontend Check & Build (`npm run build` — `tsc && vite build`)**: lolos (`✓ built`)
 - **Total Built-in MCP Tools**: `28` tool aktif
+- **Catatan Windows GNU Toolchain**: Selalu jalankan `cargo` dari direktori `d:\tauri-mcp-hub\src-tauri` agar `.cargo/config.toml` terbaca (menghindari error linker `-lgcc_eh`).
 
 ---
 
@@ -195,9 +196,15 @@ git commit -m "feat: complete Airlock Waves 1-5B (security hardening, multi-work
 
 ---
 
-## 6. Pengingat Audit untuk Sesi Selanjutnya
+## 6. Pembaruan Audit, Reliabilitas & Sisa Backlog
 
-Dua temuan audit awal yang sengaja ditunda dari roadmap utama sudah dicatat di memori persisten (`Airlock_NextSession_Audit_FollowUp`) untuk dikerjakan di sesi berikutnya bila Anda mau:
+Status tindak lanjut pasca-Gelombang 1–5B:
 
-1. **F-06 (Command Execution Policy Hardening)** di [security.rs](src-tauri/src/security.rs): penambahan mode policy allowlist / pembatasan metakarakter shell yang lebih ketat di atas blocklist regex saat ini.
-2. **F-10 Sisa Refactoring Modularitas**: memecah dua modul Rust berukuran besar yang tersisa ([providers.rs](src-tauri/src/providers.rs) dan [mcp_server.rs](src-tauri/src/mcp_server.rs)) menjadi submodul terfokus seperti pola `src-tauri/src/tools/`.
+1. **F-06 (Command Execution Policy Hardening)** — **Selesai**: Mode `guarded`, `allowlist` (blokir chaining/metakarakter & validasi prefix), dan `hitl` (Always HITL di semua mode), beserta deobfuscation di [security.rs](src-tauri/src/security.rs) dan kontrol UI di tab **MCP Bridge**.
+2. **Studi & Perbaikan Reliabilitas Eksekusi (Tahap A–C)** — **Selesai**:
+   - **Live Job Observability**: Tick `1s` backend (`job-updated`), in-place row patching di Live Monitor, indikator global `#statusbar-jobs-pill`, preview baris terakhir (`↳ ...`), dan modal *Live Logs* berbasis `get_background_job_logs_delta` dengan *Auto-scroll* dan tombol *Stop Job*.
+   - **Gemini Web & Windows Hardening**: Environment non-interaktif bersama (`build_shell_command`), adaptive long-poll `wait_secs` (default `12s` untuk `WebMCP`) di `poll_command_job`, detektor file lock / prompt / hening `>= 25s` (`STALL_WARNING:`), serta grace window +70s untuk popup HITL di `mcp_server.rs`.
+   - **Dokumentasi Studi & Checklist Uji**: Tersimpan di `.gemini/Findings/realworld-edge-cases-reliability-study.md` (jangan ikut di-stage ke Git).
+3. **F-10 Sisa Refactoring Modularitas** — **Selesai**: Memecah dua modul Rust berukuran besar yang tersisa menjadi submodul terfokus seperti pola `src-tauri/src/tools/`:
+   - `src-tauri/src/providers/` (`mod.rs`, `common.rs`, `openai.rs`, `anthropic.rs`, `tests.rs`)
+   - `src-tauri/src/mcp_server/` (`mod.rs`, `auth.rs`, `rpc.rs`, `http.rs`, `tests.rs`)
