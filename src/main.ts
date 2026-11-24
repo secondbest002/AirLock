@@ -62,6 +62,7 @@ import {
   enqueueMcpElicitation,
   enqueueOAuthConsent,
   enqueueToolApproval,
+  handleJobUpdatedForModal,
   handleMcpElicitationResolvedEvent,
   handleOAuthResolvedEvent,
   handleToolApprovalResolvedEvent,
@@ -498,6 +499,13 @@ async function init(): Promise<void> {
     setAccentTheme(cur === "cyan" ? "mint" : "cyan");
   });
 
+  $("statusbar-jobs-pill").addEventListener("click", () => {
+    switchTab("monitor");
+    document
+      .getElementById("jobs-monitor-card")
+      ?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  });
+
   $("rail-server-toggle").addEventListener("click", async () => {
     try {
       const running = currentSnapshot?.server_running ?? false;
@@ -662,6 +670,7 @@ async function init(): Promise<void> {
 
   await listen<JobSummary>("job-updated", (event) => {
     updateJobIncremental(currentSnapshot, event.payload, renderSnapshot);
+    handleJobUpdatedForModal(event.payload);
   });
 
   await listen<AgentStepV2Payload>("agent-step-v2", (event) => {

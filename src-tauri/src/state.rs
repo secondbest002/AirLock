@@ -250,6 +250,8 @@ pub struct DashboardSnapshot {
     pub close_to_tray: bool,
     pub allow_sensitive_reads: bool,
     pub guardrail_mode: String,
+    pub command_execution_policy: String,
+    pub command_allowlist: Vec<String>,
     pub recent_workspaces: Vec<String>,
     pub pinned_workspaces: Vec<String>,
     pub git_branch: Option<String>,
@@ -972,6 +974,14 @@ impl AppState {
         Self::write_persisted_auth_file(path, &payload);
     }
 
+    pub async fn command_policy_and_allowlist(&self) -> (String, Vec<String>) {
+        let cfg = self.config.read().await;
+        (
+            cfg.command_execution_policy.clone(),
+            cfg.command_allowlist.clone(),
+        )
+    }
+
     pub async fn save_config_state(&self) {
         let tunnel_provider = self.tunnel_provider.read().await.clone();
         let gemini_model = self.gemini_config.read().await.model.clone();
@@ -1127,6 +1137,8 @@ impl AppState {
             agent_max_steps,
             agent_turn_timeout_secs,
             stream_idle_timeout_secs,
+            command_execution_policy,
+            command_allowlist,
         ) = {
             let cfg = self.config.read().await;
             (
@@ -1144,6 +1156,8 @@ impl AppState {
                 cfg.agent_max_steps,
                 cfg.agent_turn_timeout_secs,
                 cfg.stream_idle_timeout_secs,
+                cfg.command_execution_policy.clone(),
+                cfg.command_allowlist.clone(),
             )
         };
         let state_default_id = self.default_workspace_id.read().await.clone();
@@ -1309,6 +1323,8 @@ impl AppState {
             close_to_tray: self.close_to_tray.load(Ordering::SeqCst),
             allow_sensitive_reads: self.allow_sensitive_reads.load(Ordering::SeqCst),
             guardrail_mode,
+            command_execution_policy,
+            command_allowlist,
             recent_workspaces,
             pinned_workspaces,
             git_branch,

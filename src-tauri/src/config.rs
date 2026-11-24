@@ -22,6 +22,14 @@ fn default_guardrail_mode() -> String {
     "autonomous".to_string()
 }
 
+fn default_command_execution_policy() -> String {
+    "guarded".to_string()
+}
+
+fn default_command_allowlist() -> Vec<String> {
+    crate::security::default_command_allowlist()
+}
+
 fn default_agent_provider() -> String {
     "gemini".to_string()
 }
@@ -127,6 +135,10 @@ pub struct AppConfig {
     pub allow_sensitive_reads: bool,
     #[serde(default = "default_guardrail_mode")]
     pub guardrail_mode: String,
+    #[serde(default = "default_command_execution_policy")]
+    pub command_execution_policy: String,
+    #[serde(default = "default_command_allowlist")]
+    pub command_allowlist: Vec<String>,
     #[serde(default = "default_agent_provider")]
     pub agent_provider: String,
     #[serde(default = "default_openai_base_url")]
@@ -178,6 +190,8 @@ impl Default for AppConfig {
             sensitive_deny_patterns: default_sensitive_patterns(),
             allow_sensitive_reads: false,
             guardrail_mode: default_guardrail_mode(),
+            command_execution_policy: default_command_execution_policy(),
+            command_allowlist: default_command_allowlist(),
             agent_provider: default_agent_provider(),
             openai_base_url: default_openai_base_url(),
             openai_model: default_openai_model(),
@@ -314,6 +328,8 @@ mod tests {
         cfg.gemini_model = "gemini-2.5-pro".to_string();
         cfg.allow_sensitive_reads = true;
         cfg.guardrail_mode = "safe_edit".to_string();
+        cfg.command_execution_policy = "allowlist".to_string();
+        cfg.command_allowlist = vec!["cargo".to_string(), "git status".to_string()];
         cfg.agent_provider = "openai_compat".to_string();
         cfg.cloudflare_tunnel_token = "eyJ_secret_cf_token".to_string();
         cfg.cloudflare_public_url = "https://mcp.example.dev".to_string();
@@ -335,6 +351,8 @@ mod tests {
         assert_eq!(loaded.gemini_model, "gemini-2.5-pro");
         assert!(loaded.allow_sensitive_reads);
         assert_eq!(loaded.guardrail_mode, "safe_edit");
+        assert_eq!(loaded.command_execution_policy, "allowlist");
+        assert_eq!(loaded.command_allowlist, vec!["cargo".to_string(), "git status".to_string()]);
         assert_eq!(loaded.agent_provider, "openai_compat");
         assert_eq!(loaded.cloudflare_tunnel_token, "eyJ_secret_cf_token");
         assert_eq!(loaded.cloudflare_public_url, "https://mcp.example.dev");

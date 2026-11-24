@@ -4,7 +4,7 @@ use super::guardrail::{
 };
 use super::shell::run_shell_raw;
 use crate::jobs;
-use crate::security::{compress_output, resolve_jailed_path, validate_command};
+use crate::security::{compress_output, resolve_jailed_path, validate_command_with_policy};
 use crate::state::{AppState, AuditEntry};
 use crate::tools_extra::extract_outline_text;
 use crate::workspace::{
@@ -876,7 +876,8 @@ pub(crate) async fn exec_patch_and_verify(
 
     let target = resolve_jailed_path(&ws.canon_root, rel_path)?;
     check_sensitive_guard_for_workspace(state, ws, &target, rel_path).await?;
-    validate_command(verify_cmd)?;
+    let (cmd_policy, cmd_allowlist) = state.command_policy_and_allowlist().await;
+    validate_command_with_policy(verify_cmd, &cmd_policy, &cmd_allowlist)?;
 
     let prep = prepare_surgical_edits(rel_path, target, edits_val)?;
     apply_prepared_edit(&prep)?;
@@ -956,7 +957,7 @@ pub(crate) async fn exec_patch_and_verify(
         };
 
         return Ok(format!(
-            "PATCH DIFF ({rel_path}):\n{}\nAUTO_PROMOTED_VERIFY_JOB\nJOB_ID: {}\nWORKSPACE: @{}\nSTATUS: running\nELAPSED: {}s\nNEXT_FROM_LINE: {}\nHINT: Patch was applied and recorded for rollback. Verification exceeded {}s sync window and continues in background; call poll_command_job(job_id=\"{}\", from_line={}).\nRECENT OUTPUT:\n{}",
+            "PATCH DIFF ({rel_path}):\n{}\nAUTO_PROMOTED_VERIFY_JOB\nJOB_ID: {}\nWORKSPACE: @{}\nSTATUS: running\nELAPSED: {}s\nNEXT_FROM_LINE: {}\nHINT: Patch was applied and recorded for rollback. Verification exceeded {}s sync window and continues in background; call poll_command_job(job_id=\"{}\", from_line={}) (it automatically long-polls up to 12s; do NOT run sleep).\nRECENT OUTPUT:\n{}",
             prep.diff_text,
             summary.job_id,
             ws.alias,

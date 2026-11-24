@@ -1,38 +1,19 @@
 use crate::jobs;
-use crate::process_util::ChildTreeGuard;
-use crate::security::{compress_output, validate_command};
+use crate::process_util::{build_shell_command, ChildTreeGuard};
+use crate::security::{compress_output, validate_command_with_policy};
 use crate::state::{AppState, AuditEntry};
 use crate::workspace::ResolvedWorkspace;
 use serde_json::Value;
 use std::path::Path;
-use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 
 pub(crate) async fn run_shell_raw(
     root: &Path,
     command: &str,
     timeout_secs: u64,
 ) -> Result<(i32, String, String), String> {
-    let mut cmd = if cfg!(target_os = "windows") {
-        let mut c = Command::new("cmd.exe");
-        c.args(["/C", command]);
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.args(["-c", command]);
-        c
-    };
-
-    let clean_cwd = crate::workspace::clean_path_string(root);
-    cmd.current_dir(&clean_cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(0x08000000);
+    let mut cmd = build_shell_command(root, command);
 
     let mut child = cmd
         .spawn()
@@ -104,7 +85,8 @@ pub(crate) async fn exec_run_command(
         .get("command")
         .and_then(|v| v.as_str())
         .ok_or("Argumen 'command' wajib diisi.")?;
-    validate_command(command)?;
+    let (cmd_policy, cmd_allowlist) = state.command_policy_and_allowlist().await;
+    validate_command_with_policy(command, &cmd_policy, &cmd_allowlist)?;
 
     let max_lines = args
         .get("max_lines")
@@ -220,7 +202,7 @@ pub(crate) async fn exec_run_command(
             .await;
 
         return Ok(format!(
-            "AUTO_PROMOTED_TO_BACKGROUND_JOB\nJOB_ID: {}\nWORKSPACE: @{}\nSTATUS: running\nELAPSED: {}s\nNEXT_FROM_LINE: {}\nHINT: Command exceeded {}s sync window and is continuing in background. Call poll_command_job(job_id=\"{}\", from_line={}) to check completion, or stop_command_job(job_id=\"{}\") to cancel.\nRECENT OUTPUT:\n{}",
+            "AUTO_PROMOTED_TO_BACKGROUND_JOB\nJOB_ID: {}\nWORKSPACE: @{}\nSTATUS: running\nELAPSED: {}s\nNEXT_FROM_LINE: {}\nHINT: Command exceeded {}s sync window and is continuing in background. Call poll_command_job(job_id=\"{}\", from_line={}) (it automatically long-polls up to 12s; do NOT run sleep), or stop_command_job(job_id=\"{}\") to cancel.\nRECENT OUTPUT:\n{}",
             summary.job_id,
             ws.alias,
             elapsed,

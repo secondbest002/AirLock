@@ -1,5 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
-import { closeTopLayer, copyToClipboard, $, setToast, setupDialogLightDismiss } from "../dom";
+import {
+  $,
+  closeTopLayer,
+  copyToClipboard,
+  formatDurationCompact,
+  setToast,
+  setupDialogLightDismiss,
+} from "../dom";
 import { generateClientPreset } from "../presets";
 import type {
   CommandPaletteAction,
@@ -9,6 +16,7 @@ import type {
   ElicitationAction,
   HooksStatusSummary,
   HttpTrafficEntry,
+  JobLogsDelta,
   JobSummary,
   PendingElicitation,
   PendingOAuthInfo,
@@ -31,6 +39,10 @@ const pendingElicitationQueue: PendingElicitation[] = [];
 let activeElicitationBindings: ElicitationFieldBinding[] = [];
 let elicitationSubmitting = false;
 let activeLogJobId: string | null = null;
+let activeLogNextLine = 0;
+let activeLogFetching = false;
+let activeLogPendingFetch = false;
+let activeLogPendingReset = false;
 let pendingForceRevertAuditId: string | null = null;
 let revertConflictConfirmHandler: ((auditId: string) => Promise<void>) | null = null;
 
@@ -907,23 +919,120 @@ export function openDiagnosticModal(report: DiagnosticReport): void {
   ($("diagnostic-dialog") as HTMLDialogElement).showModal();
 }
 
-async function refreshActiveJobLogs(): Promise<void> {
+function clearActiveJobLogsState(): void {
+  activeLogJobId = null;
+  activeLogNextLine = 0;
+  activeLogFetching = false;
+  activeLogPendingFetch = false;
+  activeLogPendingReset = false;
+}
+
+function updateJobLogsModalHeader(job: JobSummary): void {
+  $("job-logs-title").textContent = `Job Output: ${job.label || job.job_id}`;
+  const statusBadge = $("job-logs-status-badge");
+  statusBadge.className = `status-dot ${
+    job.status === "running"
+      ? "status-warn"
+      : job.status === "completed"
+        ? "status-online"
+        : "status-offline"
+  }`;
+  statusBadge.textContent = job.exit_code !== null ? `${job.status} (${job.exit_code})` : job.status;
+
+  const timeoutPart =
+    job.timeout_secs && job.timeout_secs > 0
+      ? ` / ${formatDurationCompact(job.timeout_secs)}`
+      : "";
+  const idlePart =
+    job.status === "running"
+      ? job.stall_hint
+        ? ` · ${job.stall_hint}`
+        : (job.idle_secs ?? 0) >= 10
+          ? ` · silent ${formatDurationCompact(job.idle_secs ?? 0)}`
+          : " · active"
+      : "";
+  $("job-logs-meta").textContent =
+    `${job.job_id} · ${job.command} · ${formatDurationCompact(job.elapsed_secs)}${timeoutPart} · ${job.line_count} lines${idlePart}`;
+
+  $("job-logs-stream-hint").textContent =
+    job.status === "running" ? "LIVE STREAM (AUTO-UPDATING)" : "FINAL OUTPUT";
+  ($("btn-stop-job-modal") as HTMLButtonElement).hidden = job.status !== "running";
+}
+
+export function handleJobUpdatedForModal(job: JobSummary): void {
+  if (activeLogJobId !== job.job_id) return;
+  updateJobLogsModalHeader(job);
+  if (job.line_count > activeLogNextLine || job.status !== "running") {
+    void refreshActiveJobLogs(false);
+  }
+}
+
+async function refreshActiveJobLogs(reset = false): Promise<void> {
   if (!activeLogJobId) return;
+  if (activeLogFetching) {
+    activeLogPendingFetch = true;
+    activeLogPendingReset = activeLogPendingReset || reset;
+    return;
+  }
+
+  const targetJobId = activeLogJobId;
+  const fromLine = reset ? 0 : activeLogNextLine;
+  activeLogFetching = true;
+
   try {
-    const raw = await invoke<string>("get_background_job_logs", { jobId: activeLogJobId });
-    $("job-logs-pre").textContent = raw || "(belum ada output)";
+    const delta = await invoke<JobLogsDelta>("get_background_job_logs_delta", {
+      jobId: targetJobId,
+      fromLine,
+    });
+    if (activeLogJobId !== targetJobId) return;
+
+    updateJobLogsModalHeader(delta.summary);
+
+    const pre = $("job-logs-pre");
+    if (reset || delta.truncated_earlier || fromLine === 0) {
+      pre.textContent =
+        delta.lines.length > 0 ? delta.lines.join("\n") : "(belum ada output log)";
+    } else if (delta.lines.length > 0) {
+      const existing = pre.textContent ?? "";
+      const isPlaceholder =
+        existing === "Memuat log..." || existing === "(belum ada output log)" || existing === "";
+      pre.textContent = isPlaceholder
+        ? delta.lines.join("\n")
+        : `${existing}\n${delta.lines.join("\n")}`;
+    }
+
+    activeLogNextLine = delta.next_from_line;
+    const autoScroll = ($("chk-job-logs-autoscroll") as HTMLInputElement).checked;
+    if (autoScroll) {
+      pre.scrollTop = pre.scrollHeight;
+    }
   } catch (err) {
-    $("job-logs-pre").textContent = `Gagal memuat log: ${String(err)}`;
+    if (activeLogJobId === targetJobId && fromLine === 0) {
+      $("job-logs-pre").textContent = `Gagal memuat log: ${String(err)}`;
+    }
+  } finally {
+    activeLogFetching = false;
+    if (activeLogPendingFetch && activeLogJobId === targetJobId) {
+      const nextReset = activeLogPendingReset;
+      activeLogPendingFetch = false;
+      activeLogPendingReset = false;
+      void refreshActiveJobLogs(nextReset);
+    } else {
+      activeLogPendingFetch = false;
+      activeLogPendingReset = false;
+    }
   }
 }
 
 export async function openJobLogsModal(job: JobSummary): Promise<void> {
   activeLogJobId = job.job_id;
-  $("job-logs-title").textContent = `Job Output: ${job.label || job.job_id}`;
-  $("job-logs-meta").textContent = `${job.job_id} · ${job.command} · Status: ${job.status} (${job.elapsed_secs}s)`;
+  activeLogNextLine = 0;
+  activeLogPendingFetch = false;
+  activeLogPendingReset = false;
+  updateJobLogsModalHeader(job);
   $("job-logs-pre").textContent = "Memuat log...";
   ($("job-logs-dialog") as HTMLDialogElement).showModal();
-  await refreshActiveJobLogs();
+  await refreshActiveJobLogs(true);
 }
 
 export function openAddMcpModal(): void {
@@ -1092,16 +1201,42 @@ export function initModals(
   });
 
   const jobLogsDialog = $("job-logs-dialog") as HTMLDialogElement;
-  $("btn-refresh-job-logs").addEventListener("click", () => void refreshActiveJobLogs());
+  $("btn-stop-job-modal").addEventListener("click", async () => {
+    const targetId = activeLogJobId;
+    if (!targetId) return;
+    const stopBtn = $("btn-stop-job-modal") as HTMLButtonElement;
+    stopBtn.disabled = true;
+    try {
+      await invoke("stop_background_job", { jobId: targetId });
+      const next = await invoke<DashboardSnapshot>("get_dashboard_state");
+      onSnapshot(next);
+      await refreshActiveJobLogs(false);
+      setToast(`Job ${targetId} dihentikan.`);
+    } catch (err) {
+      setToast(`Gagal stop job: ${String(err)}`, "warn");
+    } finally {
+      stopBtn.disabled = false;
+    }
+  });
+  $("btn-refresh-job-logs").addEventListener("click", () => void refreshActiveJobLogs(false));
+  $("chk-job-logs-autoscroll").addEventListener("change", (e) => {
+    if ((e.target as HTMLInputElement).checked) {
+      const pre = $("job-logs-pre");
+      pre.scrollTop = pre.scrollHeight;
+    }
+  });
   $("btn-copy-job-logs").addEventListener("click", () => {
     void copyToClipboard($("job-logs-pre").textContent ?? "", "Job Logs");
   });
   $("btn-close-job-logs").addEventListener("click", () => {
-    activeLogJobId = null;
+    clearActiveJobLogsState();
     void closeTopLayer(jobLogsDialog);
   });
+  jobLogsDialog.addEventListener("close", () => {
+    clearActiveJobLogsState();
+  });
   jobLogsDialog.addEventListener("cancel", () => {
-    activeLogJobId = null;
+    clearActiveJobLogsState();
   });
 
   const addMcpDialog = $("add-mcp-dialog") as HTMLDialogElement;

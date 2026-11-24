@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { $, copyToClipboard, maskToken, setToast } from "../dom";
+import { $, copyToClipboard, formatDurationCompact, maskToken, setToast } from "../dom";
 import { generateClientPreset, MCP_CLIENT_PRESETS } from "../presets";
 import type {
   DashboardSnapshot,
@@ -344,53 +344,79 @@ export function appendTunnelLogIncremental(
   pre.scrollTop = pre.scrollHeight;
 }
 
-function renderBackgroundJobs(
-  jobs: JobSummary[],
-  onSnapshot: (snap: DashboardSnapshot) => void
-): void {
-  const tbody = $("jobs-body") as HTMLTableSectionElement;
-  tbody.innerHTML = "";
-  if (jobs.length === 0) {
-    const tr = document.createElement("tr");
-    const td = document.createElement("td");
-    td.colSpan = 5;
-    td.className = "traffic-empty";
-    td.textContent = "Belum ada background command job yang dijalankan.";
-    tr.appendChild(td);
-    tbody.appendChild(tr);
-    return;
+const latestJobsById = new Map<string, JobSummary>();
+
+function renderStatusbarJobs(jobs: JobSummary[]): void {
+  const running = jobs.filter((j) => j.status === "running");
+  const pill = document.getElementById("statusbar-jobs-pill");
+  const pillText = document.getElementById("statusbar-jobs-text");
+  if (pill && pillText) {
+    pill.hidden = running.length === 0;
+    if (running.length > 0) {
+      const maxElapsed = Math.max(...running.map((j) => j.elapsed_secs));
+      const totalLines = running.reduce((sum, j) => sum + j.line_count, 0);
+      pillText.textContent =
+        running.length === 1
+          ? `1 job running · ${formatDurationCompact(maxElapsed)} · ${totalLines} lines`
+          : `${running.length} jobs running · ${formatDurationCompact(maxElapsed)} · ${totalLines} lines`;
+    }
   }
 
-  for (const job of jobs) {
-    const tr = document.createElement("tr");
+  const countBadge = document.getElementById("jobs-running-count");
+  if (countBadge) {
+    countBadge.textContent = `${running.length} active`;
+    countBadge.className = `badge ${running.length > 0 ? "badge-warn" : "badge-muted"}`;
+  }
+}
 
-    const tdId = document.createElement("td");
-    tdId.className = "mono-cell";
-    tdId.textContent = job.job_id;
+function patchJobRow(tr: HTMLTableRowElement, job: JobSummary): void {
+  const tdId = tr.cells[0];
+  tdId.textContent = job.job_id;
 
-    const tdCmd = document.createElement("td");
-    tdCmd.className = "mono-cell";
+  const tdCmd = tr.cells[1];
+  const cmdHeader = tdCmd.querySelector<HTMLElement>('[data-role="job-cmd-header"]');
+  const lastLineEl = tdCmd.querySelector<HTMLElement>('[data-role="job-last-line"]');
+  if (cmdHeader) {
+    cmdHeader.replaceChildren();
     const cmdText = job.label ? `${job.label} (${job.command})` : job.command;
     if (job.mcp_task_id) {
       const taskBadge = document.createElement("span");
       taskBadge.className = "badge badge-info mcp-task-badge";
       taskBadge.textContent = "MCP Task";
       taskBadge.title = `MCP Task: ${job.mcp_task_id}`;
-      tdCmd.appendChild(taskBadge);
-      tdCmd.appendChild(document.createTextNode(" "));
+      cmdHeader.appendChild(taskBadge);
+      cmdHeader.appendChild(document.createTextNode(" "));
     }
     if (job.workspace_alias) {
       const wsPill = document.createElement("span");
       wsPill.className = "audit-ws-pill";
       wsPill.textContent = `@${job.workspace_alias}`;
-      tdCmd.appendChild(wsPill);
-      tdCmd.appendChild(document.createTextNode(` ${cmdText}`));
-    } else {
-      tdCmd.appendChild(document.createTextNode(cmdText));
+      cmdHeader.appendChild(wsPill);
+      cmdHeader.appendChild(document.createTextNode(" "));
     }
+    const titleSpan = document.createElement("span");
+    titleSpan.className = "job-cmd-title";
+    titleSpan.textContent = cmdText;
+    cmdHeader.appendChild(titleSpan);
+  }
+  if (lastLineEl) {
+    const preview = job.last_line?.trim();
+    if (preview) {
+      lastLineEl.textContent = `↳ ${preview}`;
+      lastLineEl.title = preview;
+      lastLineEl.classList.remove("is-empty");
+    } else {
+      lastLineEl.textContent =
+        job.status === "running" ? "↳ (menunggu output...)" : "↳ (tanpa output)";
+      lastLineEl.title = "";
+      lastLineEl.classList.add("is-empty");
+    }
+  }
 
-    const tdStatus = document.createElement("td");
-    const badge = document.createElement("span");
+  const tdStatus = tr.cells[2];
+  const badge = tdStatus.querySelector<HTMLElement>('[data-role="job-status-badge"]');
+  const idleHint = tdStatus.querySelector<HTMLElement>('[data-role="job-idle-hint"]');
+  if (badge) {
     badge.className = `status-dot ${
       job.status === "running"
         ? "status-warn"
@@ -399,45 +425,205 @@ function renderBackgroundJobs(
           : "status-offline"
     }`;
     badge.textContent = job.exit_code !== null ? `${job.status} (${job.exit_code})` : job.status;
-    tdStatus.appendChild(badge);
-
-    const tdRuntime = document.createElement("td");
-    tdRuntime.className = "mono-cell";
-    tdRuntime.textContent = `${job.elapsed_secs}s · ${job.line_count} lines`;
-
-    const tdAction = document.createElement("td");
-    const actWrap = document.createElement("div");
-    actWrap.className = "btn-row";
-
-    const logsBtn = document.createElement("button");
-    logsBtn.type = "button";
-    logsBtn.className = "btn btn-secondary btn-xs";
-    logsBtn.textContent = "Logs";
-    logsBtn.addEventListener("click", () => void openJobLogsModal(job));
-    actWrap.appendChild(logsBtn);
-
-    if (job.status === "running") {
-      const stopBtn = document.createElement("button");
-      stopBtn.type = "button";
-      stopBtn.className = "btn btn-danger btn-xs";
-      stopBtn.textContent = "Stop";
-      stopBtn.addEventListener("click", async () => {
-        try {
-          await invoke("stop_background_job", { jobId: job.job_id });
-          const next = await invoke<DashboardSnapshot>("get_dashboard_state");
-          onSnapshot(next);
-          setToast(`Job ${job.job_id} dihentikan.`);
-        } catch (err) {
-          setToast(`Gagal stop job: ${String(err)}`);
-        }
-      });
-      actWrap.appendChild(stopBtn);
-    }
-
-    tdAction.appendChild(actWrap);
-    tr.append(tdId, tdCmd, tdStatus, tdRuntime, tdAction);
-    tbody.appendChild(tr);
   }
+  const idleSecs = job.idle_secs ?? 0;
+  const stallHint = job.stall_hint?.trim();
+  if (idleHint) {
+    if (job.status === "running") {
+      idleHint.hidden = false;
+      if (stallHint && idleSecs < 15) {
+        idleHint.textContent = "lock/prompt!";
+        idleHint.className = "job-idle-hint is-silent";
+        idleHint.title = stallHint;
+      } else if (idleSecs >= 15) {
+        idleHint.textContent = `silent ${formatDurationCompact(idleSecs)}`;
+        idleHint.className = "job-idle-hint is-silent";
+        idleHint.title =
+          stallHint ||
+          "Belum ada baris output baru — kemungkinan sedang kompilasi berat atau menunggu prompt.";
+      } else if (job.line_count > 0) {
+        idleHint.textContent = "active";
+        idleHint.className = "job-idle-hint is-active";
+        idleHint.title = `Output terakhir ${idleSecs}s lalu`;
+      } else {
+        idleHint.textContent = "starting";
+        idleHint.className = "job-idle-hint";
+        idleHint.title = "Proses baru dijalankan";
+      }
+    } else {
+      idleHint.hidden = true;
+      idleHint.textContent = "";
+    }
+  }
+
+  const tdRuntime = tr.cells[3];
+  const runtimeText = tdRuntime.querySelector<HTMLElement>('[data-role="job-runtime-text"]');
+  const progressTrack = tdRuntime.querySelector<HTMLElement>('[data-role="job-progress-track"]');
+  const progressFill = tdRuntime.querySelector<HTMLElement>('[data-role="job-progress-fill"]');
+  const timeoutSecs = job.timeout_secs ?? 0;
+  if (runtimeText) {
+    const elapsedPart =
+      timeoutSecs > 0
+        ? `${formatDurationCompact(job.elapsed_secs)} / ${formatDurationCompact(timeoutSecs)}`
+        : formatDurationCompact(job.elapsed_secs);
+    runtimeText.textContent = `${elapsedPart} · ${job.line_count} lines`;
+  }
+  if (progressTrack && progressFill) {
+    const pct =
+      job.status === "running"
+        ? timeoutSecs > 0
+          ? Math.min(100, Math.max(2, Math.round((job.elapsed_secs / timeoutSecs) * 100)))
+          : 0
+        : 100;
+    progressTrack.hidden = job.status === "running" && timeoutSecs <= 0;
+    progressTrack.title =
+      timeoutSecs > 0
+        ? `Durasi: ${job.elapsed_secs}s dari batas timeout ${timeoutSecs}s`
+        : `Durasi: ${job.elapsed_secs}s`;
+    progressFill.style.width = `${pct}%`;
+    progressFill.className = `job-progress-fill ${
+      job.status === "running"
+        ? idleSecs >= 15
+          ? "is-silent"
+          : ""
+        : job.status === "completed"
+          ? "is-ok"
+          : "is-err"
+    }`.trim();
+  }
+
+  const tdAction = tr.cells[4];
+  const logsBtn = tdAction.querySelector<HTMLButtonElement>('[data-role="btn-job-logs"]');
+  const stopBtn = tdAction.querySelector<HTMLButtonElement>('[data-role="btn-job-stop"]');
+  if (logsBtn) {
+    logsBtn.textContent = job.status === "running" ? "Live Logs" : "Logs";
+  }
+  if (stopBtn) {
+    stopBtn.hidden = job.status !== "running";
+  }
+}
+
+function buildJobRow(
+  job: JobSummary,
+  onSnapshot: (snap: DashboardSnapshot) => void
+): HTMLTableRowElement {
+  const tr = document.createElement("tr");
+  tr.dataset.jobId = job.job_id;
+
+  const tdId = document.createElement("td");
+  tdId.className = "mono-cell";
+
+  const tdCmd = document.createElement("td");
+  tdCmd.className = "mono-cell";
+  const cmdHeader = document.createElement("div");
+  cmdHeader.dataset.role = "job-cmd-header";
+  const lastLineEl = document.createElement("span");
+  lastLineEl.className = "job-last-line";
+  lastLineEl.dataset.role = "job-last-line";
+  tdCmd.append(cmdHeader, lastLineEl);
+
+  const tdStatus = document.createElement("td");
+  const statusStack = document.createElement("div");
+  statusStack.className = "job-status-stack";
+  const badge = document.createElement("span");
+  badge.dataset.role = "job-status-badge";
+  const idleHint = document.createElement("span");
+  idleHint.className = "job-idle-hint";
+  idleHint.dataset.role = "job-idle-hint";
+  statusStack.append(badge, idleHint);
+  tdStatus.appendChild(statusStack);
+
+  const tdRuntime = document.createElement("td");
+  tdRuntime.className = "mono-cell";
+  const runtimeWrap = document.createElement("div");
+  runtimeWrap.className = "job-runtime-wrap";
+  const runtimeText = document.createElement("span");
+  runtimeText.className = "job-runtime-text";
+  runtimeText.dataset.role = "job-runtime-text";
+  const progressTrack = document.createElement("div");
+  progressTrack.className = "job-progress-track";
+  progressTrack.dataset.role = "job-progress-track";
+  progressTrack.setAttribute("aria-hidden", "true");
+  const progressFill = document.createElement("div");
+  progressFill.className = "job-progress-fill";
+  progressFill.dataset.role = "job-progress-fill";
+  progressTrack.appendChild(progressFill);
+  runtimeWrap.append(runtimeText, progressTrack);
+  tdRuntime.appendChild(runtimeWrap);
+
+  const tdAction = document.createElement("td");
+  const actWrap = document.createElement("div");
+  actWrap.className = "btn-row";
+
+  const logsBtn = document.createElement("button");
+  logsBtn.type = "button";
+  logsBtn.className = "btn btn-secondary btn-xs";
+  logsBtn.dataset.role = "btn-job-logs";
+  logsBtn.addEventListener("click", () => {
+    const latest = latestJobsById.get(job.job_id) ?? job;
+    void openJobLogsModal(latest);
+  });
+  actWrap.appendChild(logsBtn);
+
+  const stopBtn = document.createElement("button");
+  stopBtn.type = "button";
+  stopBtn.className = "btn btn-danger btn-xs";
+  stopBtn.textContent = "Stop";
+  stopBtn.dataset.role = "btn-job-stop";
+  stopBtn.addEventListener("click", async () => {
+    try {
+      await invoke("stop_background_job", { jobId: job.job_id });
+      const next = await invoke<DashboardSnapshot>("get_dashboard_state");
+      onSnapshot(next);
+      setToast(`Job ${job.job_id} dihentikan.`);
+    } catch (err) {
+      setToast(`Gagal stop job: ${String(err)}`);
+    }
+  });
+  actWrap.appendChild(stopBtn);
+
+  tdAction.appendChild(actWrap);
+  tr.append(tdId, tdCmd, tdStatus, tdRuntime, tdAction);
+  patchJobRow(tr, job);
+  return tr;
+}
+
+function renderBackgroundJobs(
+  jobs: JobSummary[],
+  onSnapshot: (snap: DashboardSnapshot) => void
+): void {
+  latestJobsById.clear();
+  for (const job of jobs) {
+    latestJobsById.set(job.job_id, job);
+  }
+  renderStatusbarJobs(jobs);
+
+  const tbody = $("jobs-body") as HTMLTableSectionElement;
+  if (jobs.length === 0) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 5;
+    td.className = "traffic-empty";
+    td.textContent = "Belum ada background command job yang dijalankan.";
+    tr.appendChild(td);
+    tbody.replaceChildren(tr);
+    return;
+  }
+
+  const existingRows = Array.from(tbody.rows);
+  const sameOrder =
+    existingRows.length === jobs.length &&
+    existingRows.every((row, idx) => row.dataset.jobId === jobs[idx].job_id);
+
+  if (sameOrder) {
+    for (let i = 0; i < jobs.length; i++) {
+      patchJobRow(existingRows[i], jobs[i]);
+    }
+    return;
+  }
+
+  const nextRows = jobs.map((job) => buildJobRow(job, onSnapshot));
+  tbody.replaceChildren(...nextRows);
 }
 
 function renderActiveLspServers(
@@ -692,6 +878,14 @@ export function renderBridgeView(
   ($("toggle-close-to-tray") as HTMLInputElement).checked = snap.close_to_tray;
   ($("toggle-sensitive-guard") as HTMLInputElement).checked = !snap.allow_sensitive_reads;
 
+  const cmdPolicy = snap.command_execution_policy ?? "guarded";
+  ($("command-policy-select") as HTMLSelectElement).value = cmdPolicy;
+  $("command-allowlist-box").hidden = cmdPolicy !== "allowlist";
+  const allowlistInput = $("command-allowlist-input") as HTMLTextAreaElement;
+  if (document.activeElement !== allowlistInput) {
+    allowlistInput.value = (snap.command_allowlist ?? []).join(", ");
+  }
+
   renderOAuthClients(snap.oauth_clients ?? [], onSnapshot);
   renderActiveLspServers(snap.active_lsp_servers ?? [], onSnapshot);
   renderBackgroundJobs(snap.background_jobs ?? [], onSnapshot);
@@ -847,6 +1041,57 @@ export function initBridgeView(
       );
     } catch (err) {
       setToast(`Gagal menyimpan pengaturan: ${String(err)}`);
+    }
+  });
+
+  $("command-policy-select").addEventListener("change", async (e) => {
+    const policy = (e.target as HTMLSelectElement).value;
+    $("command-allowlist-box").hidden = policy !== "allowlist";
+    try {
+      const snap = await invoke<DashboardSnapshot>("update_app_settings", {
+        commandExecutionPolicy: policy,
+      });
+      onSnapshot(snap);
+      const label =
+        policy === "allowlist"
+          ? "Strict Allowlist (hanya prefix aman & blokir chaining)"
+          : policy === "hitl"
+            ? "Always HITL (wajib konfirmasi shell)"
+            : "Guarded (hardened blocklist)";
+      setToast(`Command Policy: ${label}`, policy === "guarded" ? "info" : "warn");
+    } catch (err) {
+      setToast(`Gagal menyimpan Command Policy: ${String(err)}`, "warn");
+    }
+  });
+
+  $("btn-save-command-allowlist").addEventListener("click", async () => {
+    const raw = ($("command-allowlist-input") as HTMLTextAreaElement).value;
+    const entries = raw
+      .split(/[,\n]/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    try {
+      const snap = await invoke<DashboardSnapshot>("update_app_settings", {
+        commandAllowlist: entries,
+      });
+      onSnapshot(snap);
+      setToast(`Command Allowlist disimpan (${snap.command_allowlist.length} prefix).`, "info");
+    } catch (err) {
+      setToast(`Gagal menyimpan Command Allowlist: ${String(err)}`, "warn");
+    }
+  });
+
+  $("btn-reset-command-allowlist").addEventListener("click", async () => {
+    try {
+      const snap = await invoke<DashboardSnapshot>("update_app_settings", {
+        commandAllowlist: [],
+      });
+      onSnapshot(snap);
+      ($("command-allowlist-input") as HTMLTextAreaElement).value =
+        snap.command_allowlist.join(", ");
+      setToast("Command Allowlist dikembalikan ke daftar default.", "info");
+    } catch (err) {
+      setToast(`Gagal reset Command Allowlist: ${String(err)}`, "warn");
     }
   });
 

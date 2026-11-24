@@ -275,7 +275,7 @@ async fn execute_tool_core(
             Err(err) => Err(err),
             Ok(()) => match tool_name {
                 "poll_command_job" => {
-                    tools_extra::exec_poll_command_job(state, &args, pinned_ws).await
+                    tools_extra::exec_poll_command_job(state, source, &args, pinned_ws).await
                 }
                 "stop_command_job" => {
                     tools_extra::exec_stop_command_job(state, source, &args, pinned_ws).await

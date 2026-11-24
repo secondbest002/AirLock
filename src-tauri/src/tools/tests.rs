@@ -3,6 +3,7 @@ use crate::state::ToolApprovalDecision;
 use serde_json::json;
 use std::fs;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[tokio::test]
@@ -1115,6 +1116,131 @@ async fn test_plan_first_mode_blocks_mutative_tools_until_approved() {
     .await;
     assert!(!allowed.is_error, "Edit should succeed after approve_artifact: {}", allowed.text);
     assert_eq!(fs::read_to_string(temp_dir.join("app.rs")).unwrap(), "fn v() -> i32 { 2 }\n");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_command_execution_policy_allowlist_and_hitl_in_autonomous_mode() {
+    let temp_dir = std::env::temp_dir().join("smart_mcp_cmd_policy_test");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let state = Arc::new(AppState::new(temp_dir.clone()));
+    *state.guardrail_mode.write().await = "autonomous".to_string();
+
+    // 1. Strict Allowlist mode blocks non-allowlisted commands & chaining even in autonomous mode
+    {
+        let mut cfg = state.config.write().await;
+        cfg.command_execution_policy = "allowlist".to_string();
+        cfg.command_allowlist = vec!["echo".to_string()];
+    }
+
+    let allowed = execute_tool(
+        &state,
+        "LocalAgent",
+        "run_command_compressed",
+        json!({ "command": "echo allowlist_ok" }),
+    )
+    .await;
+    assert!(!allowed.is_error, "Allowlisted command should succeed: {}", allowed.text);
+    assert!(allowed.text.contains("allowlist_ok"));
+
+    let blocked_chain = execute_tool(
+        &state,
+        "LocalAgent",
+        "run_command_compressed",
+        json!({ "command": "echo ok && echo chained" }),
+    )
+    .await;
+    assert!(blocked_chain.is_error);
+    assert!(blocked_chain.text.contains("Command Policy (Allowlist)"));
+
+    let blocked_prefix = execute_tool(
+        &state,
+        "LocalAgent",
+        "run_command_compressed",
+        json!({ "command": "whoami" }),
+    )
+    .await;
+    assert!(blocked_prefix.is_error);
+    assert!(blocked_prefix.text.contains("Command Policy (Allowlist)"));
+
+    // 2. Always HITL mode triggers HITL prompt for shell commands even in autonomous mode
+    {
+        let mut cfg = state.config.write().await;
+        cfg.command_execution_policy = "hitl".to_string();
+    }
+
+    let state_bg = state.clone();
+    let resolver = tokio::spawn(async move {
+        for _ in 0..40 {
+            let req_id = state_bg
+                .pending_tool_approvals
+                .read()
+                .await
+                .keys()
+                .next()
+                .cloned();
+            if let Some(id) = req_id {
+                resolve_tool_approval(&state_bg, &id, ToolApprovalDecision::Deny)
+                    .await
+                    .unwrap();
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        false
+    });
+
+    let denied = execute_tool(
+        &state,
+        "WebMCP",
+        "run_command_compressed",
+        json!({ "command": "echo hitl_enforced" }),
+    )
+    .await;
+    let resolved = resolver.await.unwrap();
+    assert!(resolved, "Expected HITL approval request in command_execution_policy=hitl");
+    assert!(denied.is_error);
+    assert!(denied.text.contains("ditolak oleh user"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_webmcp_poll_command_job_long_polls_to_completion() {
+    let temp_dir = std::env::temp_dir().join("smart_mcp_webmcp_poll_wait_test");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let state = AppState::new(temp_dir.clone());
+    let started = execute_tool(
+        &state,
+        "WebMCP",
+        "start_command_job",
+        json!({ "command": "echo webmcp_long_poll_ok" }),
+    )
+    .await;
+    assert!(!started.is_error, "start_command_job failed: {}", started.text);
+    let job_id = started
+        .text
+        .lines()
+        .find_map(|l| l.strip_prefix("JOB_STARTED: "))
+        .expect("JOB_STARTED line missing")
+        .trim()
+        .to_string();
+
+    let polled = execute_tool(
+        &state,
+        "WebMCP",
+        "poll_command_job",
+        json!({ "job_id": job_id, "from_line": 0 }),
+    )
+    .await;
+    assert!(!polled.is_error, "poll_command_job failed: {}", polled.text);
+    assert!(polled.text.contains("STATUS: completed"), "got:\n{}", polled.text);
+    assert!(polled.text.contains("webmcp_long_poll_ok"), "got:\n{}", polled.text);
 
     let _ = fs::remove_dir_all(&temp_dir);
 }

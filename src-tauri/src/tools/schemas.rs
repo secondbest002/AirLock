@@ -460,7 +460,7 @@ pub fn mcp_tools_list() -> Value {
         },
         {
             "name": "start_command_job",
-            "description": "Starts a long-running shell command asynchronously in background and returns job_id immediately (<50ms) to avoid WebMCP timeouts.",
+            "description": "Starts a long-running shell command asynchronously in non-interactive mode (CI=true, GIT_TERMINAL_PROMPT=0, PYTHONUNBUFFERED=1) and returns job_id immediately (<50ms). Follow with poll_command_job (which waits up to 12s per call automatically; never run sleep).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -480,13 +480,14 @@ pub fn mcp_tools_list() -> Value {
         },
         {
             "name": "poll_command_job",
-            "description": "Polls status and compressed incremental output from a background job started with start_command_job.",
+            "description": "Polls status and compressed incremental output from a background job. Automatically long-polls up to wait_secs (default 12s for WebMCP) and wakes immediately when the job finishes, avoiding spin-polling or sleep commands.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "job_id": { "type": "string" },
                     "from_line": { "type": "integer", "description": "0-based line offset (default 0)" },
-                    "max_lines": { "type": "integer", "description": "Max compressed lines (default 80)" }
+                    "max_lines": { "type": "integer", "description": "Max compressed lines (default 80)" },
+                    "wait_secs": { "type": "integer", "description": "Long-poll wait up to N seconds (0-18) for completion before returning (default 12 for WebMCP, 0 for local)" }
                 },
                 "required": ["job_id"]
             },

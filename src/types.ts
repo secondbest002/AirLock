@@ -1,4 +1,5 @@
 export type GuardrailMode = "read_only" | "safe_edit" | "autonomous";
+export type CommandExecutionPolicy = "guarded" | "allowlist" | "hitl";
 export type AgentProvider = "gemini" | "openai_compat" | "anthropic";
 export type GeminiThinkingMode = "auto" | "off" | "low" | "medium" | "high";
 export type ExecutionMode = "direct" | "plan_first";
@@ -222,7 +223,19 @@ export interface JobSummary {
   exit_code: number | null;
   started_at: string;
   elapsed_secs: number;
+  timeout_secs?: number;
   line_count: number;
+  idle_secs?: number;
+  last_line?: string | null;
+  stall_hint?: string | null;
+}
+
+export interface JobLogsDelta {
+  summary: JobSummary;
+  lines: string[];
+  from_line: number;
+  next_from_line: number;
+  truncated_earlier: boolean;
 }
 
 export interface LspServerSummary {
@@ -356,6 +369,8 @@ export interface DashboardSnapshot {
   close_to_tray: boolean;
   allow_sensitive_reads: boolean;
   guardrail_mode: GuardrailMode;
+  command_execution_policy: CommandExecutionPolicy;
+  command_allowlist: string[];
   recent_workspaces: string[];
   pinned_workspaces: string[];
   git_branch: string | null;

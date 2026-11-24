@@ -575,12 +575,38 @@ async fn update_app_settings(
     state: State<'_, Arc<AppState>>,
     close_to_tray: Option<bool>,
     allow_sensitive_reads: Option<bool>,
+    command_execution_policy: Option<String>,
+    command_allowlist: Option<Vec<String>>,
 ) -> Result<DashboardSnapshot, String> {
     if let Some(val) = close_to_tray {
         state.close_to_tray.store(val, Ordering::SeqCst);
     }
     if let Some(val) = allow_sensitive_reads {
         state.allow_sensitive_reads.store(val, Ordering::SeqCst);
+    }
+    if let Some(policy) = command_execution_policy {
+        let norm = policy.trim().to_string();
+        if !crate::security::is_valid_command_execution_policy(&norm) {
+            return Err(format!("Command execution policy tidak valid: {norm}"));
+        }
+        {
+            let mut cfg = state.config.write().await;
+            cfg.command_execution_policy = norm;
+        }
+        state.session_approved_tools.write().await.clear();
+    }
+    if let Some(list) = command_allowlist {
+        let cleaned: Vec<String> = list
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut cfg = state.config.write().await;
+        cfg.command_allowlist = if cleaned.is_empty() {
+            crate::security::default_command_allowlist()
+        } else {
+            cleaned
+        };
     }
     state.save_config_state().await;
     let snap = state.snapshot().await;
@@ -922,6 +948,15 @@ async fn get_background_job_logs(
     job_id: String,
 ) -> Result<String, String> {
     jobs::get_job_logs(&state, &job_id).await
+}
+
+#[tauri::command]
+async fn get_background_job_logs_delta(
+    state: State<'_, Arc<AppState>>,
+    job_id: String,
+    from_line: usize,
+) -> Result<jobs::JobLogsDelta, String> {
+    jobs::get_job_logs_delta(&state, &job_id, from_line).await
 }
 
 #[tauri::command]
@@ -1741,6 +1776,7 @@ fn main() {
             revert_audit_group,
             list_background_jobs,
             get_background_job_logs,
+            get_background_job_logs_delta,
             stop_background_job,
             clear_finished_jobs,
             upsert_downstream_mcp,

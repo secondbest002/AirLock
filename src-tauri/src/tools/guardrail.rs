@@ -86,10 +86,16 @@ pub async fn enforce_guardrail_gate_for_workspace(
         ));
     }
 
-    if mode == "safe_edit"
-        && source != "Simulator"
-        && requires_hitl_in_safe_edit(tool_name, args, is_read_only)
-    {
+    let is_shell_tool = matches!(
+        tool_name,
+        "run_command_compressed" | "patch_and_verify" | "start_command_job"
+    );
+    let cmd_policy = state.config.read().await.command_execution_policy.clone();
+    let hitl_from_safe_edit =
+        mode == "safe_edit" && requires_hitl_in_safe_edit(tool_name, args, is_read_only);
+    let hitl_from_cmd_policy = cmd_policy == "hitl" && is_shell_tool;
+
+    if source != "Simulator" && (hitl_from_safe_edit || hitl_from_cmd_policy) {
         let session_key = ws
             .map(|w| format!("{}::{tool_name}", w.id))
             .unwrap_or_else(|| tool_name.to_string());
@@ -106,8 +112,13 @@ pub async fn enforce_guardrail_gate_for_workspace(
         let request_id = format!("hitl_{}", AppState::generate_token());
         let args_pretty = serde_json::to_string_pretty(args).unwrap_or_else(|_| "{}".to_string());
         let args_preview: String = args_pretty.chars().take(1200).collect();
+        let reason_label = if hitl_from_cmd_policy && mode != "safe_edit" {
+            "kebijakan Command Policy (Always HITL)"
+        } else {
+            "mode Safe-Edit"
+        };
         let summary =
-            format!("{source} ingin menjalankan '{tool_name}'{ws_label} dalam mode Safe-Edit.");
+            format!("{source} ingin menjalankan '{tool_name}'{ws_label} dalam {reason_label}.");
 
         let info = PendingToolApproval {
             request_id: request_id.clone(),

@@ -790,6 +790,33 @@
                     <input id="toggle-close-to-tray" type="checkbox" class="tactile-switch" checked />
                   </label>
                 </div>
+                <div class="kv-grid">
+                  <div class="kv-item">
+                    <label for="command-policy-select" class="kv-label">Command Execution Policy (Shell Hardening)</label>
+                    <select id="command-policy-select" class="mono-select">
+                      <option value="guarded" selected>Guarded (Hardened Blocklist + Guardrail Mode)</option>
+                      <option value="allowlist">Strict Allowlist (Hanya Prefix Aman, Tanpa Chaining)</option>
+                      <option value="hitl">Always HITL (Popup Konfirmasi Shell di Semua Mode)</option>
+                    </select>
+                    <span class="toggle-hint">Di mode Autonomous, shell berjalan tanpa sandbox kernel OS. Gunakan Strict Allowlist atau Always HITL untuk isolasi lebih ketat.</span>
+                  </div>
+                  <div id="command-allowlist-box" class="cf-named-box" hidden>
+                    <div class="form-group">
+                      <label for="command-allowlist-input">Allowed Command Prefixes (pisahkan dengan koma atau baris baru)</label>
+                      <textarea
+                        id="command-allowlist-input"
+                        class="mono-input"
+                        rows="3"
+                        spellcheck="false"
+                        placeholder="cargo, npm, npx, tsc, pytest, git status, git diff"
+                      ></textarea>
+                    </div>
+                    <div class="btn-row">
+                      <button id="btn-save-command-allowlist" type="button" class="btn btn-primary btn-xs">Save Allowlist</button>
+                      <button id="btn-reset-command-allowlist" type="button" class="btn btn-secondary btn-xs">Reset Default</button>
+                    </div>
+                  </div>
+                </div>
               </article>
 
               <article class="card card-span-2">
@@ -1051,15 +1078,18 @@
                 </div>
               </article>
 
-              <article class="card card-span-2">
+              <article id="jobs-monitor-card" class="card card-span-2">
                 <div class="card-header-row">
                   <div>
                     <h2 class="card-heading">Background Command Jobs (Async)</h2>
-                    <p class="card-desc">Pantau build/test panjang via <code class="md-inline-code">start_command_job</code> tanpa terkena timeout WebMCP.</p>
+                    <p class="card-desc">Pantau build/test panjang via <code class="md-inline-code">start_command_job</code> secara live (durasi, idle detector, preview output, dan log streaming).</p>
                   </div>
-                  <button id="btn-clear-finished-jobs" type="button" class="btn btn-secondary btn-xs">Clear Finished</button>
+                  <div class="btn-row">
+                    <span id="jobs-running-count" class="badge badge-muted">0 active</span>
+                    <button id="btn-clear-finished-jobs" type="button" class="btn btn-secondary btn-xs">Clear Finished</button>
+                  </div>
                 </div>
-                <div class="traffic-table-wrap">
+                <div class="traffic-table-wrap" tabindex="0" role="region" aria-label="Background command jobs">
                   <table class="traffic-table">
                     <thead>
                       <tr>
@@ -1148,6 +1178,16 @@
       <footer class="statusbar">
         <span id="toast-region" role="status" aria-live="polite">Ready</span>
         <div class="statusbar-right">
+          <button
+            id="statusbar-jobs-pill"
+            type="button"
+            class="preview-pill job-live-pill"
+            hidden
+            title="Klik untuk membuka Background Command Jobs di Live Monitor"
+          >
+            <span class="live-dot warn" aria-hidden="true"></span>
+            <span id="statusbar-jobs-text">0 jobs running</span>
+          </button>
           <button id="btn-toggle-accent" type="button" class="preview-pill" title="Ganti warna aksen Obsidian Studio">
             Accent: <strong id="accent-name-label" style="color: var(--accent-fg)">Electric Mint</strong>
           </button>
@@ -1348,16 +1388,27 @@
     <!-- Background Job Logs Modal -->
     <dialog id="job-logs-dialog" closedby="any" class="modal-dialog modal-dialog-wide" aria-labelledby="job-logs-title">
       <div class="modal-header">
-        <h2 id="job-logs-title" class="card-heading">Background Job Output</h2>
+        <div class="card-header-row" style="margin-bottom: 4px">
+          <h2 id="job-logs-title" class="card-heading">Background Job Output</h2>
+          <span id="job-logs-status-badge" class="status-dot status-warn">running</span>
+        </div>
         <p id="job-logs-meta" class="card-desc">-</p>
       </div>
       <div class="modal-body">
-        <pre id="job-logs-pre" class="mono-pre insp-pre">Memuat log...</pre>
+        <div class="label-action-row" style="margin-bottom: 6px">
+          <span id="job-logs-stream-hint" class="bar-label">LIVE STREAM</span>
+          <label for="chk-job-logs-autoscroll" class="inline-check">
+            <input id="chk-job-logs-autoscroll" type="checkbox" checked />
+            <span>Auto-scroll</span>
+          </label>
+        </div>
+        <pre id="job-logs-pre" class="mono-pre insp-pre job-logs-pre">Memuat log...</pre>
       </div>
       <div class="modal-footer">
+        <button id="btn-stop-job-modal" type="button" class="btn btn-danger" hidden>Stop Job</button>
         <button id="btn-refresh-job-logs" type="button" class="btn btn-secondary">Refresh</button>
         <button id="btn-copy-job-logs" type="button" class="btn btn-secondary">Copy Output</button>
-        <button id="btn-close-job-logs" type="button" class="btn btn-primary">Close</button>
+        <button id="btn-close-job-logs" type="button" class="btn btn-primary" autofocus>Close</button>
       </div>
     </dialog>
 

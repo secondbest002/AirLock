@@ -63,6 +63,17 @@ export function escapeHtml(raw: string): string {
     .replaceAll("'", "&#39;");
 }
 
+export function formatDurationCompact(secs: number): string {
+  const safe = Math.max(0, Math.floor(secs));
+  if (safe < 60) return `${safe}s`;
+  const mins = Math.floor(safe / 60);
+  const remSecs = safe % 60;
+  if (mins < 60) return remSecs > 0 ? `${mins}m ${remSecs}s` : `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  const remMins = mins % 60;
+  return remMins > 0 ? `${hours}h ${remMins}m` : `${hours}h`;
+}
+
 export function syncRailIndicator(): void {
   const activeBtn = document.querySelector<HTMLElement>(".rail-btn.active");
   const indicator = document.getElementById("rail-indicator");

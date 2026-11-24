@@ -3177,3 +3177,111 @@ dialog:modal {
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
 }
+
+/* =================================================================
+   BACKGROUND COMMAND JOB LIVE PROGRESS & STREAMING (TAHAP A)
+   ================================================================= */
+.job-live-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-color: var(--status-warn-border);
+  background: var(--status-warn-bg);
+  color: var(--status-warn);
+  font-variant-numeric: tabular-nums;
+}
+
+.job-live-pill[hidden] {
+  display: none;
+}
+
+.job-cmd-title {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.job-last-line {
+  display: block;
+  margin-top: 3px;
+  max-width: 380px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.job-last-line.is-empty {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.job-status-stack {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.job-idle-hint {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.job-idle-hint.is-silent {
+  color: var(--status-warn);
+}
+
+.job-idle-hint.is-active {
+  color: var(--status-ok);
+}
+
+.job-runtime-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 145px;
+}
+
+.job-runtime-text {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+}
+
+.job-progress-track {
+  width: 100%;
+  height: 3px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-elevated);
+  overflow: hidden;
+}
+
+.job-progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 260ms var(--ease-out-expo), background-color var(--dur-fast) ease;
+}
+
+.job-progress-fill.is-silent {
+  background: var(--status-warn);
+}
+
+.job-progress-fill.is-ok {
+  background: var(--status-ok);
+}
+
+.job-progress-fill.is-err {
+  background: var(--status-danger);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .job-progress-fill {
+    transition: none;
+  }
+}
+
+.job-logs-pre {
+  max-height: min(46vh, 420px);
+}

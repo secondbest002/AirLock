@@ -840,7 +840,7 @@ pub async fn exec_start_command_job(
         .await;
 
     Ok(format!(
-        "JOB_STARTED: {}\nWORKSPACE: @{}\nCOMMAND: {}\nSTATUS: running\nGunakan poll_command_job(job_id=\"{}\", from_line=0) untuk memantau progres tanpa timeout.",
+        "JOB_STARTED: {}\nWORKSPACE: @{}\nCOMMAND: {}\nSTATUS: running\nGunakan poll_command_job(job_id=\"{}\", from_line=0) — tool ini otomatis menunggu s.d. 12 detik hingga selesai tanpa perlu perintah sleep.",
         summary.job_id, ws.alias, summary.command, summary.job_id
     ))
 }
@@ -867,6 +867,7 @@ async fn verify_job_pin_access(
 
 pub async fn exec_poll_command_job(
     state: &AppState,
+    source: &str,
     args: &Value,
     pinned_ws: Option<&str>,
 ) -> Result<String, String> {
@@ -880,7 +881,11 @@ pub async fn exec_poll_command_job(
         .get("max_lines")
         .and_then(|v| v.as_u64())
         .unwrap_or(80) as usize;
-    jobs::poll_job(state, job_id, from_line, max_lines).await
+    let wait_secs = args
+        .get("wait_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(if source == "WebMCP" { 12 } else { 0 });
+    jobs::poll_job_with_wait(state, job_id, from_line, max_lines, wait_secs).await
 }
 
 pub async fn exec_stop_command_job(
