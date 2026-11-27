@@ -1,17 +1,130 @@
 use super::auth::{
-    check_auth, compute_base_url, extract_pinned_workspace, sanitize_preview,
-    unauthorized_response, TokenQuery,
+    check_auth, compute_base_url, extract_pinned_workspace, extract_tool_profile, sanitize_preview,
+    unauthorized_response, McpToolProfile, TokenQuery,
 };
-use super::rpc::handle_single_rpc_with_context;
+use super::rpc::{handle_single_rpc_with_request_context, RpcRequestContext};
 use super::total_tools_count;
 use crate::state::{AppState, HttpTrafficEntry};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
+use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio::task::JoinSet;
+
+fn is_rpc_message_read_only(msg: &Value) -> bool {
+    let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    match method {
+        "ping"
+        | "tools/list"
+        | "resources/list"
+        | "resources/read"
+        | "prompts/list"
+        | "skills/list"
+        | "server/discover"
+        | "tasks/list"
+        | "tasks/get"
+        | "tasks/result" => true,
+        "tools/call" => {
+            let name = msg
+                .get("params")
+                .and_then(|p| p.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if name.contains("__") {
+                return false;
+            }
+            let args = msg
+                .get("params")
+                .and_then(|p| p.get("arguments"))
+                .unwrap_or(&Value::Null);
+            crate::tools::is_tool_read_only(name, args)
+        }
+        _ => false,
+    }
+}
+
+async fn execute_rpc_batch_hybrid(
+    state: Arc<AppState>,
+    messages: Vec<Value>,
+    pinned_ws: Option<String>,
+    tool_profile: McpToolProfile,
+    source: &'static str,
+    session_id: Option<String>,
+) -> Vec<Value> {
+    let len = messages.len();
+    let mut results: Vec<Option<Value>> = vec![None; len];
+    let mut idx = 0usize;
+
+    while idx < len {
+        if is_rpc_message_read_only(&messages[idx]) {
+            let mut end = idx + 1;
+            while end < len && is_rpc_message_read_only(&messages[end]) {
+                end += 1;
+            }
+            if end - idx == 1 {
+                let ctx = RpcRequestContext {
+                    pinned_ws: pinned_ws.as_deref(),
+                    tool_profile,
+                    source,
+                    session_id: session_id.as_deref(),
+                };
+                results[idx] =
+                    handle_single_rpc_with_request_context(&state, &messages[idx], ctx).await;
+            } else {
+                let mut set: JoinSet<(usize, Option<Value>)> = JoinSet::new();
+                for pos in idx..end {
+                    let st = Arc::clone(&state);
+                    let msg_owned = messages[pos].clone();
+                    let pin_owned = pinned_ws.clone();
+                    let sid_owned = session_id.clone();
+                    set.spawn(async move {
+                        let ctx = RpcRequestContext {
+                            pinned_ws: pin_owned.as_deref(),
+                            tool_profile,
+                            source,
+                            session_id: sid_owned.as_deref(),
+                        };
+                        let out =
+                            handle_single_rpc_with_request_context(&st, &msg_owned, ctx).await;
+                        (pos, out)
+                    });
+                }
+                while let Some(joined) = set.join_next().await {
+                    if let Ok((pos, out)) = joined {
+                        results[pos] = out;
+                    }
+                }
+            }
+            idx = end;
+        } else {
+            let ctx = RpcRequestContext {
+                pinned_ws: pinned_ws.as_deref(),
+                tool_profile,
+                source,
+                session_id: session_id.as_deref(),
+            };
+            results[idx] =
+                handle_single_rpc_with_request_context(&state, &messages[idx], ctx).await;
+            idx += 1;
+        }
+    }
+
+    results.into_iter().flatten().collect()
+}
+
+fn attach_session_id_header(resp: &mut Response, session_id: Option<&str>) {
+    if let Some(sid) = session_id {
+        if let Ok(val) = HeaderValue::from_str(sid) {
+            resp.headers_mut()
+                .insert(HeaderName::from_static("mcp-session-id"), val);
+        }
+    }
+}
 
 async fn process_mcp_get(
     state: Arc<AppState>,
@@ -36,7 +149,7 @@ async fn process_mcp_get(
                 response_preview: None,
             })
             .await;
-        return unauthorized_response(&base);
+        return unauthorized_response(&base, Some(&query));
     }
 
     let accept = headers
@@ -140,7 +253,7 @@ async fn process_mcp_post(
                 response_preview: None,
             })
             .await;
-        return unauthorized_response(&base);
+        return unauthorized_response(&base, Some(&query));
     }
 
     let is_batch = payload.is_array();
@@ -181,12 +294,9 @@ async fn process_mcp_post(
     };
 
     let pinned_ws = extract_pinned_workspace(&headers, &query);
-    let mut outs = Vec::new();
-    for msg in &messages {
-        if let Some(out) = handle_single_rpc_with_context(&state, msg, pinned_ws.as_deref()).await {
-            outs.push(out);
-        }
-    }
+    let default_profile = state.config.read().await.webmcp_default_profile.clone();
+    let sse_keepalive_enabled = state.config.read().await.webmcp_sse_keepalive;
+    let tool_profile = extract_tool_profile(&headers, &query, &default_profile);
 
     let mcp_method_hdr = headers
         .get("mcp-method")
@@ -216,6 +326,119 @@ async fn process_mcp_post(
         note_parts.join(" | ")
     };
 
+    let accepts_sse = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .contains("text/event-stream");
+    let has_tools_call = messages
+        .iter()
+        .any(|m| m.get("method").and_then(|v| v.as_str()) == Some("tools/call"));
+    let first_req_id = messages
+        .iter()
+        .find_map(|m| m.get("id").cloned())
+        .unwrap_or(Value::Null);
+
+    let outs = if !is_init && sse_keepalive_enabled && accepts_sse && has_tools_call {
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<Vec<Value>>();
+        let st_bg = Arc::clone(&state);
+        let msgs_bg = messages;
+        let pin_bg = pinned_ws.clone();
+        let sid_bg = session_id.clone();
+        tokio::spawn(async move {
+            let res = execute_rpc_batch_hybrid(
+                st_bg,
+                msgs_bg,
+                pin_bg,
+                tool_profile,
+                "WebMCP",
+                sid_bg,
+            )
+            .await;
+            let _ = tx.send(res);
+        });
+
+        let wait_fast = tokio::time::sleep(Duration::from_secs(3));
+        tokio::pin!(wait_fast);
+        tokio::select! {
+            res = &mut rx => res.unwrap_or_default(),
+            _ = &mut wait_fast => {
+                let sse_note = if note_parts.is_empty() {
+                    "SSE keepalive stream".to_string()
+                } else {
+                    format!("{ok_note} | SSE keepalive")
+                };
+                state
+                    .record_http_traffic(HttpTrafficEntry {
+                        timestamp: AppState::now_timestamp(),
+                        method: "POST".to_string(),
+                        path: req_path.to_string(),
+                        rpc_method: if rpc_summary.is_empty() {
+                            None
+                        } else {
+                            Some(rpc_summary)
+                        },
+                        status: 200,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        note: sse_note,
+                        request_preview: req_preview,
+                        response_preview: Some("(streaming final result via SSE)".to_string()),
+                    })
+                    .await;
+
+                let stream = futures_util::stream::once(async move {
+                    let body = match rx.await {
+                        Ok(outs) => {
+                            if is_batch {
+                                Value::Array(outs)
+                            } else {
+                                outs.into_iter().next().unwrap_or_else(|| {
+                                    json!({
+                                        "jsonrpc": "2.0",
+                                        "id": first_req_id,
+                                        "error": {
+                                            "code": -32603,
+                                            "message": "SSE tool execution returned empty response"
+                                        }
+                                    })
+                                })
+                            }
+                        }
+                        Err(_) => json!({
+                            "jsonrpc": "2.0",
+                            "id": first_req_id,
+                            "error": {
+                                "code": -32603,
+                                "message": "SSE worker task terminated before producing a response"
+                            }
+                        }),
+                    };
+                    let data = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
+                    Ok::<Event, Infallible>(Event::default().event("message").data(data))
+                });
+                let mut resp = Sse::new(stream)
+                    .keep_alive(KeepAlive::new().interval(Duration::from_secs(6)).text("keepalive"))
+                    .into_response();
+                resp.headers_mut().insert(
+                    HeaderName::from_static("x-accel-buffering"),
+                    HeaderValue::from_static("no"),
+                );
+                attach_session_id_header(&mut resp, session_id.as_deref());
+                return resp;
+            }
+        }
+    } else {
+        execute_rpc_batch_hybrid(
+            Arc::clone(&state),
+            messages,
+            pinned_ws.clone(),
+            tool_profile,
+            "WebMCP",
+            session_id.clone(),
+        )
+        .await
+    };
+
     let status_code = if outs.is_empty() { 202 } else { 200 };
     if outs.is_empty() {
         let notif_note = if note_parts.is_empty() {
@@ -240,7 +463,9 @@ async fn process_mcp_post(
                 response_preview: None,
             })
             .await;
-        return StatusCode::ACCEPTED.into_response();
+        let mut resp = StatusCode::ACCEPTED.into_response();
+        attach_session_id_header(&mut resp, session_id.as_deref());
+        return resp;
     }
 
     let body = if is_batch {
@@ -271,12 +496,7 @@ async fn process_mcp_post(
         .await;
 
     let mut resp = (StatusCode::OK, Json(body)).into_response();
-    if let Some(sid) = session_id {
-        if let Ok(val) = HeaderValue::from_str(&sid) {
-            resp.headers_mut()
-                .insert(HeaderName::from_static("mcp-session-id"), val);
-        }
-    }
+    attach_session_id_header(&mut resp, session_id.as_deref());
     resp
 }
 
@@ -308,7 +528,7 @@ async fn process_mcp_delete(
     let req_path = if path_token.is_some() { "/mcp/<token>" } else { "/mcp" };
     if !check_auth(&state, &headers, &query, path_token.as_deref()).await {
         let base = compute_base_url(&state, &headers).await;
-        return unauthorized_response(&base);
+        return unauthorized_response(&base, Some(&query));
     }
     state
         .record_http_traffic(HttpTrafficEntry {

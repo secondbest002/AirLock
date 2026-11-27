@@ -877,11 +877,8 @@ export function openDiagnosticModal(report: DiagnosticReport): void {
     },
     {
       label: "Tools Exposed",
-      ok: report.tools_count >= 14,
-      value:
-        report.tools_count > 14
-          ? `${report.tools_count} tools (14 + ${report.tools_count - 14} hub)`
-          : `${report.tools_count} / 14 tools`,
+      ok: report.tools_count >= 9,
+      value: `${report.tools_count} tools`,
     },
     {
       label: "Loopback Latency",

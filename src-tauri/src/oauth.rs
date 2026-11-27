@@ -4,7 +4,7 @@ use crate::state::{
     AppState, HttpTrafficEntry, OAuthClient, OAuthCode, OAuthDecision, OAuthTokenRecord,
     PendingOAuthInfo,
 };
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -19,13 +19,46 @@ use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
 use tokio::sync::oneshot;
 
+fn build_protected_resource_url(base: &str, suffix: Option<&str>, raw_query: Option<&str>) -> String {
+    let clean_suffix = suffix
+        .map(|s| s.trim_start_matches('/'))
+        .filter(|s| !s.is_empty())
+        .unwrap_or("mcp");
+
+    let safe_query = raw_query
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .and_then(|q| {
+            let mut ser = url::form_urlencoded::Serializer::new(String::new());
+            let mut count = 0usize;
+            for (k, v) in url::form_urlencoded::parse(q.as_bytes()) {
+                if !k.eq_ignore_ascii_case("token") {
+                    ser.append_pair(&k, &v);
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                Some(ser.finish())
+            } else {
+                None
+            }
+        });
+
+    match safe_query {
+        Some(qs) => format!("{base}/{clean_suffix}?{qs}"),
+        None => format!("{base}/{clean_suffix}"),
+    }
+}
+
 pub async fn handle_oauth_protected_resource(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
 ) -> impl IntoResponse {
     let base = compute_base_url(&state, &headers).await;
+    let resource_url = build_protected_resource_url(&base, None, raw_query.as_deref());
     Json(json!({
-        "resource": format!("{base}/mcp"),
+        "resource": resource_url,
         "authorization_servers": [base],
         "bearer_methods_supported": ["header"],
         "scopes_supported": ["mcp"]
@@ -36,14 +69,10 @@ pub async fn handle_oauth_protected_resource_suffix(
     State(state): State<Arc<AppState>>,
     Path(suffix): Path<String>,
     headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
 ) -> impl IntoResponse {
     let base = compute_base_url(&state, &headers).await;
-    let clean_suffix = suffix.trim_start_matches('/');
-    let resource_url = if clean_suffix.is_empty() {
-        format!("{base}/mcp")
-    } else {
-        format!("{base}/{clean_suffix}")
-    };
+    let resource_url = build_protected_resource_url(&base, Some(&suffix), raw_query.as_deref());
     Json(json!({
         "resource": resource_url,
         "authorization_servers": [base],

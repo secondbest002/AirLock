@@ -40,6 +40,24 @@ pub fn resources_list() -> Value {
             "name": "Background Command Jobs",
             "description": "Current and recent async background jobs managed by the hub.",
             "mimeType": "application/json"
+        },
+        {
+            "uri": "airlock://workspace/checkpoint",
+            "name": "Session Checkpoint",
+            "description": "Latest persistent server-side session checkpoint and live git drift for the active workspace.",
+            "mimeType": "text/plain"
+        },
+        {
+            "uri": "airlock://workspace/handoff",
+            "name": "Workspace Handoff Summary",
+            "description": "Concise WebMCP-to-Antigravity handoff summary (.airlock/HANDOFF.md or live read-only preview).",
+            "mimeType": "text/markdown"
+        },
+        {
+            "uri": "airlock://instructions",
+            "name": "Global & Workspace Rules",
+            "description": "Combined global GEMINI.md/CLAUDE.md/AGENTS.md and active workspace rules.",
+            "mimeType": "text/markdown"
         }
     ])
 }
@@ -69,6 +87,18 @@ pub fn resource_templates_list() -> Value {
             "name": "Mounted Workspace File",
             "description": "Reads a UTF-8 file inside a specific mounted workspace @alias (enforces Sensitive File Guard).",
             "mimeType": "text/plain"
+        },
+        {
+            "uriTemplate": "workspace://{alias}/instructions",
+            "name": "Mounted Workspace Rules",
+            "description": "Combined global and @alias workspace rules (GEMINI.md/CLAUDE.md/AGENTS.md).",
+            "mimeType": "text/markdown"
+        },
+        {
+            "uriTemplate": "workspace://{alias}/handoff",
+            "name": "Mounted Workspace Handoff Summary",
+            "description": "WebMCP-to-Antigravity handoff summary for a specific mounted workspace @alias.",
+            "mimeType": "text/markdown"
         },
         {
             "uriTemplate": "skill://{name}",
@@ -253,6 +283,54 @@ pub async fn read_resource_with_context(
                 }]
             }))
         }
+        "airlock://workspace/checkpoint" => {
+            let ws = resolve_workspace(state, None, pinned_ws).await?;
+            let text = match crate::checkpoints::format_checkpoint_with_drift(state, &ws).await? {
+                Some(txt) => txt,
+                None => format!(
+                    "Belum ada session_checkpoint tersimpan untuk @{}. Panggil session_checkpoint(op=\"save\", goal=...) untuk membuatnya.",
+                    ws.alias
+                ),
+            };
+            Ok(json!({
+                "contents": [{
+                    "uri": trimmed,
+                    "mimeType": "text/plain",
+                    "text": text
+                }]
+            }))
+        }
+        "airlock://workspace/handoff" => {
+            let ws = resolve_workspace(state, None, pinned_ws).await?;
+            let text = crate::handoff::render_handoff_preview_readonly(state, &ws).await;
+            Ok(json!({
+                "contents": [{
+                    "uri": trimmed,
+                    "mimeType": "text/markdown",
+                    "text": text
+                }]
+            }))
+        }
+        "airlock://instructions" => {
+            let ws = resolve_workspace(state, None, pinned_ws).await?;
+            let text = crate::providers::load_combined_rules_snippet(
+                state.data_dir.as_deref(),
+                &ws.canon_root,
+            )
+            .unwrap_or_else(|| {
+                format!(
+                    "Belum ada file rules global atau workspace (`GEMINI.md`, `CLAUDE.md`, `AGENTS.md`) untuk @{}.",
+                    ws.alias
+                )
+            });
+            Ok(json!({
+                "contents": [{
+                    "uri": trimmed,
+                    "mimeType": "text/markdown",
+                    "text": text
+                }]
+            }))
+        }
         other => {
             if let Some(raw_rel) = other.strip_prefix("workspace://file/") {
                 let ws = resolve_workspace(state, None, pinned_ws).await?;
@@ -287,6 +365,33 @@ pub async fn read_resource_with_context(
                         "contents": [{
                             "uri": other,
                             "mimeType": "text/plain",
+                            "text": text
+                        }]
+                    }))
+                } else if rest == "handoff" {
+                    let text = crate::handoff::render_handoff_preview_readonly(state, &ws).await;
+                    Ok(json!({
+                        "contents": [{
+                            "uri": other,
+                            "mimeType": "text/markdown",
+                            "text": text
+                        }]
+                    }))
+                } else if rest == "instructions" {
+                    let text = crate::providers::load_combined_rules_snippet(
+                        state.data_dir.as_deref(),
+                        &ws.canon_root,
+                    )
+                    .unwrap_or_else(|| {
+                        format!(
+                            "Belum ada file rules global atau workspace (`GEMINI.md`, `CLAUDE.md`, `AGENTS.md`) untuk @{}.",
+                            ws.alias
+                        )
+                    });
+                    Ok(json!({
+                        "contents": [{
+                            "uri": other,
+                            "mimeType": "text/markdown",
                             "text": text
                         }]
                     }))
@@ -380,7 +485,84 @@ pub fn prompts_list() -> Value {
     ])
 }
 
+pub async fn prompts_list_for_context(state: &AppState, pinned_ws: Option<&str>) -> Value {
+    let mut items = prompts_list().as_array().cloned().unwrap_or_default();
+    let skills = state.skills_for_context(pinned_ws).await;
+    for s in skills {
+        if !s.summary.enabled || s.summary.parse_error.is_some() {
+            continue;
+        }
+        let manual_tag = if s.summary.disable_model_invocation {
+            "[manual] "
+        } else {
+            ""
+        };
+        items.push(json!({
+            "name": format!("skill:{}", s.summary.name),
+            "description": format!("[{}] {manual_tag}{}", s.summary.source_label, s.summary.description),
+            "arguments": [
+                { "name": "task", "description": "Optional task or target for this skill", "required": false }
+            ]
+        }));
+    }
+    Value::Array(items)
+}
+
+#[allow(dead_code)]
 pub async fn get_prompt(state: &AppState, name: &str, args: &Value) -> Result<Value, String> {
+    get_prompt_with_context(state, name, args, None).await
+}
+
+pub async fn get_prompt_with_context(
+    state: &AppState,
+    name: &str,
+    args: &Value,
+    pinned_ws: Option<&str>,
+) -> Result<Value, String> {
+    if let Some(skill_name) = name.strip_prefix("skill:").map(str::trim).filter(|s| !s.is_empty()) {
+        let skills = state.skills_for_context(pinned_ws).await;
+        let skill = skills
+            .into_iter()
+            .find(|s| {
+                s.summary.enabled
+                    && s.summary.parse_error.is_none()
+                    && s.summary.name.eq_ignore_ascii_case(skill_name)
+            })
+            .ok_or_else(|| format!("Prompt skill '{skill_name}' tidak ditemukan atau nonaktif."))?;
+        let task = args
+            .get("task")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let resources_hint = if skill.summary.resource_files.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nAvailable skill resources (load with `read_skill_resource(name=\"{}\", path=...)`):\n{}",
+                skill.summary.name,
+                skill
+                    .summary
+                    .resource_files
+                    .iter()
+                    .take(25)
+                    .map(|r| format!("- {r}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+        let task_prefix = task
+            .map(|t| format!("Task: {t}\n\n"))
+            .unwrap_or_default();
+        let text = format!(
+            "{task_prefix}Apply Agent Skill `{}` [{}]:\n\n{}{}",
+            skill.summary.name, skill.summary.source_label, skill.body_md, resources_hint
+        );
+        return Ok(json!({
+            "description": skill.summary.description,
+            "messages": [{ "role": "user", "content": { "type": "text", "text": text } }]
+        }));
+    }
+
     let raw_root = state.workspace_root.read().await.display().to_string();
     let workspace = raw_root.strip_prefix(r"\\?\").unwrap_or(&raw_root).to_string();
 
@@ -554,6 +736,63 @@ mod tests {
                 .await
                 .unwrap_err();
         assert!(cross_err.contains("ditolak"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn test_instructions_resource_and_dynamic_skill_prompts() {
+        let base = std::env::temp_dir().join("smart_mcp_instructions_and_prompts_test");
+        let _ = fs::remove_dir_all(&base);
+        let data_dir = base.join("hub_data");
+        let ws_dir = base.join("ws");
+        fs::create_dir_all(data_dir.join("skills/demo-skill")).unwrap();
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        fs::write(
+            data_dir.join("GEMINI.md"),
+            "Always run `list_skills` before specialized tasks.",
+        )
+        .unwrap();
+        fs::write(ws_dir.join("CLAUDE.md"), "Keep edits minimal and verified.").unwrap();
+        fs::write(
+            data_dir.join("skills/demo-skill/SKILL.md"),
+            "---\nname: demo-skill\ndescription: Demo prompt workflow\n---\nStep 1: Audit.\nStep 2: Patch.",
+        )
+        .unwrap();
+
+        let state = AppState::new_persistent(
+            ws_dir.clone(),
+            data_dir.join("auth.json"),
+            data_dir.join("config.json"),
+        );
+
+        let instr = read_resource_with_context(&state, "airlock://instructions", None)
+            .await
+            .unwrap();
+        let instr_txt = instr["contents"][0]["text"].as_str().unwrap();
+        assert!(instr_txt.contains("list_skills"));
+        assert!(instr_txt.contains("Keep edits minimal"));
+
+        let prm = prompts_list_for_context(&state, None).await;
+        let arr = prm.as_array().unwrap();
+        assert_eq!(arr.len(), 6);
+        assert!(arr.iter().any(|p| p["name"] == "skill:demo-skill"));
+        assert!(arr
+            .iter()
+            .any(|p| p["name"] == "skill:airlock-blueprint-workflow"));
+
+        let loaded = get_prompt_with_context(
+            &state,
+            "skill:demo-skill",
+            &json!({"task": "Check login module"}),
+            None,
+        )
+        .await
+        .unwrap();
+        let loaded_txt = loaded["messages"][0]["content"]["text"].as_str().unwrap();
+        assert!(loaded_txt.contains("Check login module"));
+        assert!(loaded_txt.contains("Step 1: Audit."));
 
         let _ = fs::remove_dir_all(&base);
     }

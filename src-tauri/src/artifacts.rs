@@ -214,6 +214,96 @@ impl ArtifactStore {
         docs
     }
 
+    pub async fn list_workspace_latest_by_kind(
+        &self,
+        clean_ws: &str,
+        session_prefixes: &[&str],
+    ) -> Vec<ArtifactDocument> {
+        fn matches_prefix(sid: &str, prefixes: &[&str]) -> bool {
+            prefixes.iter().any(|p| {
+                sid == *p || (p.ends_with('_') && sid.starts_with(p))
+            })
+        }
+
+        fn kind_rank(kind: &ArtifactKind) -> usize {
+            match kind {
+                ArtifactKind::ImplementationPlan => 0,
+                ArtifactKind::TaskList => 1,
+                ArtifactKind::Walkthrough => 2,
+                ArtifactKind::ReviewNote => 3,
+            }
+        }
+
+        let ws_hash = Self::ws_hash(clean_ws);
+        let key_prefix = format!("{ws_hash}::");
+        let mut by_session: HashMap<String, Vec<ArtifactDocument>> = HashMap::new();
+
+        {
+            let guard = self.mem.read().await;
+            for (k, docs) in guard.iter() {
+                if let Some(sid) = k.strip_prefix(&key_prefix) {
+                    if matches_prefix(sid, session_prefixes) && !docs.is_empty() {
+                        by_session.insert(sid.to_string(), docs.clone());
+                    }
+                }
+            }
+        }
+
+        if let Some(root) = self.root_dir.as_ref() {
+            let ws_dir = root.join(&ws_hash);
+            if let Ok(entries) = fs::read_dir(&ws_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    let Some(sid) = path.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    if by_session.contains_key(sid) || !matches_prefix(sid, session_prefixes) {
+                        continue;
+                    }
+                    let manifest = path.join("manifest.json");
+                    if let Ok(raw) = fs::read_to_string(&manifest) {
+                        if let Ok(docs) = serde_json::from_str::<Vec<ArtifactDocument>>(&raw) {
+                            if !docs.is_empty() {
+                                by_session.insert(sid.to_string(), docs);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut best: [Option<ArtifactDocument>; 4] = [None, None, None, None];
+        for docs in by_session.into_values() {
+            for doc in docs {
+                let idx = kind_rank(&doc.kind);
+                let replace = match &best[idx] {
+                    None => true,
+                    Some(cur) => {
+                        let new_key = (
+                            doc.updated_at.as_str(),
+                            doc.session_id == "webmcp-latest",
+                            doc.version,
+                        );
+                        let cur_key = (
+                            cur.updated_at.as_str(),
+                            cur.session_id == "webmcp-latest",
+                            cur.version,
+                        );
+                        new_key > cur_key
+                    }
+                };
+                if replace {
+                    best[idx] = Some(doc);
+                }
+            }
+        }
+
+        best.into_iter().flatten().collect()
+    }
+
     pub async fn upsert_artifact(
         &self,
         clean_ws: &str,
@@ -591,6 +681,105 @@ mod tests {
             .unwrap();
         assert!(exported_path.ends_with("implementation_plan.md"));
         assert!(ws_dir.join(".airlock/artifacts/implementation_plan.md").is_file());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn test_list_workspace_latest_by_kind_merges_webmcp_and_delegated() {
+        let base = std::env::temp_dir().join("smart_mcp_artifacts_merge_test");
+        let _ = fs::remove_dir_all(&base);
+        let data_dir = base.join("data");
+        let ws_dir = base.join("repo");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let clean_ws = clean_path_string(&ws_dir);
+        let store = ArtifactStore::new_persistent(data_dir.clone());
+
+        store
+            .upsert_artifact(
+                &clean_ws,
+                "repo",
+                "webmcp-latest",
+                ArtifactKind::ImplementationPlan,
+                "Main WebMCP Plan",
+                "# Plan\nStep 1\n",
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_artifact(
+                &clean_ws,
+                "repo",
+                "webmcp-latest",
+                ArtifactKind::TaskList,
+                "Old Tasks",
+                "- [ ] Task A\n",
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_artifact(
+                &clean_ws,
+                "repo",
+                "delegated_abc123",
+                ArtifactKind::ReviewNote,
+                "Delegated Review",
+                "# Review\nLooks good\n",
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_artifact(
+                &clean_ws,
+                "repo",
+                "delegated_abc123",
+                ArtifactKind::TaskList,
+                "Updated Tasks",
+                "- [x] Task A\n",
+            )
+            .await
+            .unwrap();
+        // Also ensure an unrelated desktop chat session is excluded
+        store
+            .upsert_artifact(
+                &clean_ws,
+                "repo",
+                "chat-desktop-1",
+                ArtifactKind::Walkthrough,
+                "Desktop Walkthrough",
+                "# Desktop\n",
+            )
+            .await
+            .unwrap();
+
+        // Update updated_at deterministically on disk/reloaded store
+        let fresh_store = ArtifactStore::new_persistent(data_dir);
+        let merged = fresh_store
+            .list_workspace_latest_by_kind(&clean_ws, &["webmcp-latest", "delegated_"])
+            .await;
+
+        assert_eq!(merged.len(), 3);
+        let plan = merged
+            .iter()
+            .find(|d| d.kind == ArtifactKind::ImplementationPlan)
+            .expect("implementation_plan should be preserved");
+        assert_eq!(plan.title, "Main WebMCP Plan");
+        let review = merged
+            .iter()
+            .find(|d| d.kind == ArtifactKind::ReviewNote)
+            .expect("review_note from delegated run should be merged");
+        assert_eq!(review.title, "Delegated Review");
+        let tasks = merged
+            .iter()
+            .find(|d| d.kind == ArtifactKind::TaskList)
+            .expect("task_list should exist");
+        assert!(
+            tasks.title == "Old Tasks" || tasks.title == "Updated Tasks",
+            "expected merged task list"
+        );
+        assert!(!merged.iter().any(|d| d.kind == ArtifactKind::Walkthrough));
 
         let _ = fs::remove_dir_all(&base);
     }

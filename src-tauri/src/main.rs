@@ -4,7 +4,9 @@ mod acp_server;
 mod agent_manager;
 mod artifacts;
 mod chat_store;
+mod checkpoints;
 mod config;
+mod handoff;
 mod hooks;
 mod jobs;
 mod local_agent;
@@ -27,6 +29,8 @@ mod stdio_bridge;
 mod tools;
 mod tools_extra;
 mod tunnel;
+mod webmcp_benchmark;
+mod webmcp_harness;
 mod workspace;
 
 use crate::config::{AppConfig, DownstreamMcpConfig};
@@ -612,6 +616,81 @@ async fn update_app_settings(
     let snap = state.snapshot().await;
     state.emit_dashboard().await;
     Ok(snap)
+}
+
+#[tauri::command]
+async fn update_webmcp_settings(
+    state: State<'_, Arc<AppState>>,
+    webmcp_default_profile: Option<String>,
+    webmcp_auto_promote_secs: Option<u64>,
+    webmcp_poll_wait_secs: Option<u64>,
+    webmcp_rpc_timeout_secs: Option<u64>,
+    webmcp_max_output_chars: Option<usize>,
+    webmcp_sse_keepalive: Option<bool>,
+    webmcp_allow_write_delegation: Option<bool>,
+    webmcp_expose_skills: Option<bool>,
+    webmcp_session_harness: Option<bool>,
+    webmcp_auto_verify_on_edit: Option<bool>,
+    webmcp_auto_handoff_dir: Option<bool>,
+) -> Result<DashboardSnapshot, String> {
+    {
+        let mut cfg = state.config.write().await;
+        if let Some(profile) = webmcp_default_profile {
+            let parsed = crate::config::McpToolProfile::parse(&profile).ok_or_else(|| {
+                format!("WebMCP profile tidak valid: '{profile}'. Pilih 'compact' atau 'full'.")
+            })?;
+            cfg.webmcp_default_profile = parsed.as_str().to_string();
+        }
+        if let Some(val) = webmcp_auto_promote_secs {
+            cfg.webmcp_auto_promote_secs = val.clamp(10, 24);
+        }
+        if let Some(val) = webmcp_poll_wait_secs {
+            cfg.webmcp_poll_wait_secs = val.clamp(5, 26);
+        }
+        if let Some(val) = webmcp_rpc_timeout_secs {
+            let min_rpc = cfg.effective_webmcp_poll_wait_secs().saturating_add(6);
+            cfg.webmcp_rpc_timeout_secs = val.clamp(min_rpc.max(20), 55);
+        } else {
+            let min_rpc = cfg.effective_webmcp_poll_wait_secs().saturating_add(6);
+            if cfg.webmcp_rpc_timeout_secs < min_rpc {
+                cfg.webmcp_rpc_timeout_secs = min_rpc;
+            }
+        }
+        if let Some(val) = webmcp_max_output_chars {
+            cfg.webmcp_max_output_chars = val.clamp(2500, 24000);
+        }
+        if let Some(val) = webmcp_sse_keepalive {
+            cfg.webmcp_sse_keepalive = val;
+        }
+        if let Some(val) = webmcp_allow_write_delegation {
+            cfg.webmcp_allow_write_delegation = val;
+        }
+        if let Some(val) = webmcp_expose_skills {
+            cfg.webmcp_expose_skills = val;
+        }
+        if let Some(val) = webmcp_session_harness {
+            cfg.webmcp_session_harness = val;
+        }
+        if let Some(val) = webmcp_auto_verify_on_edit {
+            cfg.webmcp_auto_verify_on_edit = val;
+        }
+        if let Some(val) = webmcp_auto_handoff_dir {
+            cfg.webmcp_auto_handoff_dir = val;
+        }
+    }
+    state.save_config_state().await;
+    let snap = state.snapshot().await;
+    state.emit_dashboard().await;
+    Ok(snap)
+}
+
+#[tauri::command]
+async fn sync_workspace_handoff_now(
+    state: State<'_, Arc<AppState>>,
+    workspace_alias: Option<String>,
+) -> Result<String, String> {
+    let ws = resolve_workspace(&state, workspace_alias.as_deref(), None).await?;
+    handoff::sync_from_state(&state, &ws, handoff::HandoffTrigger::ManualSync, true).await
 }
 
 #[tauri::command]
@@ -1363,6 +1442,17 @@ async fn approve_artifact(
     if let Some(app) = state.app_handle.read().await.clone() {
         let _ = app.emit("artifact-updated", &doc);
     }
+    if (doc.session_id == "webmcp-latest" || doc.session_id.starts_with("delegated_"))
+        && handoff::workspace_has_handoff(&ws)
+    {
+        let _ = handoff::sync_from_state(
+            &state,
+            &ws,
+            handoff::HandoffTrigger::ArtifactUpdated(doc.session_id.clone()),
+            false,
+        )
+        .await;
+    }
     Ok(doc)
 }
 
@@ -1380,6 +1470,17 @@ async fn request_artifact_changes(
         .await?;
     if let Some(app) = state.app_handle.read().await.clone() {
         let _ = app.emit("artifact-updated", &doc);
+    }
+    if (doc.session_id == "webmcp-latest" || doc.session_id.starts_with("delegated_"))
+        && handoff::workspace_has_handoff(&ws)
+    {
+        let _ = handoff::sync_from_state(
+            &state,
+            &ws,
+            handoff::HandoffTrigger::ArtifactUpdated(doc.session_id.clone()),
+            false,
+        )
+        .await;
     }
     Ok(ArtifactFeedbackResult {
         artifact: doc,
@@ -1583,6 +1684,10 @@ fn main() {
     if std::env::args().any(|a| a == "--acp") {
         std::process::exit(acp_server::run_acp_server());
     }
+    if std::env::args().any(|a| a == "--benchmark-webmcp") {
+        let json_output = std::env::args().any(|a| a == "--json");
+        std::process::exit(webmcp_benchmark::run_benchmark_cli(json_output));
+    }
 
     let app_state = Arc::new(AppState::new_persistent(
         default_workspace_dir(),
@@ -1758,6 +1863,8 @@ fn main() {
             revoke_oauth_client,
             revoke_all_oauth,
             update_app_settings,
+            update_webmcp_settings,
+            sync_workspace_handoff_now,
             toggle_pin_workspace,
             set_server_port,
             configure_cloudflare_named,

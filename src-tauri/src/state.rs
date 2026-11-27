@@ -289,6 +289,17 @@ pub struct DashboardSnapshot {
     pub active_runs: Vec<crate::agent_manager::AgentRunSummary>,
     pub hooks_status: crate::hooks::HooksStatusSummary,
     pub active_lsp_servers: Vec<crate::lsp_bridge::LspServerSummary>,
+    pub webmcp_default_profile: String,
+    pub webmcp_rpc_timeout_secs: u64,
+    pub webmcp_auto_promote_secs: u64,
+    pub webmcp_poll_wait_secs: u64,
+    pub webmcp_max_output_chars: usize,
+    pub webmcp_sse_keepalive: bool,
+    pub webmcp_allow_write_delegation: bool,
+    pub webmcp_expose_skills: bool,
+    pub webmcp_session_harness: bool,
+    pub webmcp_auto_verify_on_edit: bool,
+    pub webmcp_auto_handoff_dir: bool,
 }
 
 pub struct AppState {
@@ -311,6 +322,8 @@ pub struct AppState {
     pub mcp_tasks: crate::mcp_tasks::McpTaskManager,
     pub mcp_hub: McpHubManager,
     pub lsp_manager: crate::lsp_bridge::LspManager,
+    pub webmcp_harness: crate::webmcp_harness::WebMcpHarnessManager,
+    pub handoff_manager: crate::handoff::WorkspaceHandoffManager,
     pub acp_bridge: crate::acp_server::AcpBridgeHandle,
     pub http_client: reqwest::Client,
     pub server_port: AtomicU16,
@@ -684,6 +697,8 @@ impl AppState {
             mcp_tasks: crate::mcp_tasks::McpTaskManager::default(),
             mcp_hub: McpHubManager::default(),
             lsp_manager: crate::lsp_bridge::LspManager::default(),
+            webmcp_harness: crate::webmcp_harness::WebMcpHarnessManager::default(),
+            handoff_manager: crate::handoff::WorkspaceHandoffManager::default(),
             acp_bridge: crate::acp_server::AcpBridgeHandle::default(),
             http_client,
             server_port: AtomicU16::new(server_port),
@@ -752,6 +767,7 @@ impl AppState {
         let _ = self.agent_cancel_tx.send(true);
     }
 
+    #[allow(dead_code)]
     pub fn reset_agent_cancel(&self) -> watch::Receiver<bool> {
         let _ = self.agent_cancel_tx.send(false);
         self.agent_cancel_tx.subscribe()
@@ -850,12 +866,13 @@ impl AppState {
         }
 
         let disabled_set: HashSet<String> = disabled_vec.into_iter().collect();
-        let entries = crate::skills::discover_skills(
+        let mut entries = crate::skills::discover_skills(
             &ws_roots,
             &plugins,
             self.global_skills_dir().as_deref(),
             &disabled_set,
         );
+        crate::skills::inject_builtin_skills(&mut entries, &disabled_set);
         *self.skills_cache.write().await = entries.clone();
         entries
     }
@@ -1139,6 +1156,17 @@ impl AppState {
             stream_idle_timeout_secs,
             command_execution_policy,
             command_allowlist,
+            webmcp_default_profile,
+            webmcp_rpc_timeout_secs,
+            webmcp_auto_promote_secs,
+            webmcp_poll_wait_secs,
+            webmcp_max_output_chars,
+            webmcp_sse_keepalive,
+            webmcp_allow_write_delegation,
+            webmcp_expose_skills,
+            webmcp_session_harness,
+            webmcp_auto_verify_on_edit,
+            webmcp_auto_handoff_dir,
         ) = {
             let cfg = self.config.read().await;
             (
@@ -1158,6 +1186,17 @@ impl AppState {
                 cfg.stream_idle_timeout_secs,
                 cfg.command_execution_policy.clone(),
                 cfg.command_allowlist.clone(),
+                cfg.normalized_webmcp_default_profile().to_string(),
+                cfg.effective_webmcp_rpc_timeout_secs(),
+                cfg.effective_webmcp_auto_promote_secs(),
+                cfg.effective_webmcp_poll_wait_secs(),
+                cfg.effective_webmcp_max_output_chars(),
+                cfg.webmcp_sse_keepalive,
+                cfg.webmcp_allow_write_delegation,
+                cfg.webmcp_expose_skills,
+                cfg.webmcp_session_harness,
+                cfg.webmcp_auto_verify_on_edit,
+                cfg.webmcp_auto_handoff_dir,
             )
         };
         let state_default_id = self.default_workspace_id.read().await.clone();
@@ -1362,6 +1401,17 @@ impl AppState {
             active_runs,
             hooks_status,
             active_lsp_servers,
+            webmcp_default_profile,
+            webmcp_rpc_timeout_secs,
+            webmcp_auto_promote_secs,
+            webmcp_poll_wait_secs,
+            webmcp_max_output_chars,
+            webmcp_sse_keepalive,
+            webmcp_allow_write_delegation,
+            webmcp_expose_skills,
+            webmcp_session_harness,
+            webmcp_auto_verify_on_edit,
+            webmcp_auto_handoff_dir,
         }
     }
 

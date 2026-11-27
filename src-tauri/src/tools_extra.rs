@@ -87,6 +87,138 @@ pub(crate) fn extract_outline_text(rel_path: &str, ext: &str, content: &str, max
     (output, sym_len)
 }
 
+pub(crate) fn run_find_files_blocking(
+    search_root: std::path::PathBuf,
+    canon_root: std::path::PathBuf,
+    protected_files: Vec<std::path::PathBuf>,
+    allow_sensitive: bool,
+    sensitive_patterns: Vec<String>,
+    pattern: String,
+    max_results: usize,
+) -> (Vec<String>, usize, usize, bool) {
+    let start = std::time::Instant::now();
+    let mut found = Vec::new();
+    let mut total_walked = 0usize;
+    let mut sensitive_skipped = 0usize;
+    let mut was_capped = false;
+    let pat_has_slash = pattern.contains('/') || pattern.contains('\\');
+    let pat_norm = pattern.replace('\\', "/");
+
+    let search_rel = search_root
+        .strip_prefix(&canon_root)
+        .unwrap_or(&search_root)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let searching_inside_handoff = crate::handoff::is_handoff_ignored_rel(&search_rel);
+    let root_for_filter = canon_root.clone();
+
+    let walker = WalkBuilder::new(&search_root)
+        .filter_entry(move |e| {
+            let name = e.file_name().to_string_lossy();
+            if name == ".git"
+                || name == "node_modules"
+                || name == "target"
+                || name == "dist"
+                || name.eq_ignore_ascii_case(".smart-tauri-hub")
+            {
+                return false;
+            }
+            if !searching_inside_handoff {
+                if let Ok(rel) = e.path().strip_prefix(&root_for_filter) {
+                    let rel_str = rel.to_string_lossy();
+                    if crate::handoff::is_handoff_ignored_rel(&rel_str) {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+        .build();
+
+    for entry in walker.flatten() {
+        total_walked += 1;
+        if total_walked > 5000 {
+            was_capped = true;
+            break;
+        }
+        if total_walked % 128 == 0 && start.elapsed() > Duration::from_secs(5) {
+            was_capped = true;
+            break;
+        }
+
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let rel_obj = path.strip_prefix(&canon_root).unwrap_or(path);
+        let rel_str = rel_obj.to_string_lossy().replace('\\', "/");
+        if check_sensitive_guard_parts(
+            &protected_files,
+            &canon_root,
+            allow_sensitive,
+            &sensitive_patterns,
+            path,
+            &rel_str,
+        )
+        .is_err()
+        {
+            sensitive_skipped += 1;
+            continue;
+        }
+
+        let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let matched = if pat_has_slash {
+            wildcard_match(&pat_norm, &rel_str)
+        } else {
+            wildcard_match(&pat_norm, fname) || wildcard_match(&pat_norm, &rel_str)
+        };
+        if matched {
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            found.push(format!("{rel_str} ({size} B)"));
+            if found.len() >= max_results {
+                break;
+            }
+        }
+    }
+
+    (found, total_walked, sensitive_skipped, was_capped)
+}
+
+pub(crate) fn format_find_files_output(
+    pattern: &str,
+    found: &[String],
+    total_walked: usize,
+    sensitive_skipped: usize,
+    was_capped: bool,
+) -> String {
+    let mut notes = Vec::new();
+    if was_capped {
+        notes.push("[Scan dibatasi untuk menjaga responsivitas — persempit parameter 'path']".to_string());
+    }
+    if sensitive_skipped > 0 {
+        notes.push(format!(
+            "[Sensitive File Guard: {sensitive_skipped} file sensitif dilewati]"
+        ));
+    }
+    let notes_suffix = if notes.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{}", notes.join("\n"))
+    };
+
+    if found.is_empty() {
+        format!("Tidak ada file yang cocok dengan pola '{pattern}' ({total_walked} entri dipindai).{notes_suffix}")
+    } else {
+        format!(
+            "Ditemukan {} file cocok pola '{}':\n{}{}",
+            found.len(),
+            pattern,
+            found.join("\n"),
+            notes_suffix
+        )
+    }
+}
+
 pub async fn exec_find_files(
     state: &AppState,
     source: &str,
@@ -119,102 +251,21 @@ pub async fn exec_find_files(
 
     let (found, total_walked, sensitive_skipped, was_capped) =
         tokio::task::spawn_blocking(move || {
-            let start = std::time::Instant::now();
-            let mut found = Vec::new();
-            let mut total_walked = 0usize;
-            let mut sensitive_skipped = 0usize;
-            let mut was_capped = false;
-            let pat_has_slash = pat_clone.contains('/') || pat_clone.contains('\\');
-            let pat_norm = pat_clone.replace('\\', "/");
-
-            let walker = WalkBuilder::new(&search_root)
-                .filter_entry(|e| {
-                    let name = e.file_name().to_string_lossy();
-                    name != ".git"
-                        && name != "node_modules"
-                        && name != "target"
-                        && name != "dist"
-                        && !name.eq_ignore_ascii_case(".smart-tauri-hub")
-                })
-                .build();
-
-            for entry in walker.flatten() {
-                total_walked += 1;
-                if total_walked > 5000 {
-                    was_capped = true;
-                    break;
-                }
-                if total_walked % 128 == 0 && start.elapsed() > Duration::from_secs(5) {
-                    was_capped = true;
-                    break;
-                }
-
-                let path = entry.path();
-                if !path.is_file() {
-                    continue;
-                }
-                let rel_obj = path.strip_prefix(&canon_root).unwrap_or(path);
-                let rel_str = rel_obj.to_string_lossy().replace('\\', "/");
-                if check_sensitive_guard_parts(
-                    &protected_files,
-                    &canon_root,
-                    allow_sensitive,
-                    &sensitive_patterns,
-                    path,
-                    &rel_str,
-                )
-                .is_err()
-                {
-                    sensitive_skipped += 1;
-                    continue;
-                }
-
-                let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                let matched = if pat_has_slash {
-                    wildcard_match(&pat_norm, &rel_str)
-                } else {
-                    wildcard_match(&pat_norm, fname) || wildcard_match(&pat_norm, &rel_str)
-                };
-                if matched {
-                    let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    found.push(format!("{rel_str} ({size} B)"));
-                    if found.len() >= max_results {
-                        break;
-                    }
-                }
-            }
-
-            (found, total_walked, sensitive_skipped, was_capped)
+            run_find_files_blocking(
+                search_root,
+                canon_root,
+                protected_files,
+                allow_sensitive,
+                sensitive_patterns,
+                pat_clone,
+                max_results,
+            )
         })
         .await
         .map_err(|e| format!("Gagal memindai file: {e}"))?;
 
-    let mut notes = Vec::new();
-    if was_capped {
-        notes.push("[Scan dibatasi untuk menjaga responsivitas — persempit parameter 'path']".to_string());
-    }
-    if sensitive_skipped > 0 {
-        notes.push(format!(
-            "[Sensitive File Guard: {sensitive_skipped} file sensitif dilewati]"
-        ));
-    }
-    let notes_suffix = if notes.is_empty() {
-        String::new()
-    } else {
-        format!("\n\n{}", notes.join("\n"))
-    };
-
-    let output = if found.is_empty() {
-        format!("Tidak ada file yang cocok dengan pola '{pattern}' ({total_walked} entri dipindai).{notes_suffix}")
-    } else {
-        format!(
-            "Ditemukan {} file cocok pola '{}':\n{}{}",
-            found.len(),
-            pattern,
-            found.join("\n"),
-            notes_suffix
-        )
-    };
+    let output =
+        format_find_files_output(&pattern, &found, total_walked, sensitive_skipped, was_capped);
 
     let tokens_saved = 200;
     state
@@ -802,13 +853,14 @@ pub async fn exec_start_command_job(
         .and_then(|v| v.as_u64())
         .unwrap_or(300);
 
-    let (summary, _rx) = jobs::start_job_with_handle(
+    let (summary, _rx) = jobs::start_job_for_source(
         state,
         &ws.canon_root,
         command,
         label,
         timeout_secs,
         Some(ws.alias.clone()),
+        Some(source.to_string()),
     )
     .await?;
 
@@ -839,9 +891,10 @@ pub async fn exec_start_command_job(
         )
         .await;
 
+    let poll_wait_secs = state.config.read().await.effective_webmcp_poll_wait_secs();
     Ok(format!(
-        "JOB_STARTED: {}\nWORKSPACE: @{}\nCOMMAND: {}\nSTATUS: running\nGunakan poll_command_job(job_id=\"{}\", from_line=0) — tool ini otomatis menunggu s.d. 12 detik hingga selesai tanpa perlu perintah sleep.",
-        summary.job_id, ws.alias, summary.command, summary.job_id
+        "JOB_STARTED: {}\nWORKSPACE: @{}\nCOMMAND: {}\nSTATUS: running\nGunakan poll_command_job(job_id=\"{}\", from_line=0) — tool ini otomatis menunggu s.d. {} detik hingga selesai tanpa perlu perintah sleep.",
+        summary.job_id, ws.alias, summary.command, summary.job_id, poll_wait_secs
     ))
 }
 
@@ -881,10 +934,15 @@ pub async fn exec_poll_command_job(
         .get("max_lines")
         .and_then(|v| v.as_u64())
         .unwrap_or(80) as usize;
+    let default_wait = if source == "WebMCP" {
+        state.config.read().await.effective_webmcp_poll_wait_secs()
+    } else {
+        0
+    };
     let wait_secs = args
         .get("wait_secs")
         .and_then(|v| v.as_u64())
-        .unwrap_or(if source == "WebMCP" { 12 } else { 0 });
+        .unwrap_or(default_wait);
     jobs::poll_job_with_wait(state, job_id, from_line, max_lines, wait_secs).await
 }
 

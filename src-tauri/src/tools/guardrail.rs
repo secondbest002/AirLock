@@ -1,4 +1,4 @@
-use super::schemas::requires_hitl_in_safe_edit;
+use super::schemas::{normalized_arg_str, requires_hitl_in_safe_edit};
 use crate::security::{is_airlock_internal_path, is_sensitive_path};
 use crate::state::{AppState, PendingToolApproval, ToolApprovalDecision};
 use crate::workspace::ResolvedWorkspace;
@@ -45,9 +45,14 @@ pub(crate) async fn enforce_run_mode_gate(
     let Some(ctx) = run_ctx else {
         return Ok(());
     };
-    if !is_read_only && ctx.execution_mode == "read_only_subagent" {
+    if !is_read_only
+        && matches!(
+            ctx.execution_mode.as_str(),
+            "read_only_subagent" | "delegated_read_only"
+        )
+    {
         return Err(format!(
-            "Diblokir oleh Subagent Read-Only Sandbox: tool mutatif '{tool_name}' tidak diizinkan."
+            "Diblokir oleh Sandbox Read-Only: tool mutatif '{tool_name}' tidak diizinkan."
         ));
     }
     if !is_read_only
@@ -74,6 +79,27 @@ pub async fn enforce_guardrail_gate_for_workspace(
     is_read_only: bool,
     ws: Option<&ResolvedWorkspace>,
 ) -> Result<(), String> {
+    enforce_guardrail_gate_with_run_status(
+        state,
+        source,
+        tool_name,
+        args,
+        is_read_only,
+        ws,
+        None,
+    )
+    .await
+}
+
+pub async fn enforce_guardrail_gate_with_run_status(
+    state: &AppState,
+    source: &str,
+    tool_name: &str,
+    args: &Value,
+    is_read_only: bool,
+    ws: Option<&ResolvedWorkspace>,
+    run_id: Option<&str>,
+) -> Result<(), String> {
     let mode = match ws {
         Some(w) => w.effective_guardrail.clone(),
         None => state.guardrail_mode.read().await.clone(),
@@ -89,7 +115,11 @@ pub async fn enforce_guardrail_gate_for_workspace(
     let is_shell_tool = matches!(
         tool_name,
         "run_command_compressed" | "patch_and_verify" | "start_command_job"
-    );
+    ) || (tool_name == "run_command"
+        && !matches!(
+            normalized_arg_str(args, "action", "run").as_str(),
+            "poll" | "stop"
+        ));
     let cmd_policy = state.config.read().await.command_execution_policy.clone();
     let hitl_from_safe_edit =
         mode == "safe_edit" && requires_hitl_in_safe_edit(tool_name, args, is_read_only);
@@ -164,7 +194,34 @@ pub async fn enforce_guardrail_gate_for_workspace(
             let _ = app.emit("tool-approval-request", &info);
         }
 
-        let res = tokio::time::timeout(Duration::from_secs(90), rx).await;
+        let res = {
+            if let Some(rid) = run_id {
+                state
+                    .agent_manager
+                    .notify_run_status(
+                        rid,
+                        crate::agent_manager::AgentRunStatus::AwaitingApproval,
+                        format!("Menunggu persetujuan HITL untuk '{}'", tool_name),
+                        Some(format!(
+                            "Pending HITL approval request '{request_id}' for tool '{tool_name}' on Airlock desktop UI"
+                        )),
+                    )
+                    .await;
+            }
+            let out = tokio::time::timeout(Duration::from_secs(90), rx).await;
+            if let Some(rid) = run_id {
+                state
+                    .agent_manager
+                    .notify_run_status(
+                        rid,
+                        crate::agent_manager::AgentRunStatus::Running,
+                        format!("Melanjutkan setelah konfirmasi '{tool_name}'"),
+                        None,
+                    )
+                    .await;
+            }
+            out
+        };
 
         {
             let mut pending = state.pending_tool_approvals.write().await;

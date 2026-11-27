@@ -81,12 +81,139 @@ pub(crate) async fn exec_run_command(
     ws: &ResolvedWorkspace,
     args: &Value,
 ) -> Result<String, String> {
-    let command = args
+    run_command_with_tool_name(state, source, ws, args, "run_command_compressed", false).await
+}
+
+pub(crate) async fn exec_run_command_unified(
+    state: &AppState,
+    source: &str,
+    ws: &ResolvedWorkspace,
+    args: &Value,
+) -> Result<String, String> {
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "run".to_string());
+
+    match action.as_str() {
+        "run" => run_command_with_tool_name(state, source, ws, args, "run_command", true).await,
+        "start" => {
+            let commands = parse_run_commands(args)?;
+            let label = args
+                .get("label")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let timeout_secs = args
+                .get("timeout_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(180);
+            let (summary, _rx) = jobs::start_pipeline_job_for_source(
+                state,
+                &ws.canon_root,
+                &commands,
+                label,
+                timeout_secs,
+                Some(ws.alias.clone()),
+                Some(source.to_string()),
+            )
+            .await?;
+
+            state
+                .record_audit(
+                    AuditEntry {
+                        id: AppState::next_audit_id(),
+                        timestamp: AppState::now_timestamp(),
+                        source: source.to_string(),
+                        tool_name: "run_command".to_string(),
+                        target_path: None,
+                        summary: format!("Started job {}: {}", summary.job_id, summary.command),
+                        diff_text: None,
+                        can_revert: false,
+                        reverted: false,
+                        tokens_saved: 0,
+                        original_content: None,
+                        original_blob_hash: None,
+                        file_existed_before: false,
+                        post_edit_hash: None,
+                        group_id: None,
+                        move_from_path: None,
+                        workspace_id: Some(ws.id.clone()),
+                        workspace_alias: Some(ws.alias.clone()),
+                        workspace_root: Some(ws.clean_path.clone()),
+                    },
+                    0,
+                )
+                .await;
+
+            let poll_wait_secs = state.config.read().await.effective_webmcp_poll_wait_secs();
+            Ok(format!(
+                "JOB_STARTED: {}\nWORKSPACE: @{}\nCOMMAND: {}\nSTATUS: running\nGunakan run_command(action=\"poll\", job_id=\"{}\", from_line=0) — tool ini otomatis menunggu s.d. {} detik hingga selesai tanpa perlu perintah sleep.",
+                summary.job_id, ws.alias, summary.command, summary.job_id, poll_wait_secs
+            ))
+        }
+        _ => Err(format!(
+            "Parameter 'action' tidak valid ('{action}'). Pilih: run, start, poll, atau stop."
+        )),
+    }
+}
+
+fn parse_run_commands(args: &Value) -> Result<Vec<String>, String> {
+    let single = args
         .get("command")
         .and_then(|v| v.as_str())
-        .ok_or("Argumen 'command' wajib diisi.")?;
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let multi = match args.get("commands") {
+        Some(v) if !v.is_null() => {
+            let list: Vec<String> = serde_json::from_value(v.clone())
+                .map_err(|e| format!("Format 'commands' tidak valid: {e}"))?;
+            let cleaned: Vec<String> = list
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if cleaned.is_empty() {
+                return Err("Array 'commands' tidak boleh kosong.".to_string());
+            }
+            if cleaned.len() > 5 {
+                return Err(format!(
+                    "Pipeline maksimal 5 command sekaligus (diterima {}).",
+                    cleaned.len()
+                ));
+            }
+            Some(cleaned)
+        }
+        _ => None,
+    };
+
+    match (single, multi) {
+        (Some(_), Some(_)) => {
+            Err("Isi salah satu: 'command' (tunggal) ATAU 'commands' (array 1..5), bukan keduanya.".to_string())
+        }
+        (Some(cmd), None) => Ok(vec![cmd]),
+        (None, Some(cmds)) => Ok(cmds),
+        (None, None) => Err("Argumen 'command' atau 'commands' wajib diisi.".to_string()),
+    }
+}
+
+async fn run_command_with_tool_name(
+    state: &AppState,
+    source: &str,
+    ws: &ResolvedWorkspace,
+    args: &Value,
+    audit_tool_name: &str,
+    is_unified: bool,
+) -> Result<String, String> {
+    let commands = parse_run_commands(args)?;
     let (cmd_policy, cmd_allowlist) = state.command_policy_and_allowlist().await;
-    validate_command_with_policy(command, &cmd_policy, &cmd_allowlist)?;
+    for cmd in &commands {
+        validate_command_with_policy(cmd, &cmd_policy, &cmd_allowlist)?;
+    }
 
     let max_lines = args
         .get("max_lines")
@@ -94,11 +221,25 @@ pub(crate) async fn exec_run_command(
         .unwrap_or(60)
         .clamp(12, 200) as usize;
 
+    let (default_promote_secs, poll_wait_secs, rpc_timeout_secs) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.effective_webmcp_auto_promote_secs(),
+            cfg.effective_webmcp_poll_wait_secs(),
+            cfg.effective_webmcp_rpc_timeout_secs(),
+        )
+    };
     let explicit_promote = args
         .get("auto_promote_secs")
         .and_then(|v| v.as_u64())
-        .map(|s| s.clamp(3, 20));
-    let promote_secs = explicit_promote.or_else(|| if source == "WebMCP" { Some(9) } else { None });
+        .map(|s| s.clamp(1, 25));
+    let promote_secs = explicit_promote.or_else(|| {
+        if source == "WebMCP" || commands.len() > 1 {
+            Some(default_promote_secs)
+        } else {
+            None
+        }
+    });
 
     if let Some(p_secs) = promote_secs {
         let bg_timeout = args
@@ -106,14 +247,16 @@ pub(crate) async fn exec_run_command(
             .and_then(|v| v.as_u64())
             .unwrap_or(300)
             .clamp(15, 1800);
-        let cmd_label: String = command.chars().take(48).collect();
-        let (summary, mut done_rx) = jobs::start_job_with_handle(
+        let cmd_display = commands.join(" && ");
+        let cmd_label: String = cmd_display.chars().take(48).collect();
+        let (summary, mut done_rx) = jobs::start_pipeline_job_for_source(
             state,
             &ws.canon_root,
-            command,
+            &commands,
             Some(format!("Auto: {cmd_label}")),
             bg_timeout,
             Some(ws.alias.clone()),
+            Some(source.to_string()),
         )
         .await?;
 
@@ -140,9 +283,9 @@ pub(crate) async fn exec_run_command(
                         id: AppState::next_audit_id(),
                         timestamp: AppState::now_timestamp(),
                         source: source.to_string(),
-                        tool_name: "run_command_compressed".to_string(),
+                        tool_name: audit_tool_name.to_string(),
                         target_path: None,
-                        summary: format!("$ {command} (exit {code})"),
+                        summary: format!("$ {cmd_display} (exit {code})"),
                         diff_text: Some(compressed.clone()),
                         can_revert: false,
                         reverted: false,
@@ -180,9 +323,9 @@ pub(crate) async fn exec_run_command(
                     id: AppState::next_audit_id(),
                     timestamp: AppState::now_timestamp(),
                     source: source.to_string(),
-                    tool_name: "run_command_compressed".to_string(),
+                    tool_name: audit_tool_name.to_string(),
                     target_path: None,
-                    summary: format!("$ {command} (auto-promoted -> {})", summary.job_id),
+                    summary: format!("$ {cmd_display} (auto-promoted -> {})", summary.job_id),
                     diff_text: Some(recent.clone()),
                     can_revert: false,
                     reverted: false,
@@ -201,16 +344,25 @@ pub(crate) async fn exec_run_command(
             )
             .await;
 
+        let hint_line = if is_unified {
+            format!(
+                "Command exceeded {}s sync window and is continuing in background. Call run_command(action=\"poll\", job_id=\"{}\", from_line={}) (auto long-polls up to {}s; do NOT run sleep), or run_command(action=\"stop\", job_id=\"{}\") to cancel.",
+                p_secs, summary.job_id, total_lines, poll_wait_secs, summary.job_id
+            )
+        } else {
+            format!(
+                "Command exceeded {}s sync window and is continuing in background. Call poll_command_job(job_id=\"{}\", from_line={}) (it automatically long-polls up to {}s; do NOT run sleep), or stop_command_job(job_id=\"{}\") to cancel.",
+                p_secs, summary.job_id, total_lines, poll_wait_secs, summary.job_id
+            )
+        };
+
         return Ok(format!(
-            "AUTO_PROMOTED_TO_BACKGROUND_JOB\nJOB_ID: {}\nWORKSPACE: @{}\nSTATUS: running\nELAPSED: {}s\nNEXT_FROM_LINE: {}\nHINT: Command exceeded {}s sync window and is continuing in background. Call poll_command_job(job_id=\"{}\", from_line={}) (it automatically long-polls up to 12s; do NOT run sleep), or stop_command_job(job_id=\"{}\") to cancel.\nRECENT OUTPUT:\n{}",
+            "AUTO_PROMOTED_TO_BACKGROUND_JOB\nJOB_ID: {}\nWORKSPACE: @{}\nSTATUS: running\nELAPSED: {}s\nNEXT_FROM_LINE: {}\nHINT: {}\nRECENT OUTPUT:\n{}",
             summary.job_id,
             ws.alias,
             elapsed,
             total_lines,
-            p_secs,
-            summary.job_id,
-            total_lines,
-            summary.job_id,
+            hint_line,
             if recent.is_empty() {
                 "(waiting for output...)"
             } else {
@@ -219,7 +371,12 @@ pub(crate) async fn exec_run_command(
         ));
     }
 
-    let max_timeout = if source == "WebMCP" { 22 } else { 60 };
+    let command = &commands[0];
+    let max_timeout = if source == "WebMCP" {
+        rpc_timeout_secs.saturating_sub(2).max(20)
+    } else {
+        60
+    };
     let timeout_secs = args
         .get("timeout_secs")
         .and_then(|v| v.as_u64())
@@ -236,7 +393,7 @@ pub(crate) async fn exec_run_command(
                 id: AppState::next_audit_id(),
                 timestamp: AppState::now_timestamp(),
                 source: source.to_string(),
-                tool_name: "run_command_compressed".to_string(),
+                tool_name: audit_tool_name.to_string(),
                 target_path: None,
                 summary: format!("$ {command} (exit {exit_code})"),
                 diff_text: Some(compressed.clone()),

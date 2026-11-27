@@ -2,7 +2,7 @@ use crate::process_util::kill_pid_tree;
 use crate::security::{compress_output, resolve_jailed_path};
 use crate::state::{AppState, AuditEntry};
 use crate::tools::{check_sensitive_guard_for_workspace, sha256_hex};
-use crate::workspace::{clean_path_string, normalize_clean_path, ResolvedWorkspace};
+use crate::workspace::{clean_path_string, ResolvedWorkspace};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -1403,9 +1403,200 @@ pub async fn exec_lsp_hover(
     Ok(compressed)
 }
 
+/// Warm-only post-edit diagnostic check. Queries ONLY already-running LSP servers
+/// in `LspManager.servers` (never triggers a cold spawn) within `timeout`.
+pub async fn quick_diagnostics_for_files(
+    state: &AppState,
+    ws: &ResolvedWorkspace,
+    rel_paths: &[String],
+    timeout: Duration,
+) -> Option<String> {
+    let mut unique_paths = Vec::new();
+    for p in rel_paths {
+        let trimmed = p.trim();
+        if !trimmed.is_empty() && !unique_paths.iter().any(|u| u == trimmed) {
+            unique_paths.push(trimmed.to_string());
+        }
+    }
+    if unique_paths.is_empty() {
+        return None;
+    }
+
+    let ws_key = if cfg!(target_os = "windows") {
+        ws.clean_path.to_ascii_lowercase()
+    } else {
+        ws.clean_path.clone()
+    };
+
+    let mut supported_targets: Vec<(String, &'static str)> = Vec::new();
+    for rel in &unique_paths {
+        let ext = Path::new(rel)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if let Some((lang_id, _, _)) = detect_lsp_for_ext(ext) {
+            supported_targets.push((rel.clone(), lang_id));
+        }
+    }
+    if supported_targets.is_empty() {
+        return None;
+    }
+
+    let mut warm_targets: Vec<(String, Arc<LspClient>)> = Vec::new();
+    let mut cold_langs: Vec<&'static str> = Vec::new();
+    {
+        let servers = state.lsp_manager.servers.read().await;
+        for (rel, lang_id) in supported_targets {
+            let key = format!("{ws_key}::{lang_id}");
+            if let Some(existing) = servers.get(&key) {
+                let mut child = existing.child.lock().await;
+                let exited = matches!(child.try_wait(), Ok(Some(_)));
+                drop(child);
+                if !exited {
+                    warm_targets.push((rel, Arc::clone(existing)));
+                    continue;
+                }
+            }
+            if !cold_langs.contains(&lang_id) {
+                cold_langs.push(lang_id);
+            }
+        }
+    }
+
+    if warm_targets.is_empty() {
+        return Some(
+            "(LSP post-check skipped: language server cold — jalankan lsp_query op='diagnostics' jika dibutuhkan)".to_string(),
+        );
+    }
+
+    let checked_count = warm_targets.len();
+    let deadline = Instant::now() + timeout;
+    let query_res = tokio::time::timeout(timeout, async move {
+        let mut lines_out: Vec<String> = Vec::new();
+        for (rel, client) in warm_targets {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            *client.last_used.write().await = Instant::now();
+            let Ok((_, uri)) = client.sync_document(state, ws, &rel).await else {
+                continue;
+            };
+            let mut items: Vec<Value> = Vec::new();
+            let req_secs = remaining.as_secs().clamp(1, 2);
+            if let Ok(pull_resp) = client
+                .send_request(
+                    "textDocument/diagnostic",
+                    json!({ "textDocument": { "uri": uri } }),
+                    req_secs,
+                )
+                .await
+            {
+                if let Some(arr) = pull_resp["result"]["items"].as_array() {
+                    items = arr.clone();
+                }
+            }
+            if items.is_empty() {
+                let key_uri = normalize_uri_key(&uri);
+                let mut cached = client
+                    .diagnostics
+                    .read()
+                    .await
+                    .get(&key_uri)
+                    .cloned()
+                    .unwrap_or_default();
+                if cached.is_empty() {
+                    let wait_ms = deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(180));
+                    if !wait_ms.is_zero() {
+                        tokio::time::sleep(wait_ms).await;
+                    }
+                    cached = client
+                        .diagnostics
+                        .read()
+                        .await
+                        .get(&key_uri)
+                        .cloned()
+                        .unwrap_or_default();
+                }
+                items = cached;
+            }
+            for d in items {
+                let sev_code = d["severity"].as_u64().unwrap_or(1);
+                if sev_code <= 2 {
+                    lines_out.push(format!("{rel}: {}", format_lsp_diagnostic_line(&d)));
+                }
+            }
+        }
+        lines_out
+    })
+    .await;
+
+    let cold_note = if cold_langs.is_empty() {
+        String::new()
+    } else {
+        format!(" [cold skipped: {}]", cold_langs.join(", "))
+    };
+
+    match query_res {
+        Ok(lines_out) => {
+            if lines_out.is_empty() {
+                Some(format!(
+                    "LSP_POST_CHECK: (warm · {checked_count} file{cold_note}) 0 error/warning."
+                ))
+            } else {
+                let shown: Vec<String> = lines_out.iter().take(20).cloned().collect();
+                let extra = lines_out.len().saturating_sub(shown.len());
+                let suffix = if extra > 0 {
+                    format!("\n... (+{extra} diagnostic lagi)")
+                } else {
+                    String::new()
+                };
+                Some(format!(
+                    "LSP_POST_CHECK: (warm · {} item{}):\n{}{}",
+                    lines_out.len(),
+                    cold_note,
+                    shown.join("\n"),
+                    suffix
+                ))
+            }
+        }
+        Err(_) => Some(format!(
+            "LSP_POST_CHECK: timed out after {}ms{cold_note} — jalankan lsp_query op='diagnostics' jika dibutuhkan",
+            timeout.as_millis()
+        )),
+    }
+}
+
+pub async fn exec_lsp_query(
+    state: &AppState,
+    source: &str,
+    ws: &ResolvedWorkspace,
+    args: &Value,
+) -> Result<String, String> {
+    let op = args
+        .get("op")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "diagnostics".to_string());
+
+    match op.as_str() {
+        "diagnostics" | "diag" => exec_lsp_diagnostics(state, source, ws, args).await,
+        "definition" | "def" => exec_lsp_definition(state, source, ws, args).await,
+        "references" | "refs" => exec_lsp_references(state, source, ws, args).await,
+        "hover" => exec_lsp_hover(state, source, ws, args).await,
+        _ => Err(format!(
+            "Parameter 'op' tidak valid ('{op}'). Pilih: diagnostics, definition, references, atau hover."
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::normalize_clean_path;
 
     #[tokio::test]
     async fn test_lsp_content_length_framing_with_utf8_multibyte() {

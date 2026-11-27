@@ -57,6 +57,7 @@ async fn proxy_line_to_hub(
         .bearer_auth(token)
         .header("Accept", "application/json")
         .header("Content-Type", "application/json")
+        .header("X-Airlock-Profile", "full")
         .json(msg);
     if let Some(sid) = session_id.as_deref() {
         req = req.header("mcp-session-id", sid);

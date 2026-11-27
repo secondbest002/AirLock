@@ -648,7 +648,10 @@
                     <h2 class="card-heading">Embedded MCP Server (Route A)</h2>
                     <p class="card-desc">Streamable HTTP JSON-RPC 2.0 + Bearer Token Auth di localhost.</p>
                   </div>
-                  <span id="bridge-server-pill" class="badge badge-muted">OFFLINE</span>
+                  <div class="btn-row">
+                    <span id="bridge-webmcp-profile-badge" class="badge badge-muted">COMPACT (9 TOOLS)</span>
+                    <span id="bridge-server-pill" class="badge badge-muted">OFFLINE</span>
+                  </div>
                 </div>
 
                 <div class="kv-grid">
@@ -816,6 +819,85 @@
                       <button id="btn-reset-command-allowlist" type="button" class="btn btn-secondary btn-xs">Reset Default</button>
                     </div>
                   </div>
+                </div>
+              </article>
+
+              <article class="card card-span-2">
+                <div class="card-header-row">
+                  <div>
+                    <h2 class="card-heading">WebMCP Optimization (Gemini Web &amp; Remote Clients)</h2>
+                    <p class="card-desc">Atur profil tool default, jendela auto-promote, long-poll wait, budget output, SSE keepalive, dan delegasi Local Agent.</p>
+                  </div>
+                  <button id="btn-save-webmcp" type="button" class="btn btn-primary btn-xs">Save WebMCP Settings</button>
+                </div>
+                <div class="kv-grid">
+                  <div class="kv-item">
+                    <label for="webmcp-profile-select" class="kv-label">Default WebMCP Tool Profile</label>
+                    <select id="webmcp-profile-select" class="mono-select">
+                      <option value="compact" selected>Compact (~9 Super-Tools, Anti-Timeout)</option>
+                      <option value="full">Full (All Granular Tools)</option>
+                    </select>
+                  </div>
+                  <div class="kv-item">
+                    <label for="webmcp-promote-input" class="kv-label">Auto-Promote Sync Window (10-24s)</label>
+                    <input id="webmcp-promote-input" type="number" min="10" max="24" value="18" class="mono-input" />
+                  </div>
+                  <div class="kv-item">
+                    <label for="webmcp-poll-input" class="kv-label">Long-Poll Wait (5-26s)</label>
+                    <input id="webmcp-poll-input" type="number" min="5" max="26" value="22" class="mono-input" />
+                  </div>
+                  <div class="kv-item">
+                    <label for="webmcp-rpc-timeout-input" class="kv-label">RPC Soft Deadline (20-55s)</label>
+                    <input id="webmcp-rpc-timeout-input" type="number" min="20" max="55" value="32" class="mono-input" />
+                  </div>
+                  <div class="kv-item">
+                    <label for="webmcp-max-chars-input" class="kv-label">Output Guard Budget (2500-24000 chars)</label>
+                    <input id="webmcp-max-chars-input" type="number" min="2500" max="24000" step="250" value="6000" class="mono-input" />
+                  </div>
+                </div>
+                <div class="toggle-grid">
+                  <label for="toggle-webmcp-sse" class="toggle-row">
+                    <div>
+                      <span class="toggle-title">Enable SSE Keepalive for Long WebMCP Calls (&gt;3s)</span>
+                      <span class="toggle-hint">Kirim komentar SSE :keepalive setiap 6 detik bila client mengirim Accept: text/event-stream (opt-in eksperimental).</span>
+                    </div>
+                    <input id="toggle-webmcp-sse" type="checkbox" class="tactile-switch" />
+                  </label>
+                  <label for="toggle-webmcp-write-delegation" class="toggle-row">
+                    <div>
+                      <span class="toggle-title">Allow Local Agent Write Delegation (execute mode)</span>
+                      <span class="toggle-hint">Izinkan WebMCP mendelegasikan edit kode ke Local Agent secara asinkron (default OFF; mode read_only selalu aman).</span>
+                    </div>
+                    <input id="toggle-webmcp-write-delegation" type="checkbox" class="tactile-switch" />
+                  </label>
+                  <label for="toggle-webmcp-expose-skills" class="toggle-row">
+                    <div>
+                      <span class="toggle-title">Expose Skill Tools on Compact Profile</span>
+                      <span class="toggle-hint">Sertakan list_skills/load_skill/read_skill_resource pada profil Compact (+3 tool; resource skill:// tetap aktif).</span>
+                    </div>
+                    <input id="toggle-webmcp-expose-skills" type="checkbox" class="tactile-switch" />
+                  </label>
+                  <label for="toggle-webmcp-session-harness" class="toggle-row">
+                    <div>
+                      <span class="toggle-title">Session Harness &amp; Loop Guard</span>
+                      <span class="toggle-hint">Lacak sesi mcp-session-id untuk jangkar checkpoint, anti read-loop, dan saran session_checkpoint berkala.</span>
+                    </div>
+                    <input id="toggle-webmcp-session-harness" type="checkbox" class="tactile-switch" />
+                  </label>
+                  <label for="toggle-webmcp-auto-verify-edit" class="toggle-row">
+                    <div>
+                      <span class="toggle-title">Auto Warm-LSP Verify on Edit</span>
+                      <span class="toggle-hint">Jalankan diagnostic LSP hangat otomatis setelah WebMCP mengedit file (zero cold-spawn penalty).</span>
+                    </div>
+                    <input id="toggle-webmcp-auto-verify-edit" type="checkbox" class="tactile-switch" />
+                  </label>
+                  <label for="toggle-webmcp-auto-handoff" class="toggle-row">
+                    <div>
+                      <span class="toggle-title">Auto-Export Workspace .airlock/HANDOFF.md</span>
+                      <span class="toggle-hint">Sinkronkan otomatis progres, checkpoint, diff, dan audit WebMCP ke .airlock/ lokal (otomatis masuk .git/info/exclude).</span>
+                    </div>
+                    <input id="toggle-webmcp-auto-handoff" type="checkbox" class="tactile-switch" checked />
+                  </label>
                 </div>
               </article>
 
@@ -991,6 +1073,10 @@
                       <option value="upsert_artifact">upsert_artifact</option>
                       <option value="request_plan_approval">request_plan_approval</option>
                       <option value="spawn_subagent">spawn_subagent</option>
+                      <option value="run_command">run_command</option>
+                      <option value="lsp_query">lsp_query</option>
+                      <option value="session_checkpoint">session_checkpoint</option>
+                      <option value="delegate_local_agent">delegate_local_agent</option>
                     </select>
                     <button id="btn-copy-sim-rpc" type="button" class="btn btn-secondary">Copy JSON-RPC</button>
                     <button id="btn-run-sim" type="button" class="btn btn-primary">Execute Tool</button>

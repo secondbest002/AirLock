@@ -310,6 +310,12 @@ pub async fn run_openai_compat_turn(
     let watchdog = load_watchdog_settings(&state).await;
     let max_steps = if run_ctx.depth > 0 {
         watchdog.max_steps.min(10)
+    } else if run_ctx.execution_mode.starts_with("delegated_") {
+        state
+            .agent_manager
+            .get_run_max_steps(&run_ctx.run_id)
+            .await
+            .unwrap_or_else(|| watchdog.max_steps.clamp(1, 20))
     } else {
         watchdog.max_steps
     };

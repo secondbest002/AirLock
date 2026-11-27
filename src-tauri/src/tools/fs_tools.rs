@@ -51,6 +51,25 @@ struct BatchSearchSpec {
 }
 
 #[derive(Debug, Deserialize)]
+struct BatchFindSpec {
+    pattern: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    max_results: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchSymbolSpec {
+    path: String,
+    query: String,
+    #[serde(default)]
+    include_docs: Option<bool>,
+    #[serde(default)]
+    max_lines: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct MultiEditFile {
     path: String,
     edits: Value,
@@ -134,16 +153,26 @@ fn scan_project_overview_blocking(root_owned: PathBuf, max_depth: usize) -> Vec<
     let mut walked = 0usize;
     let mut stopped_reason: Option<&'static str> = None;
 
+    let root_for_filter = root_owned.clone();
     let walker = WalkBuilder::new(&root_owned)
         .max_depth(Some(max_depth))
         .hidden(false)
-        .filter_entry(|e| {
+        .filter_entry(move |e| {
             let name = e.file_name().to_string_lossy();
-            name != ".git"
-                && name != "node_modules"
-                && name != "target"
-                && name != "dist"
-                && !name.eq_ignore_ascii_case(".smart-tauri-hub")
+            if name == ".git"
+                || name == "node_modules"
+                || name == "target"
+                || name == "dist"
+                || name.eq_ignore_ascii_case(".smart-tauri-hub")
+            {
+                return false;
+            }
+            if let Ok(rel) = e.path().strip_prefix(&root_for_filter) {
+                if crate::handoff::is_handoff_ignored_rel(&rel.to_string_lossy()) {
+                    return false;
+                }
+            }
+            true
         })
         .build();
 
@@ -287,16 +316,26 @@ pub(crate) async fn overview_text_for_resource(root: &Path) -> Result<String, St
     let root_owned = root.to_path_buf();
     let entries = tokio::task::spawn_blocking(move || {
         let mut out = Vec::new();
+        let root_for_filter = root_owned.clone();
         let walker = WalkBuilder::new(&root_owned)
             .max_depth(Some(3))
             .hidden(false)
-            .filter_entry(|e| {
+            .filter_entry(move |e| {
                 let name = e.file_name().to_string_lossy();
-                name != ".git"
-                    && name != "node_modules"
-                    && name != "target"
-                    && name != "dist"
-                    && !name.eq_ignore_ascii_case(".smart-tauri-hub")
+                if name == ".git"
+                    || name == "node_modules"
+                    || name == "target"
+                    || name == "dist"
+                    || name.eq_ignore_ascii_case(".smart-tauri-hub")
+                {
+                    return false;
+                }
+                if let Ok(rel) = e.path().strip_prefix(&root_for_filter) {
+                    if crate::handoff::is_handoff_ignored_rel(&rel.to_string_lossy()) {
+                        return false;
+                    }
+                }
+                true
             })
             .build();
         for entry in walker.flatten() {
@@ -374,14 +413,33 @@ fn run_smart_search_blocking(
     let mut was_capped = false;
     let mut sensitive_skipped = 0usize;
 
+    let search_rel = search_root
+        .strip_prefix(&canon_root)
+        .unwrap_or(&search_root)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let searching_inside_handoff = crate::handoff::is_handoff_ignored_rel(&search_rel);
+    let root_for_filter = canon_root.clone();
+
     let walker = WalkBuilder::new(&search_root)
-        .filter_entry(|e| {
+        .filter_entry(move |e| {
             let name = e.file_name().to_string_lossy();
-            name != ".git"
-                && name != "node_modules"
-                && name != "target"
-                && name != "dist"
-                && !name.eq_ignore_ascii_case(".smart-tauri-hub")
+            if name == ".git"
+                || name == "node_modules"
+                || name == "target"
+                || name == "dist"
+                || name.eq_ignore_ascii_case(".smart-tauri-hub")
+            {
+                return false;
+            }
+            if !searching_inside_handoff {
+                if let Ok(rel) = e.path().strip_prefix(&root_for_filter) {
+                    if crate::handoff::is_handoff_ignored_rel(&rel.to_string_lossy()) {
+                        return false;
+                    }
+                }
+            }
+            true
         })
         .build();
 
@@ -802,6 +860,39 @@ fn apply_prepared_edit(prep: &PreparedEdit) -> Result<(), String> {
         .map_err(|e| format!("Gagal menulis hasil edit ke '{}': {e}", prep.rel_path))
 }
 
+async fn append_edit_post_checks(
+    state: &AppState,
+    source: &str,
+    ws: &ResolvedWorkspace,
+    args: &Value,
+    edited_paths: &[String],
+    text: &mut String,
+) {
+    if let Some(diag) = crate::hooks::run_post_edit_hooks(state, ws, edited_paths).await {
+        text.push_str("\n\n");
+        text.push_str(&diag);
+    }
+
+    let explicit_lsp = args.get("post_check_lsp").and_then(|v| v.as_bool());
+    let run_lsp = match explicit_lsp {
+        Some(v) => v,
+        None => source == "WebMCP" && state.config.read().await.webmcp_auto_verify_on_edit,
+    };
+    if run_lsp {
+        if let Some(lsp_note) = crate::lsp_bridge::quick_diagnostics_for_files(
+            state,
+            ws,
+            edited_paths,
+            Duration::from_millis(2500),
+        )
+        .await
+        {
+            text.push_str("\n\n");
+            text.push_str(&lsp_note);
+        }
+    }
+}
+
 pub(crate) async fn exec_surgical_edit(
     state: &AppState,
     source: &str,
@@ -849,13 +940,21 @@ pub(crate) async fn exec_surgical_edit(
         )
         .await;
 
-    let hook_diag = crate::hooks::run_post_edit_hooks(state, ws, &[rel_path.to_string()]).await;
     let mut text = format!("{} on {rel_path}\n\n{}", prep.summary, prep.diff_text);
-    if let Some(diag) = hook_diag {
-        text.push_str("\n\n");
-        text.push_str(&diag);
-    }
+    append_edit_post_checks(state, source, ws, args, &[rel_path.to_string()], &mut text).await;
     Ok(text)
+}
+
+async fn acquire_ws_write_lock(
+    state: &AppState,
+    ws: &ResolvedWorkspace,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    state
+        .agent_manager
+        .workspace_write_lock(&ws.id)
+        .await
+        .lock_owned()
+        .await
 }
 
 pub(crate) async fn exec_patch_and_verify(
@@ -879,6 +978,7 @@ pub(crate) async fn exec_patch_and_verify(
     let (cmd_policy, cmd_allowlist) = state.command_policy_and_allowlist().await;
     validate_command_with_policy(verify_cmd, &cmd_policy, &cmd_allowlist)?;
 
+    let write_guard = acquire_ws_write_lock(state, ws).await;
     let prep = prepare_surgical_edits(rel_path, target, edits_val)?;
     apply_prepared_edit(&prep)?;
 
@@ -911,21 +1011,31 @@ pub(crate) async fn exec_patch_and_verify(
             2,
         )
         .await;
+    drop(write_guard);
 
+    let (default_promote_secs, poll_wait_secs) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.effective_webmcp_auto_promote_secs(),
+            cfg.effective_webmcp_poll_wait_secs(),
+        )
+    };
     let explicit_promote = args
         .get("auto_promote_secs")
         .and_then(|v| v.as_u64())
-        .map(|s| s.clamp(1, 20));
-    let promote_secs = explicit_promote.or_else(|| if source == "WebMCP" { Some(9) } else { None });
+        .map(|s| s.clamp(1, 25));
+    let promote_secs =
+        explicit_promote.or_else(|| if source == "WebMCP" { Some(default_promote_secs) } else { None });
 
     if let Some(p_secs) = promote_secs {
-        let (summary, mut done_rx) = jobs::start_job_with_handle(
+        let (summary, mut done_rx) = jobs::start_job_for_source(
             state,
             &ws.canon_root,
             verify_cmd,
             Some(format!("Verify: {rel_path}")),
             300,
             Some(ws.alias.clone()),
+            Some(source.to_string()),
         )
         .await?;
 
@@ -957,7 +1067,7 @@ pub(crate) async fn exec_patch_and_verify(
         };
 
         return Ok(format!(
-            "PATCH DIFF ({rel_path}):\n{}\nAUTO_PROMOTED_VERIFY_JOB\nJOB_ID: {}\nWORKSPACE: @{}\nSTATUS: running\nELAPSED: {}s\nNEXT_FROM_LINE: {}\nHINT: Patch was applied and recorded for rollback. Verification exceeded {}s sync window and continues in background; call poll_command_job(job_id=\"{}\", from_line={}) (it automatically long-polls up to 12s; do NOT run sleep).\nRECENT OUTPUT:\n{}",
+            "PATCH DIFF ({rel_path}):\n{}\nAUTO_PROMOTED_VERIFY_JOB\nJOB_ID: {}\nWORKSPACE: @{}\nSTATUS: running\nELAPSED: {}s\nNEXT_FROM_LINE: {}\nHINT: Patch was applied and recorded for rollback. Verification exceeded {}s sync window and continues in background; call poll_command_job(job_id=\"{}\", from_line={}) (it automatically long-polls up to {}s; do NOT run sleep).\nRECENT OUTPUT:\n{}",
             prep.diff_text,
             summary.job_id,
             ws.alias,
@@ -966,6 +1076,7 @@ pub(crate) async fn exec_patch_and_verify(
             p_secs,
             summary.job_id,
             total_lines,
+            poll_wait_secs,
             if recent.is_empty() {
                 "(waiting for output...)"
             } else {
@@ -1064,12 +1175,8 @@ pub(crate) async fn exec_write_file(
         )
         .await;
 
-    let hook_diag = crate::hooks::run_post_edit_hooks(state, ws, &[rel_path.to_string()]).await;
     let mut text = format!("Wrote {rel_path} ({} bytes)\n\n{diff_text}", content.len());
-    if let Some(diag) = hook_diag {
-        text.push_str("\n\n");
-        text.push_str(&diag);
-    }
+    append_edit_post_checks(state, source, ws, args, &[rel_path.to_string()], &mut text).await;
     Ok(text)
 }
 
@@ -1155,8 +1262,14 @@ pub(crate) async fn exec_batch_inspect(
     state: &AppState,
     source: &str,
     ws: &ResolvedWorkspace,
+    top_level_ws: Option<&str>,
+    pinned_ws: Option<&str>,
     args: &Value,
 ) -> Result<String, String> {
+    let include_instructions = args
+        .get("include_instructions")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let include_overview = args
         .get("include_overview")
         .and_then(|v| v.as_bool())
@@ -1167,32 +1280,84 @@ pub(crate) async fn exec_batch_inspect(
         .unwrap_or(2)
         .clamp(1, 4) as usize;
 
+    let find_patterns: Vec<BatchFindSpec> = match args.get("find_patterns") {
+        Some(v) if !v.is_null() => serde_json::from_value::<Vec<BatchFindSpec>>(v.clone())
+            .map_err(|e| format!("Format 'find_patterns' tidak valid: {e}"))?
+            .into_iter()
+            .take(3)
+            .collect(),
+        _ => Vec::new(),
+    };
+
     let outline_paths: Vec<String> = match args.get("outline_paths") {
-        Some(v) => serde_json::from_value::<Vec<String>>(v.clone())
+        Some(v) if !v.is_null() => serde_json::from_value::<Vec<String>>(v.clone())
             .map_err(|e| format!("Format 'outline_paths' tidak valid: {e}"))?
             .into_iter()
             .take(8)
             .collect(),
-        None => Vec::new(),
+        _ => Vec::new(),
     };
 
     let searches: Vec<BatchSearchSpec> = match args.get("searches") {
-        Some(v) => serde_json::from_value::<Vec<BatchSearchSpec>>(v.clone())
+        Some(v) if !v.is_null() => serde_json::from_value::<Vec<BatchSearchSpec>>(v.clone())
             .map_err(|e| format!("Format 'searches' tidak valid: {e}"))?
             .into_iter()
             .take(4)
             .collect(),
-        None => Vec::new(),
+        _ => Vec::new(),
     };
 
-    if !include_overview && outline_paths.is_empty() && searches.is_empty() {
+    let read_slices: Vec<BatchReadItem> = match args.get("read_slices") {
+        Some(v) if !v.is_null() => serde_json::from_value::<Vec<BatchReadItem>>(v.clone())
+            .map_err(|e| format!("Format 'read_slices' tidak valid: {e}"))?
+            .into_iter()
+            .take(6)
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    let symbol_reads: Vec<BatchSymbolSpec> = match args.get("symbol_reads") {
+        Some(v) if !v.is_null() => serde_json::from_value::<Vec<BatchSymbolSpec>>(v.clone())
+            .map_err(|e| format!("Format 'symbol_reads' tidak valid: {e}"))?
+            .into_iter()
+            .take(6)
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    if !include_instructions
+        && !include_overview
+        && find_patterns.is_empty()
+        && outline_paths.is_empty()
+        && searches.is_empty()
+        && read_slices.is_empty()
+        && symbol_reads.is_empty()
+    {
         return Err(
-            "batch_inspect memerlukan minimal satu dari: include_overview=true, outline_paths, atau searches."
+            "batch_inspect memerlukan minimal satu dari: include_instructions=true, include_overview=true, find_patterns, outline_paths, searches, read_slices, atau symbol_reads."
                 .to_string(),
         );
     }
 
+    // Resolve slice workspaces upfront so pinned_ws isolation is enforced immediately.
+    let mut resolved_slices: Vec<(ResolvedWorkspace, BatchReadItem)> =
+        Vec::with_capacity(read_slices.len());
+    let has_slice_ws_override = read_slices
+        .iter()
+        .any(|i| i.workspace.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false));
+    for item in read_slices {
+        let item_ws = match item.workspace.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(ws_req) => resolve_workspace(state, Some(ws_req), pinned_ws).await?,
+            None => match top_level_ws {
+                Some(top_ws) => resolve_workspace(state, Some(top_ws), pinned_ws).await?,
+                None => ws.clone(),
+            },
+        };
+        resolved_slices.push((item_ws, item));
+    }
+
     let protected_files = protected_internal_files(state);
+    let is_webmcp = source == "WebMCP";
 
     let overview_fut = async {
         if include_overview {
@@ -1204,6 +1369,57 @@ pub(crate) async fn exec_batch_inspect(
         } else {
             None
         }
+    };
+
+    let finds_fut = async {
+        let mut set: JoinSet<(usize, String)> = JoinSet::new();
+        for (idx, spec) in find_patterns.into_iter().enumerate() {
+            let ws_clone = ws.clone();
+            let prot = protected_files.clone();
+            let pat_raw = spec.pattern;
+            let pat = pat_raw.trim().to_string();
+            let sub = spec.path;
+            let max_r = spec.max_results.unwrap_or(40).clamp(1, 100) as usize;
+            set.spawn_blocking(move || {
+                let res = (|| -> Result<String, String> {
+                    if pat.is_empty() {
+                        return Err("Parameter 'pattern' tidak boleh kosong.".to_string());
+                    }
+                    let search_root = match sub.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                        Some(p) => resolve_jailed_path(&ws_clone.canon_root, p)?,
+                        None => resolve_jailed_path(&ws_clone.canon_root, ".")?,
+                    };
+                    let (found, walked, skipped, capped) = crate::tools_extra::run_find_files_blocking(
+                        search_root,
+                        ws_clone.canon_root.clone(),
+                        prot,
+                        ws_clone.effective_allow_sensitive,
+                        ws_clone.effective_sensitive_patterns.clone(),
+                        pat.clone(),
+                        max_r,
+                    );
+                    Ok(format!(
+                        "[Find: '{}']\n{}",
+                        pat,
+                        crate::tools_extra::format_find_files_output(
+                            &pat, &found, walked, skipped, capped
+                        )
+                    ))
+                })();
+                match res {
+                    Ok(s) => (idx, s),
+                    Err(e) => (idx, format!("FIND ERROR ('{pat_raw}'): {e}")),
+                }
+            });
+        }
+        let mut results = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            if let Ok(item) = joined {
+                results.push(item);
+            }
+        }
+        results.sort_by_key(|(idx, _)| *idx);
+        results.into_iter().map(|(_, s)| s).collect::<Vec<_>>()
     };
 
     let outlines_fut = async {
@@ -1295,15 +1511,165 @@ pub(crate) async fn exec_batch_inspect(
         results.into_iter().map(|(_, s)| s).collect::<Vec<_>>()
     };
 
-    let (overview_res, outline_results, search_results) =
-        tokio::join!(overview_fut, outlines_fut, searches_fut);
+    let slices_fut = async {
+        let mut set: JoinSet<(usize, String)> = JoinSet::new();
+        for (idx, (item_ws, item)) in resolved_slices.into_iter().enumerate() {
+            let prot = protected_files.clone();
+            set.spawn_blocking(move || {
+                let path_err_label = item.path.clone();
+                let res = (|| -> Result<String, String> {
+                    let target = resolve_jailed_path(&item_ws.canon_root, &item.path)?;
+                    check_sensitive_guard_parts(
+                        &prot,
+                        &item_ws.canon_root,
+                        item_ws.effective_allow_sensitive,
+                        &item_ws.effective_sensitive_patterns,
+                        &target,
+                        &item.path,
+                    )?;
+                    let content = fs::read_to_string(&target)
+                        .map_err(|e| format!("Gagal membaca '{}': {e}", item.path))?;
+                    let lines: Vec<&str> = content.lines().collect();
+                    let total_lines = lines.len();
+                    let start = item.start_line.unwrap_or(1).max(1);
+                    let raw_end = item.end_line.unwrap_or(start + 119);
+                    let capped_end = if is_webmcp {
+                        raw_end.min(start + 159)
+                    } else {
+                        raw_end
+                    };
+                    let end = capped_end
+                        .min(total_lines)
+                        .max(start.saturating_sub(1));
+                    let label = if has_slice_ws_override {
+                        format!("@{}:{}", item_ws.alias, item.path)
+                    } else {
+                        item.path.clone()
+                    };
+                    let mut out = Vec::new();
+                    out.push(format!(
+                        "FILE: {} (lines {}-{} of {})",
+                        label, start, end, total_lines
+                    ));
+                    if start <= total_lines {
+                        for lidx in (start - 1)..end {
+                            out.push(format!("{:>4} | {}", lidx + 1, lines[lidx]));
+                        }
+                    }
+                    if is_webmcp && raw_end > start + 159 && start + 159 < total_lines {
+                        out.push(format!(
+                            "...[WebMCP slice capped at 160 lines; call start_line={} for continuation]",
+                            end + 1
+                        ));
+                    }
+                    Ok(out.join("\n"))
+                })();
+                match res {
+                    Ok(s) => (idx, s),
+                    Err(e) => (idx, format!("SLICE ERROR ({path_err_label}): {e}")),
+                }
+            });
+        }
+        let mut results = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            if let Ok(item) = joined {
+                results.push(item);
+            }
+        }
+        results.sort_by_key(|(idx, _)| *idx);
+        results.into_iter().map(|(_, s)| s).collect::<Vec<_>>()
+    };
+
+    let symbols_fut = async {
+        let mut set: JoinSet<(usize, String)> = JoinSet::new();
+        for (idx, spec) in symbol_reads.iter().enumerate() {
+            let ws_clone = ws.clone();
+            let prot = protected_files.clone();
+            let rel_owned = spec.path.clone();
+            let query = spec.query.clone();
+            let include_docs = spec.include_docs.unwrap_or(true);
+            let max_lines = spec.max_lines.unwrap_or(160).clamp(5, 300) as usize;
+            set.spawn_blocking(move || {
+                let res = (|| -> Result<String, String> {
+                    let target = resolve_jailed_path(&ws_clone.canon_root, &rel_owned)?;
+                    check_sensitive_guard_parts(
+                        &prot,
+                        &ws_clone.canon_root,
+                        ws_clone.effective_allow_sensitive,
+                        &ws_clone.effective_sensitive_patterns,
+                        &target,
+                        &rel_owned,
+                    )?;
+                    let content = fs::read_to_string(&target)
+                        .map_err(|e| format!("Gagal membaca '{}': {e}", rel_owned))?;
+                    let ext = target
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    crate::semantic::read_symbol_from_content(
+                        &rel_owned,
+                        &ext,
+                        &content,
+                        &query,
+                        include_docs,
+                        max_lines,
+                    )
+                })();
+                match res {
+                    Ok(s) => (idx, s),
+                    Err(e) => (idx, format!("SYMBOL ERROR ({rel_owned}::{query}): {e}")),
+                }
+            });
+        }
+        let mut results = Vec::with_capacity(symbol_reads.len());
+        while let Some(joined) = set.join_next().await {
+            if let Ok(item) = joined {
+                results.push(item);
+            }
+        }
+        results.sort_by_key(|(idx, _)| *idx);
+        results.into_iter().map(|(_, s)| s).collect::<Vec<_>>()
+    };
+
+    let webmcp_max_chars = if is_webmcp {
+        Some(state.config.read().await.effective_webmcp_max_output_chars())
+    } else {
+        None
+    };
+
+    let (overview_res, find_results, outline_results, search_results, slice_results, symbol_results) =
+        tokio::join!(
+            overview_fut,
+            finds_fut,
+            outlines_fut,
+            searches_fut,
+            slices_fut,
+            symbols_fut
+        );
 
     let mut sections = Vec::new();
+    if include_instructions {
+        let instr_txt = crate::providers::load_combined_rules_snippet(
+            state.data_dir.as_deref(),
+            &ws.canon_root,
+        )
+        .unwrap_or_else(|| {
+            format!(
+                "Belum ada file rules global atau workspace (`GEMINI.md`) untuk @{}.",
+                ws.alias
+            )
+        });
+        sections.push(format!("=== INSTRUCTIONS (@{}) ===\n{}", ws.alias, instr_txt));
+    }
     if let Some(ov) = overview_res {
         match ov {
             Ok(txt) => sections.push(format!("=== OVERVIEW (@{}) ===\n{}", ws.alias, txt)),
             Err(e) => sections.push(format!("=== OVERVIEW ERROR ===\n{e}")),
         }
+    }
+    if !find_results.is_empty() {
+        sections.push(format!("=== FILES ===\n{}", find_results.join("\n\n")));
     }
     if !outline_results.is_empty() {
         sections.push(format!("=== OUTLINES ===\n{}", outline_results.join("\n\n")));
@@ -1311,19 +1677,23 @@ pub(crate) async fn exec_batch_inspect(
     if !search_results.is_empty() {
         sections.push(format!("=== SEARCHES ===\n{}", search_results.join("\n\n")));
     }
+    if !slice_results.is_empty() {
+        sections.push(format!("=== FILE SLICES ===\n{}", slice_results.join("\n\n")));
+    }
+    if !symbol_results.is_empty() {
+        sections.push(format!("=== SYMBOLS ===\n{}", symbol_results.join("\n\n")));
+    }
 
-    let raw_output = sections.join("\n\n");
-    let total_chars = raw_output.chars().count();
-    let final_output = if total_chars > 16_000 {
-        let clipped: String = raw_output.chars().take(16_000).collect();
-        format!("{clipped}\n\n...[batch_inspect output truncated at 16000 chars]")
-    } else {
-        raw_output
-    };
+    let max_budget = webmcp_max_chars.unwrap_or(16_000);
+    let final_output = format_fair_batch_sections(sections, max_budget);
 
-    let subtask_count = (if include_overview { 1 } else { 0 })
+    let subtask_count = (if include_instructions { 1 } else { 0 })
+        + (if include_overview { 1 } else { 0 })
+        + find_results.len()
         + outline_results.len()
-        + search_results.len();
+        + search_results.len()
+        + slice_results.len()
+        + symbol_results.len();
     let turns_saved = subtask_count.saturating_sub(1);
 
     state
@@ -1335,11 +1705,15 @@ pub(crate) async fn exec_batch_inspect(
                 tool_name: "batch_inspect".to_string(),
                 target_path: None,
                 summary: format!(
-                    "Batch inspect on @{}: overview={}, {} outline(s), {} search(es)",
+                    "Batch inspect on @{}: instructions={}, overview={}, {} find(s), {} outline(s), {} search(es), {} slice(s), {} symbol(s)",
                     ws.alias,
+                    include_instructions,
                     include_overview,
+                    find_results.len(),
                     outline_results.len(),
-                    search_results.len()
+                    search_results.len(),
+                    slice_results.len(),
+                    symbol_results.len()
                 ),
                 diff_text: None,
                 can_revert: false,
@@ -1362,6 +1736,110 @@ pub(crate) async fn exec_batch_inspect(
     Ok(final_output)
 }
 
+fn format_fair_batch_sections(sections: Vec<String>, max_total_chars: usize) -> String {
+    if sections.is_empty() || max_total_chars == 0 {
+        return String::new();
+    }
+    let joined = sections.join("\n\n");
+    if joined.chars().count() <= max_total_chars {
+        return joined;
+    }
+    let n = sections.len();
+    let sep_budget = n.saturating_sub(1) * 2;
+    let avail = max_total_chars.saturating_sub(sep_budget);
+    let mut budgets: Vec<usize> = sections.iter().map(|s| s.chars().count()).collect();
+    let fair = (avail / n).max(80);
+
+    let mut fixed_sum = 0usize;
+    let mut long_indices = Vec::new();
+    for (idx, &len) in budgets.iter().enumerate() {
+        if len <= fair {
+            fixed_sum += len;
+        } else {
+            long_indices.push(idx);
+        }
+    }
+    if !long_indices.is_empty() {
+        let rem = avail.saturating_sub(fixed_sum);
+        let each = (rem / long_indices.len()).max(80);
+        for idx in long_indices {
+            budgets[idx] = budgets[idx].min(each);
+        }
+    }
+
+    let clipped_sections: Vec<String> = sections
+        .into_iter()
+        .enumerate()
+        .map(|(idx, s)| {
+            let limit = budgets[idx];
+            let s_chars = s.chars().count();
+            if s_chars <= limit {
+                s
+            } else {
+                let marker = format!("\n...[section clipped at {limit} chars]\n");
+                let marker_len = marker.chars().count();
+                if limit > marker_len + 40 {
+                    let content_budget = limit - marker_len;
+                    let head_len = (content_budget * 55) / 100;
+                    let tail_len = content_budget - head_len;
+                    let head: String = s.chars().take(head_len).collect();
+                    let tail: String = s.chars().skip(s_chars.saturating_sub(tail_len)).collect();
+                    format!("{head}{marker}{tail}")
+                } else {
+                    s.chars().take(limit).collect()
+                }
+            }
+        })
+        .collect();
+    let out = clipped_sections.join("\n\n");
+    if out.chars().count() > max_total_chars {
+        out.chars().take(max_total_chars).collect()
+    } else {
+        out
+    }
+}
+
+fn parse_optional_verify_commands(args: &Value) -> Result<Vec<String>, String> {
+    let single = args
+        .get("verify_command")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let multi = match args.get("verify_commands") {
+        Some(v) if !v.is_null() => {
+            let list: Vec<String> = serde_json::from_value(v.clone())
+                .map_err(|e| format!("Format 'verify_commands' tidak valid: {e}"))?;
+            let cleaned: Vec<String> = list
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if cleaned.is_empty() {
+                return Err("Array 'verify_commands' tidak boleh kosong.".to_string());
+            }
+            if cleaned.len() > 5 {
+                return Err(format!(
+                    "Maksimal 5 verify_commands per panggilan (diterima {}).",
+                    cleaned.len()
+                ));
+            }
+            Some(cleaned)
+        }
+        _ => None,
+    };
+
+    match (single, multi) {
+        (Some(_), Some(_)) => {
+            Err("Isi salah satu: 'verify_command' ATAU 'verify_commands', bukan keduanya.".to_string())
+        }
+        (Some(c), None) => Ok(vec![c]),
+        (None, Some(cs)) => Ok(cs),
+        (None, None) => Ok(Vec::new()),
+    }
+}
+
 pub(crate) async fn exec_multi_surgical_edit(
     state: &AppState,
     source: &str,
@@ -1378,8 +1856,10 @@ pub(crate) async fn exec_multi_surgical_edit(
         return Err("multi_surgical_edit dibatasi maksimal 8 file per eksekusi.".to_string());
     }
 
-    // PHASE 1: Atomic Pre-Flight Validation across ALL files (ZERO disk writes)
-    let mut prepared_list: Vec<PreparedEdit> = Vec::with_capacity(files.len());
+    let verify_cmds = parse_optional_verify_commands(args)?;
+
+    // PHASE 1: Pre-Flight path, sensitive-guard, duplicate, policy & HITL checks (ZERO locks or disk writes)
+    let mut jailed_targets: Vec<(&MultiEditFile, PathBuf)> = Vec::with_capacity(files.len());
     let mut seen_targets: HashSet<PathBuf> = HashSet::new();
 
     for item in &files {
@@ -1391,6 +1871,35 @@ pub(crate) async fn exec_multi_surgical_edit(
                 item.path
             ));
         }
+        jailed_targets.push((item, target));
+    }
+
+    if !verify_cmds.is_empty() {
+        let (cmd_policy, cmd_allowlist) = state.command_policy_and_allowlist().await;
+        for cmd in &verify_cmds {
+            validate_command_with_policy(cmd, &cmd_policy, &cmd_allowlist)?;
+        }
+        let gate_args = if verify_cmds.len() == 1 {
+            serde_json::json!({ "command": verify_cmds[0] })
+        } else {
+            serde_json::json!({ "commands": verify_cmds })
+        };
+        super::guardrail::enforce_guardrail_gate_for_workspace(
+            state,
+            source,
+            "run_command_compressed",
+            &gate_args,
+            false,
+            Some(ws),
+        )
+        .await?;
+    }
+
+    // Hold write lock only across prepare -> atomic writes -> snapshots -> post-checks,
+    // dropping it before verify_cmds wait so concurrent sessions are not starved.
+    let write_guard = acquire_ws_write_lock(state, ws).await;
+    let mut prepared_list: Vec<PreparedEdit> = Vec::with_capacity(jailed_targets.len());
+    for (item, target) in jailed_targets {
         let prep = prepare_surgical_edits(&item.path, target, &item.edits)?;
         prepared_list.push(prep);
     }
@@ -1442,16 +1951,100 @@ pub(crate) async fn exec_multi_surgical_edit(
             .await;
     }
 
-    let hook_diag = crate::hooks::run_post_edit_hooks(state, ws, &edited_paths).await;
     let mut text = format!(
         "Applied atomic multi_surgical_edit across {files_count} file(s) in @{}\nGROUP_ID: {group_id}\n\n{}",
         ws.alias,
         diffs.join("\n")
     );
-    if let Some(diag) = hook_diag {
-        text.push_str("\n\n");
-        text.push_str(&diag);
+    append_edit_post_checks(state, source, ws, args, &edited_paths, &mut text).await;
+    drop(write_guard);
+
+    // PHASE 4: Optional verification command / pipeline with auto-promote
+    if !verify_cmds.is_empty() {
+        let (default_promote_secs, poll_wait_secs) = {
+            let cfg = state.config.read().await;
+            (
+                cfg.effective_webmcp_auto_promote_secs(),
+                cfg.effective_webmcp_poll_wait_secs(),
+            )
+        };
+        let explicit_promote = args
+            .get("auto_promote_secs")
+            .and_then(|v| v.as_u64())
+            .map(|s| s.clamp(1, 25));
+        let promote_secs = explicit_promote.or_else(|| {
+            if source == "WebMCP" || verify_cmds.len() > 1 {
+                Some(default_promote_secs)
+            } else {
+                None
+            }
+        });
+
+        let verify_display = verify_cmds.join(" && ");
+        if let Some(p_secs) = promote_secs {
+            let (summary, mut done_rx) = jobs::start_pipeline_job_for_source(
+                state,
+                &ws.canon_root,
+                &verify_cmds,
+                Some(format!("Verify multi-edit ({files_count} files)")),
+                300,
+                Some(ws.alias.clone()),
+                Some(source.to_string()),
+            )
+            .await?;
+
+            let finished_in_time =
+                tokio::time::timeout(Duration::from_secs(p_secs), done_rx.wait_for(|&d| d))
+                    .await
+                    .is_ok();
+
+            if finished_in_time {
+                let (code, compressed) = if let Some((_, exit_opt, _, out, _)) =
+                    jobs::get_job_snapshot_output(state, &summary.job_id, 60).await
+                {
+                    (exit_opt.unwrap_or(0), out)
+                } else {
+                    (0, String::new())
+                };
+                text.push_str(&format!(
+                    "\n\nVERIFY COMMAND: {verify_display}\nEXIT CODE: {code}\nOUTPUT:\n{compressed}"
+                ));
+            } else {
+                let (elapsed, recent, total_lines) = if let Some((_, _, el, out, tot)) =
+                    jobs::get_job_snapshot_output(state, &summary.job_id, 20).await
+                {
+                    (el, out, tot)
+                } else {
+                    (p_secs, String::new(), 0)
+                };
+                text.push_str(&format!(
+                    "\n\nAUTO_PROMOTED_VERIFY_JOB\nJOB_ID: {}\nWORKSPACE: @{}\nSTATUS: running\nELAPSED: {}s\nNEXT_FROM_LINE: {}\nHINT: Atomic multi-edit succeeded (GROUP_ID: {}). Verification exceeded {}s sync window and continues in background; call run_command(action=\"poll\", job_id=\"{}\", from_line={}) (auto long-polls up to {}s; do NOT run sleep).\nRECENT OUTPUT:\n{}",
+                    summary.job_id,
+                    ws.alias,
+                    elapsed,
+                    total_lines,
+                    group_id,
+                    p_secs,
+                    summary.job_id,
+                    total_lines,
+                    poll_wait_secs,
+                    if recent.is_empty() {
+                        "(waiting for output...)"
+                    } else {
+                        recent.as_str()
+                    }
+                ));
+            }
+        } else {
+            let (code, stdout, stderr) =
+                run_shell_raw(&ws.canon_root, &verify_cmds[0], 30).await?;
+            let (compressed, _) = compress_output(&stdout, &stderr, 60);
+            text.push_str(&format!(
+                "\n\nVERIFY COMMAND: {verify_display}\nEXIT CODE: {code}\nOUTPUT:\n{compressed}"
+            ));
+        }
     }
+
     Ok(text)
 }
 
@@ -1598,32 +2191,114 @@ pub(crate) async fn exec_list_skills(
     state: &AppState,
     source: &str,
     pinned_ws: Option<&str>,
+    args: &Value,
 ) -> Result<String, String> {
+    let query_filter = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+    let scope_filter = args
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+    let compact = args
+        .get("compact")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let entries = state.skills_for_context(pinned_ws).await;
-    let active: Vec<_> = entries
+    let active_all: Vec<_> = entries
         .into_iter()
         .filter(|s| s.summary.enabled && s.summary.parse_error.is_none())
         .collect();
+    let total_active = active_all.len();
 
-    let output = if active.is_empty() {
+    let active: Vec<_> = active_all
+        .into_iter()
+        .filter(|s| {
+            if let Some(ref sc) = scope_filter {
+                let entry_scope = match s.summary.scope {
+                    crate::skills::SkillScope::Workspace => "workspace",
+                    crate::skills::SkillScope::Plugin => "plugin",
+                    crate::skills::SkillScope::Global => "global",
+                };
+                if entry_scope != sc.as_str() {
+                    return false;
+                }
+            }
+            if let Some(ref q) = query_filter {
+                let name_lc = s.summary.name.to_ascii_lowercase();
+                let desc_lc = s.summary.description.to_ascii_lowercase();
+                if !name_lc.contains(q.as_str()) && !desc_lc.contains(q.as_str()) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
+    let output = if total_active == 0 {
         "Tidak ada Agent Skill (SKILL.md) aktif yang terdeteksi.".to_string()
+    } else if active.is_empty() {
+        format!(
+            "Tidak ada Agent Skill aktif yang cocok dengan filter (query={:?}, scope={:?}) dari {} skill aktif.",
+            query_filter.as_deref().unwrap_or("*"),
+            scope_filter.as_deref().unwrap_or("*"),
+            total_active
+        )
     } else {
         let lines: Vec<String> = active
             .iter()
             .map(|s| {
-                format!(
-                    "- `{}` [{}] (resources: {}, ~{} tok full): {}",
-                    s.summary.name,
-                    s.summary.source_label,
-                    s.summary.resource_files.len(),
-                    s.summary.body_tokens_est,
-                    s.summary.description
-                )
+                let manual_tag = if s.summary.disable_model_invocation {
+                    " [explicit-only]"
+                } else {
+                    ""
+                };
+                if compact {
+                    let clean_desc: String = s
+                        .summary
+                        .description
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let clipped_desc = if clean_desc.chars().count() > 68 {
+                        let head: String = clean_desc.chars().take(65).collect();
+                        format!("{head}...")
+                    } else {
+                        clean_desc
+                    };
+                    format!(
+                        "- `{}` [{}]{}: {}",
+                        s.summary.name, s.summary.source_label, manual_tag, clipped_desc
+                    )
+                } else {
+                    format!(
+                        "- `{}` [{}]{} (resources: {}, ~{} tok full): {}",
+                        s.summary.name,
+                        s.summary.source_label,
+                        manual_tag,
+                        s.summary.resource_files.len(),
+                        s.summary.body_tokens_est,
+                        s.summary.description
+                    )
+                }
             })
             .collect();
+        let header = if active.len() == total_active {
+            format!("Active Agent Skills ({}):", active.len())
+        } else {
+            format!("Active Agent Skills ({} of {}):", active.len(), total_active)
+        };
+        let filter_tip = if active.len() > 20 && !compact {
+            "\nTip: Pass compact=true, query=\"...\", or scope=\"workspace|plugin|global\" to view large catalogs without truncation."
+        } else {
+            ""
+        };
         format!(
-            "Active Agent Skills ({}):\n{}\n\nUse load_skill(name) to read full instructions.",
-            active.len(),
+            "{header}\n{}\n\nUse load_skill(name) to read full instructions.{filter_tip}",
             lines.join("\n")
         )
     };
@@ -1797,4 +2472,56 @@ pub(crate) async fn exec_read_skill_resource(
         "SKILL RESOURCE: {}/{}\n\n{}",
         skill.summary.name, rel_path, text
     ))
+}
+
+#[cfg(test)]
+mod list_skills_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn test_exec_list_skills_supports_query_scope_and_compact() {
+        let base_dir = std::env::temp_dir().join("smart_mcp_list_skills_filter_test");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        let ws_skill_dir = base_dir.join(".airlock").join("skills").join("alpha-audit");
+        std::fs::create_dir_all(&ws_skill_dir).unwrap();
+        std::fs::write(
+            ws_skill_dir.join("SKILL.md"),
+            "---\nname: alpha-audit\ndescription: Deep audit helper for workspace verification and boundary checks in long sessions.\n---\n# Body\n",
+        )
+        .unwrap();
+        let ws_skill_dir_2 = base_dir.join(".airlock").join("skills").join("beta-helper");
+        std::fs::create_dir_all(&ws_skill_dir_2).unwrap();
+        std::fs::write(
+            ws_skill_dir_2.join("SKILL.md"),
+            "---\nname: beta-helper\ndescription: Secondary skill to ensure total active skill count exceeds filtered count.\n---\n# Body\n",
+        )
+        .unwrap();
+
+        let state = AppState::new(base_dir.clone());
+        let compact_ws = exec_list_skills(
+            &state,
+            "WebMCP",
+            None,
+            &json!({ "scope": "workspace", "query": "alpha", "compact": true }),
+        )
+        .await
+        .unwrap();
+        assert!(compact_ws.contains("Active Agent Skills (1 of "));
+        assert!(compact_ws.contains("- `alpha-audit` [workspace:"));
+        assert!(compact_ws.contains("Deep audit helper"));
+        assert!(!compact_ws.contains("tok full"));
+
+        let empty_match = exec_list_skills(
+            &state,
+            "WebMCP",
+            None,
+            &json!({ "scope": "workspace", "query": "nonexistent-xyz" }),
+        )
+        .await
+        .unwrap();
+        assert!(empty_match.contains("Tidak ada Agent Skill aktif yang cocok dengan filter"));
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
 }

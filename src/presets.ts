@@ -71,20 +71,24 @@ export function generateClientPreset(
 
   if (presetId === "gemini-web") {
     const remoteBase = tunnelBase ?? "https://<TUNNEL-BELUM-AKTIF>";
-    const oauthUrl = `${remoteBase}/mcp`;
-    const pathTokenUrl = `${remoteBase}/mcp/${snap.auth_token}`;
+    const oauthCompactUrl = `${remoteBase}/mcp?profile=compact`;
+    const oauthFullUrl = `${remoteBase}/mcp?profile=full`;
+    const pathTokenCompactUrl = `${remoteBase}/mcp/${snap.auth_token}?profile=compact`;
     return {
       title: "Gemini Web — Custom MCP Connector",
       filename: "Gemini Web Connected Apps",
       instructions: tunnelBase
-        ? "Tempelkan Endpoint OAuth (direkomendasikan) di Gemini Web -> Apps -> Add Custom MCP, lalu setujui popup OAuth di Airlock. Jika klien membutuhkan token langsung di URL, gunakan URL fallback di bawah."
+        ? "Tempelkan Endpoint OAuth Compact Profile (direkomendasikan: <=10 Super-Tools hemat konteks & anti-timeout) di Gemini Web -> Apps -> Add Custom MCP, lalu setujui popup OAuth di Airlock. Gunakan ?profile=full hanya jika membutuhkan seluruh tool granular."
         : "Aktifkan Remote Tunnel (Tailscale Funnel atau Cloudflare) terlebih dahulu untuk mendapatkan URL HTTPS publik.",
       content: [
-        `# Endpoint OAuth 2.1 (Direkomendasikan):`,
-        oauthUrl,
+        `# Endpoint OAuth 2.1 — Compact Profile (Direkomendasikan, <=10 Super-Tools):`,
+        oauthCompactUrl,
         ``,
-        `# Alternatif Bearer Token di Path URL (Non-OAuth):`,
-        pathTokenUrl,
+        `# Alternatif OAuth 2.1 — Full Profile (Semua Tool Granular):`,
+        oauthFullUrl,
+        ``,
+        `# Alternatif Bearer Token di Path URL (Non-OAuth, Compact):`,
+        pathTokenCompactUrl,
         ``,
         `# Bearer Header (opsional):`,
         `Authorization: Bearer ${snap.auth_token}`,

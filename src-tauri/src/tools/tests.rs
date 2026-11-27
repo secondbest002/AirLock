@@ -1244,3 +1244,577 @@ async fn test_webmcp_poll_command_job_long_polls_to_completion() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[tokio::test]
+async fn test_webmcp_output_budget_preserves_control_headers_and_errors() {
+    // 1. Unit test for compress_for_webmcp_budget with 20,000-char payload + control headers + middle error
+    let mut big = String::from(
+        "AUTO_PROMOTED_TO_BACKGROUND_JOB\nJOB_ID: job-123\nWORKSPACE: @repo\nSTATUS: running\nNEXT_FROM_LINE: 42\n",
+    );
+    for i in 1..=320 {
+        if i == 160 {
+            big.push_str("error[E0308]: mismatched types expected `u32`, found `String`\n");
+        } else {
+            big.push_str(&format!(
+                "Compiling crate_step_{i:03} with verbose build metadata and artifact checksum 0123456789abcdef\n"
+            ));
+        }
+    }
+    assert!(big.chars().count() > 20_000);
+
+    let compressed = compress_for_webmcp_budget("run_command_compressed", &big, 6000);
+    assert!(
+        compressed.chars().count() <= 6000,
+        "Expected <=6000 chars, got {}",
+        compressed.chars().count()
+    );
+    assert!(compressed.contains("JOB_ID: job-123"));
+    assert!(compressed.contains("STATUS: running"));
+    assert!(compressed.contains("NEXT_FROM_LINE: 42"));
+    assert!(compressed.contains("error[E0308]: mismatched types"));
+    assert!(compressed.contains("WebMCP Output Guard:"));
+
+    // 2. Single giant line (minified JS/JSON) still stays strictly within budget
+    let giant_line = "x".repeat(20_000);
+    let clipped_line = compress_for_webmcp_budget("read_file_range", &giant_line, 6000);
+    assert!(clipped_line.chars().count() <= 6000);
+    assert!(clipped_line.contains("WebMCP Output Guard:"));
+
+    // 3. End-to-end execute_tool applies output guard ONLY for source == "WebMCP", not "LocalAgent"
+    let temp_dir = std::env::temp_dir().join("smart_mcp_webmcp_budget_e2e_test");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let long_file = (1..=250)
+        .map(|i| format!("pub fn fn_{i:03}() -> usize {{ /* padding_for_webmcp_budget_test_{i:03} */ {i} }}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(temp_dir.join("big.rs"), &long_file).unwrap();
+
+    let state = AppState::new(temp_dir.clone());
+    let web_out = execute_tool(
+        &state,
+        "WebMCP",
+        "read_file_range",
+        json!({ "path": "big.rs", "start_line": 1, "end_line": 250 }),
+    )
+    .await;
+    assert!(!web_out.is_error);
+    assert!(web_out.text.chars().count() <= 6000);
+    assert!(web_out.text.contains("WebMCP Output Guard:"));
+
+    let local_out = execute_tool(
+        &state,
+        "LocalAgent",
+        "read_file_range",
+        json!({ "path": "big.rs", "start_line": 1, "end_line": 250 }),
+    )
+    .await;
+    assert!(!local_out.is_error);
+    assert!(local_out.text.chars().count() > 6000);
+    assert!(!local_out.text.contains("WebMCP Output Guard:"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_batch_inspect_supports_read_slices_and_symbol_reads() {
+    use crate::workspace::{normalize_clean_path, WorkspaceProfile};
+
+    let base = std::env::temp_dir().join("smart_mcp_batch_inspect_slices_sym_test");
+    let _ = fs::remove_dir_all(&base);
+    let alpha_dir = base.join("alpha");
+    let beta_dir = base.join("beta");
+    fs::create_dir_all(alpha_dir.join("src")).unwrap();
+    fs::create_dir_all(&beta_dir).unwrap();
+
+    let mut lib_lines = vec![
+        "/// Target helper doc".to_string(),
+        "pub fn target_helper(x: i32) -> i32 {".to_string(),
+        "    x + 42".to_string(),
+        "}".to_string(),
+    ];
+    for i in 5..=240 {
+        lib_lines.push(format!("pub fn filler_{i}() -> usize {{ {i} }}"));
+    }
+    fs::write(alpha_dir.join("src").join("lib.rs"), lib_lines.join("\n")).unwrap();
+    fs::write(beta_dir.join("secret.txt"), "beta_only_content").unwrap();
+
+    let (_, clean_alpha) = normalize_clean_path(&alpha_dir).unwrap();
+    let (_, clean_beta) = normalize_clean_path(&beta_dir).unwrap();
+
+    let state = Arc::new(AppState::new(alpha_dir.clone()));
+    {
+        let mut cfg = state.config.write().await;
+        cfg.workspaces = vec![
+            WorkspaceProfile {
+                id: "ws-alpha".to_string(),
+                alias: "alpha".to_string(),
+                path: clean_alpha,
+                enabled: true,
+                guardrail_override: None,
+                allow_sensitive_override: None,
+                extra_sensitive_patterns: vec![],
+                pinned: false,
+            },
+            WorkspaceProfile {
+                id: "ws-beta".to_string(),
+                alias: "beta".to_string(),
+                path: clean_beta,
+                enabled: true,
+                guardrail_override: None,
+                allow_sensitive_override: None,
+                extra_sensitive_patterns: vec![],
+                pinned: false,
+            },
+        ];
+        cfg.default_workspace_id = Some("ws-alpha".to_string());
+    }
+    state.sync_default_workspace_root().await;
+
+    // 1. Concurrent overview + find_patterns + outline_paths + searches + read_slices (WebMCP 160-line cap) + symbol_reads
+    let res = execute_tool_with_run_context(
+        Arc::clone(&state),
+        "WebMCP",
+        "batch_inspect",
+        json!({
+            "include_overview": true,
+            "find_patterns": [{ "pattern": "*.rs" }],
+            "outline_paths": ["src/lib.rs"],
+            "searches": [{ "query": "x + 42" }],
+            "read_slices": [{ "path": "src/lib.rs", "start_line": 1, "end_line": 230 }],
+            "symbol_reads": [{ "path": "src/lib.rs", "query": "target_helper" }]
+        }),
+        Some("alpha"),
+        None,
+    )
+    .await;
+    assert!(!res.is_error, "batch_inspect failed: {}", res.text);
+    assert!(res.text.contains("=== OVERVIEW (@alpha) ==="));
+    assert!(res.text.contains("=== FILES ==="));
+    assert!(res.text.contains("src/lib.rs"));
+    assert!(res.text.contains("=== OUTLINES ==="));
+    assert!(res.text.contains("=== SEARCHES ==="));
+    assert!(res.text.contains("=== FILE SLICES ==="));
+    assert!(res.text.contains("WebMCP slice capped at 160 lines"));
+    assert!(res.text.contains("=== SYMBOLS ==="));
+    assert!(res.text.contains("pub fn target_helper"));
+
+    // 2. read_slices strictly enforces pinned workspace isolation
+    let cross_pin = execute_tool_with_run_context(
+        Arc::clone(&state),
+        "WebMCP",
+        "batch_inspect",
+        json!({
+            "read_slices": [{ "workspace": "beta", "path": "secret.txt" }]
+        }),
+        Some("alpha"),
+        None,
+    )
+    .await;
+    assert!(cross_pin.is_error);
+    assert!(cross_pin.text.contains("di-pin ke workspace '@alpha'"));
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[tokio::test]
+async fn test_multi_surgical_edit_preflight_blocks_disallowed_verify_command() {
+    let temp_dir = std::env::temp_dir().join("smart_mcp_multi_edit_preflight_test");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(temp_dir.join("src")).unwrap();
+    let target = temp_dir.join("src").join("mod_a.rs");
+    fs::write(&target, "pub const VALUE: i32 = 1;\n").unwrap();
+
+    let state = Arc::new(AppState::new(temp_dir.clone()));
+
+    // 1. Disallowed verify_command MUST block before writing anything to disk
+    let blocked = execute_tool(
+        &state,
+        "WebMCP",
+        "multi_surgical_edit",
+        json!({
+            "files": [{
+                "path": "src/mod_a.rs",
+                "edits": [{ "search": "VALUE: i32 = 1;", "replace": "VALUE: i32 = 2;" }]
+            }],
+            "verify_command": "rm -rf /"
+        }),
+    )
+    .await;
+    assert!(blocked.is_error);
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "pub const VALUE: i32 = 1;\n",
+        "File MUST NOT be modified when verify_command fails pre-flight policy check"
+    );
+
+    // 2. HITL denial on verify_command in command_execution_policy='hitl' MUST also abort before disk write
+    state.config.write().await.command_execution_policy = "hitl".to_string();
+    let state_bg = Arc::clone(&state);
+    let denier = tokio::spawn(async move {
+        for _ in 0..40 {
+            let req_id: Option<String> = state_bg
+                .pending_tool_approvals
+                .read()
+                .await
+                .keys()
+                .next()
+                .cloned();
+            if let Some(id) = req_id {
+                resolve_tool_approval(&state_bg, &id, ToolApprovalDecision::Deny)
+                    .await
+                    .unwrap();
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        false
+    });
+    let denied = execute_tool(
+        &state,
+        "WebMCP",
+        "multi_surgical_edit",
+        json!({
+            "files": [{
+                "path": "src/mod_a.rs",
+                "edits": [{ "search": "VALUE: i32 = 1;", "replace": "VALUE: i32 = 2;" }]
+            }],
+            "verify_command": "echo should_not_run"
+        }),
+    )
+    .await;
+    assert!(denier.await.unwrap());
+    assert!(denied.is_error);
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "pub const VALUE: i32 = 1;\n",
+        "File MUST remain untouched when verify_command HITL is denied"
+    );
+
+    // 3. Passing verify_command + cold LSP post_check_lsp succeeds cleanly
+    state.config.write().await.command_execution_policy = "normal".to_string();
+    let ok = execute_tool(
+        &state,
+        "WebMCP",
+        "multi_surgical_edit",
+        json!({
+            "files": [{
+                "path": "src/mod_a.rs",
+                "edits": [{ "search": "VALUE: i32 = 1;", "replace": "VALUE: i32 = 2;" }]
+            }],
+            "post_check_lsp": true,
+            "verify_command": "echo multi_edit_verified"
+        }),
+    )
+    .await;
+    assert!(!ok.is_error, "multi_surgical_edit failed: {}", ok.text);
+    assert!(ok.text.contains("language server cold"), "got:\n{}", ok.text);
+    assert!(ok.text.contains("multi_edit_verified"), "got:\n{}", ok.text);
+    assert!(fs::read_to_string(&target).unwrap().contains("VALUE: i32 = 2;"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_run_command_pipeline_stops_on_first_failure() {
+    let temp_dir = std::env::temp_dir().join("smart_mcp_run_command_pipeline_test");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let state = AppState::new(temp_dir.clone());
+    let fail_step = if cfg!(target_os = "windows") {
+        "cmd /C exit 7"
+    } else {
+        "exit 7"
+    };
+
+    let out = execute_tool(
+        &state,
+        "WebMCP",
+        "run_command",
+        json!({
+            "action": "run",
+            "commands": [
+                "echo pipeline_step_1_ok",
+                fail_step,
+                "echo pipeline_step_3_must_not_run"
+            ]
+        }),
+    )
+    .await;
+    assert!(!out.is_error, "Pipeline execution returned hard Err: {}", out.text);
+    assert!(out.text.contains("EXIT CODE: 7"), "got:\n{}", out.text);
+    assert!(out.text.contains("[STEP 1/3]"), "got:\n{}", out.text);
+    assert!(out.text.contains("pipeline_step_1_ok"), "got:\n{}", out.text);
+    assert!(out.text.contains("[STEP 2/3]"), "got:\n{}", out.text);
+    assert!(
+        !out.text.contains("pipeline_step_3_must_not_run"),
+        "Step 3 must NOT run after Step 2 failed:\n{}",
+        out.text
+    );
+
+    // Unified lsp_query supports diagnostics cleanly (unknown op fails cleanly)
+    let bad_lsp = execute_tool(
+        &state,
+        "WebMCP",
+        "lsp_query",
+        json!({ "op": "bogus_op" }),
+    )
+    .await;
+    assert!(bad_lsp.is_error);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_case_insensitive_action_and_op_routing() {
+    use super::schemas::requires_hitl_in_safe_edit;
+
+    assert!(is_tool_read_only("run_command", &json!({ "action": "POLL" })));
+    assert!(is_tool_read_only("run_command", &json!({ "action": " Poll " })));
+    assert!(!is_tool_read_only("run_command", &json!({ "action": "RUN" })));
+    assert!(is_tool_read_only("delegate_local_agent", &json!({ "action": "POLL" })));
+    assert!(is_tool_read_only(
+        "delegate_local_agent",
+        &json!({ "action": "START", "mode": "READ_ONLY" })
+    ));
+    assert!(!is_tool_read_only(
+        "delegate_local_agent",
+        &json!({ "action": "START", "mode": "EXECUTE" })
+    ));
+    assert!(is_tool_read_only("session_checkpoint", &json!({ "op": "LOAD" })));
+    assert!(is_tool_read_only("session_checkpoint", &json!({ "op": "" })));
+    assert!(is_tool_read_only("session_checkpoint", &json!({})));
+    assert!(is_tool_read_only("git_ops", &json!({ "op": "STATUS" })));
+    assert!(!requires_hitl_in_safe_edit(
+        "run_command",
+        &json!({ "action": "POLL" }),
+        true
+    ));
+    assert!(!requires_hitl_in_safe_edit(
+        "run_command",
+        &json!({ "action": "STOP" }),
+        false
+    ));
+
+    let temp_dir = std::env::temp_dir().join("smart_mcp_case_action_routing_test");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let state = AppState::new(temp_dir.clone());
+    *state.guardrail_mode.write().await = "safe_edit".to_string();
+    state.config.write().await.command_execution_policy = "hitl".to_string();
+
+    let (summary, _rx) = crate::jobs::start_job_with_handle(
+        &state,
+        &temp_dir,
+        "echo case_routing_ok",
+        None,
+        30,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Calling run_command(action="POLL") under safe_edit + hitl must route to poll without HITL
+    let polled = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        execute_tool(
+            &state,
+            "WebMCP",
+            "run_command",
+            json!({ "action": "POLL", "job_id": summary.job_id, "from_line": 0 }),
+        ),
+    )
+    .await
+    .expect("run_command(action=POLL) must not trigger HITL wait");
+    assert!(!polled.is_error, "Upper-case POLL failed: {}", polled.text);
+    assert!(polled.text.contains("case_routing_ok"), "got:\n{}", polled.text);
+
+    // Upper-case STOP on a slow job under safe_edit + hitl must route to stop without HITL
+    let slow_cmd = if cfg!(target_os = "windows") {
+        "ping -n 10 127.0.0.1"
+    } else {
+        "sleep 10"
+    };
+    let (slow_sum, _rx2) =
+        crate::jobs::start_job_with_handle(&state, &temp_dir, slow_cmd, None, 30, None)
+            .await
+            .unwrap();
+    let stopped = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        execute_tool(
+            &state,
+            "WebMCP",
+            "run_command",
+            json!({ "action": "STOP", "job_id": slow_sum.job_id }),
+        ),
+    )
+    .await
+    .expect("run_command(action=STOP) must not trigger HITL wait");
+    assert!(!stopped.is_error, "Upper-case STOP failed: {}", stopped.text);
+    assert!(stopped.text.contains(&slow_sum.job_id));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_webmcp_auto_verify_on_edit_checks_warm_lsp_or_skips_cold() {
+    let temp_dir = std::env::temp_dir().join("smart_mcp_auto_verify_edit_test");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    fs::write(temp_dir.join("main.rs"), "fn main() { let a = 1; }\n").unwrap();
+
+    let state = AppState::new(temp_dir.clone());
+    state.config.write().await.webmcp_auto_verify_on_edit = true;
+
+    let web_out = execute_tool(
+        &state,
+        "WebMCP",
+        "surgical_edit",
+        json!({
+            "path": "main.rs",
+            "edits": [{ "search": "let a = 1;", "replace": "let a = 2;" }]
+        }),
+    )
+    .await;
+    assert!(!web_out.is_error, "WebMCP edit failed: {}", web_out.text);
+    assert!(
+        web_out.text.contains("LSP post-check skipped"),
+        "Expected auto warm-LSP check note on WebMCP edit, got:\n{}",
+        web_out.text
+    );
+
+    let local_out = execute_tool(
+        &state,
+        "LocalAgent",
+        "surgical_edit",
+        json!({
+            "path": "main.rs",
+            "edits": [{ "search": "let a = 2;", "replace": "let a = 3;" }]
+        }),
+    )
+    .await;
+    assert!(!local_out.is_error);
+    assert!(!local_out.text.contains("LSP post-check skipped"));
+
+    // Also verify Output Guard preserves [HARNESS_HINT: control lines
+    let mut big_with_hint = "line padding 0123456789abcdef\n".repeat(400);
+    big_with_hint.push_str("[HARNESS_HINT: Keep this hint intact under budget compression.]\n");
+    let compressed = compress_for_webmcp_budget("run_command", &big_with_hint, 6000);
+    assert!(compressed.chars().count() <= 6000);
+    assert!(
+        compressed.contains("[HARNESS_HINT: Keep this hint intact"),
+        "Output guard dropped [HARNESS_HINT:]:\n{compressed}"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_concurrent_slow_run_command_does_not_block_concurrent_write_or_edit_verify() {
+    use std::time::Instant;
+
+    let temp_dir = std::env::temp_dir().join("smart_mcp_concurrent_ws_lock_test");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    fs::write(temp_dir.join("file_a.txt"), "alpha=1\n").unwrap();
+    fs::write(temp_dir.join("file_b.txt"), "beta=1\n").unwrap();
+
+    let state = Arc::new(AppState::new(temp_dir.clone()));
+
+    let slow_cmd = if cfg!(target_os = "windows") {
+        "ping -n 6 127.0.0.1 >NUL && echo slow_done"
+    } else {
+        "sleep 5 && echo slow_done"
+    };
+
+    // 1. Slow run_command on workspace (4s sync wait) MUST NOT block another session's file edit
+    let st_cmd = Arc::clone(&state);
+    let slow_handle = tokio::spawn(async move {
+        execute_tool(
+            &st_cmd,
+            "WebMCP",
+            "run_command",
+            json!({
+                "action": "run",
+                "command": slow_cmd,
+                "auto_promote_secs": 4
+            }),
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let edit_started = Instant::now();
+    let edit_out = tokio::time::timeout(
+        Duration::from_millis(1800),
+        execute_tool(
+            &state,
+            "WebMCP",
+            "surgical_edit",
+            json!({
+                "path": "file_b.txt",
+                "edits": [{ "search": "beta=1", "replace": "beta=2" }]
+            }),
+        ),
+    )
+    .await
+    .expect("surgical_edit must NOT be starved by concurrent slow run_command");
+    assert!(!edit_out.is_error, "surgical_edit failed: {}", edit_out.text);
+    assert!(
+        edit_started.elapsed() < Duration::from_millis(1800),
+        "surgical_edit waited too long: {:?}",
+        edit_started.elapsed()
+    );
+
+    let cmd_out = slow_handle.await.unwrap();
+    assert!(!cmd_out.is_error, "slow run_command failed: {}", cmd_out.text);
+    assert!(cmd_out.text.contains("AUTO_PROMOTED_TO_BACKGROUND_JOB"));
+
+    // 2. multi_surgical_edit with slow verify_command (4s) MUST release write lock before verify wait
+    let st_verify = Arc::clone(&state);
+    let verify_handle = tokio::spawn(async move {
+        execute_tool(
+            &st_verify,
+            "WebMCP",
+            "multi_surgical_edit",
+            json!({
+                "files": [{
+                    "path": "file_a.txt",
+                    "edits": [{ "search": "alpha=1", "replace": "alpha=2" }]
+                }],
+                "verify_command": slow_cmd,
+                "auto_promote_secs": 4
+            }),
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    let concurrent_write = tokio::time::timeout(
+        Duration::from_millis(1800),
+        execute_tool(
+            &state,
+            "WebMCP",
+            "surgical_edit",
+            json!({
+                "path": "file_b.txt",
+                "edits": [{ "search": "beta=2", "replace": "beta=3" }]
+            }),
+        ),
+    )
+    .await
+    .expect("surgical_edit must NOT be starved during multi_surgical_edit verify phase");
+    assert!(
+        !concurrent_write.is_error,
+        "concurrent surgical_edit failed: {}",
+        concurrent_write.text
+    );
+
+    let verify_out = verify_handle.await.unwrap();
+    assert!(!verify_out.is_error, "multi_surgical_edit verify failed: {}", verify_out.text);
+    assert!(verify_out.text.contains("AUTO_PROMOTED_VERIFY_JOB"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

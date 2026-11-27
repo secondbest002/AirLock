@@ -1,11 +1,13 @@
-use crate::agent_manager::{AgentRunStatus, RunContext, MAX_SUBAGENTS_PER_RUN};
+use crate::agent_manager::{AgentRunStatus, DelegatedRunResult, RunContext, MAX_SUBAGENTS_PER_RUN};
 use crate::providers::{
     self, await_with_watchdog, emit_stream_chunk, emit_stream_step, emit_stream_thought,
     execute_tool_calls_hybrid, format_interrupted_reply, load_watchdog_settings, AgentAttachment,
     PendingToolCall, ProviderTurnOutcome, WatchdogInterrupt,
 };
-use crate::state::{AppState, DashboardSnapshot, TurnCheckpointInfo};
-use crate::workspace::{build_workspace_summaries, clean_path_string, resolve_workspace};
+use crate::state::{AppState, AuditEntry, DashboardSnapshot, TurnCheckpointInfo};
+use crate::workspace::{
+    build_workspace_summaries, clean_path_string, resolve_workspace, ResolvedWorkspace,
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -340,6 +342,7 @@ pub fn filter_subagent_read_only_tools(tools: Vec<Value>) -> Vec<Value> {
         .filter(|t| {
             let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
             name != "spawn_subagent"
+                && name != "delegate_local_agent"
                 && matches!(
                     name,
                     "list_workspaces"
@@ -354,6 +357,7 @@ pub fn filter_subagent_read_only_tools(tools: Vec<Value>) -> Vec<Value> {
                         | "lsp_definition"
                         | "lsp_references"
                         | "lsp_hover"
+                        | "lsp_query"
                         | "list_skills"
                         | "load_skill"
                         | "read_skill_resource"
@@ -450,7 +454,9 @@ async fn build_agent_system_prompt(
     }
 
     if auto_inject {
-        if let Some(rules) = providers::load_project_rules_snippet(root_path) {
+        if let Some(rules) =
+            providers::load_combined_rules_snippet(state.data_dir.as_deref(), root_path)
+        {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&rules);
         }
@@ -467,6 +473,14 @@ async fn build_agent_system_prompt(
         - Use `upsert_artifact` to maintain structured session documents (`implementation_plan`, `task_list`, `walkthrough`, `review_note`) for non-trivial changes or when reviewing.\n\
         - Use `spawn_subagent` (max 3 per turn, read-only) when parallel investigation or independent read-only verification helps avoid cluttering the main context.",
     );
+
+    if run_ctx.execution_mode == "delegated_read_only" {
+        system_prompt.push_str(&format!(
+            "\n\n[DELEGATED RESEARCH SANDBOX — READ-ONLY ON @{}]\n\
+            You are running a delegated WebMCP read-only investigation inside @{}. Mutative tools are disabled; gather grounded facts with file paths and line numbers, then return a concise final summary.",
+            run_ctx.workspace_alias, run_ctx.workspace_alias
+        ));
+    }
 
     if run_ctx.execution_mode == "plan_first" {
         let plan_approved = state
@@ -914,7 +928,7 @@ async fn run_agent_turn_inner(
     let provider = state.config.read().await.agent_provider.clone();
     let system_prompt = build_agent_system_prompt(&state, root_path, &run_ctx).await;
     let all_tools = providers::all_mcp_tools(&state).await;
-    let tools = if run_ctx.depth > 0 {
+    let tools = if run_ctx.depth > 0 || run_ctx.execution_mode == "delegated_read_only" {
         filter_subagent_read_only_tools(all_tools)
     } else {
         all_tools
@@ -979,7 +993,8 @@ async fn run_gemini_turn(
 ) -> Result<ProviderTurnOutcome, String> {
     let api_key = state.provider_secrets.read().await.gemini_api_key.clone();
     let model = state.gemini_config.read().await.model.clone();
-    let mut history = if run_ctx.depth > 0 {
+    let is_ephemeral_run = run_ctx.depth > 0 || run_ctx.execution_mode.starts_with("delegated_");
+    let mut history = if is_ephemeral_run {
         Vec::new()
     } else {
         let per_sess = state
@@ -1055,6 +1070,12 @@ async fn run_gemini_turn(
     let watchdog = load_watchdog_settings(&state).await;
     let max_steps = if run_ctx.depth > 0 {
         watchdog.max_steps.min(10)
+    } else if run_ctx.execution_mode.starts_with("delegated_") {
+        state
+            .agent_manager
+            .get_run_max_steps(&run_ctx.run_id)
+            .await
+            .unwrap_or_else(|| watchdog.max_steps.clamp(1, 20))
     } else {
         watchdog.max_steps
     };
@@ -1415,7 +1436,11 @@ async fn run_gemini_turn(
 
     ensure_clean_gemini_history(&mut last_clean_history);
 
-    let checkpoint_opt = if run_ctx.depth > 0 {
+    let checkpoint_opt = if is_ephemeral_run {
+        if let Some(kind) = interrupt_opt {
+            final_reply =
+                format_interrupted_reply(&last_streamed_text, kind, turn_budget_secs, stream_idle_secs);
+        }
         None
     } else if let Some(kind) = interrupt_opt {
         prune_gemini_history(&mut last_clean_history, 30);
@@ -1761,6 +1786,7 @@ mod tests {
 
         for banned in [
             "spawn_subagent",
+            "delegate_local_agent",
             "surgical_edit",
             "multi_surgical_edit",
             "patch_and_verify",
@@ -1811,4 +1837,670 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    #[tokio::test]
+    async fn test_delegate_local_agent_enforces_write_opt_in_and_workspace_pin() {
+        use crate::tools::execute_tool_with_run_context;
+        use crate::workspace::{normalize_clean_path, WorkspaceProfile};
+
+        let base = std::env::temp_dir().join("smart_mcp_delegate_local_agent_test");
+        let _ = std::fs::remove_dir_all(&base);
+        let alpha_dir = base.join("alpha");
+        let beta_dir = base.join("beta");
+        let gamma_dir = base.join("gamma");
+        std::fs::create_dir_all(&alpha_dir).unwrap();
+        std::fs::create_dir_all(&beta_dir).unwrap();
+        std::fs::create_dir_all(&gamma_dir).unwrap();
+
+        let (_, clean_alpha) = normalize_clean_path(&alpha_dir).unwrap();
+        let (_, clean_beta) = normalize_clean_path(&beta_dir).unwrap();
+        let (_, clean_gamma) = normalize_clean_path(&gamma_dir).unwrap();
+
+        let state = Arc::new(AppState::new(alpha_dir.clone()));
+        {
+            let mut cfg = state.config.write().await;
+            cfg.agent_provider = "openai_compat".to_string();
+            cfg.openai_base_url = "http://127.0.0.1:11434/v1".to_string();
+            cfg.openai_model = "test-local-model".to_string();
+            cfg.webmcp_allow_write_delegation = false;
+            cfg.workspaces = vec![
+                WorkspaceProfile {
+                    id: "ws-alpha".to_string(),
+                    alias: "alpha".to_string(),
+                    path: clean_alpha,
+                    enabled: true,
+                    guardrail_override: None,
+                    allow_sensitive_override: None,
+                    extra_sensitive_patterns: vec![],
+                    pinned: false,
+                },
+                WorkspaceProfile {
+                    id: "ws-beta".to_string(),
+                    alias: "beta".to_string(),
+                    path: clean_beta,
+                    enabled: true,
+                    guardrail_override: Some("read_only".to_string()),
+                    allow_sensitive_override: None,
+                    extra_sensitive_patterns: vec![],
+                    pinned: false,
+                },
+                WorkspaceProfile {
+                    id: "ws-gamma".to_string(),
+                    alias: "gamma".to_string(),
+                    path: clean_gamma,
+                    enabled: true,
+                    guardrail_override: None,
+                    allow_sensitive_override: None,
+                    extra_sensitive_patterns: vec![],
+                    pinned: false,
+                },
+            ];
+            cfg.default_workspace_id = Some("ws-alpha".to_string());
+        }
+        state.sync_default_workspace_root().await;
+
+        // 1. Local Agent tool declarations MUST never contain delegate_local_agent (anti-recursion)
+        let agent_tools = providers::all_mcp_tools(&state).await;
+        assert!(
+            !agent_tools
+                .iter()
+                .any(|t| t["name"].as_str() == Some("delegate_local_agent")),
+            "Local Agent must never receive delegate_local_agent declaration"
+        );
+
+        // 2. execute mode MUST be rejected when webmcp_allow_write_delegation == false
+        let exec_blocked = execute_tool_with_run_context(
+            Arc::clone(&state),
+            "WebMCP",
+            "delegate_local_agent",
+            json!({ "action": "start", "goal": "Edit files", "mode": "execute" }),
+            Some("alpha"),
+            None,
+        )
+        .await;
+        assert!(exec_blocked.is_error);
+        assert!(
+            exec_blocked.text.contains("Allow Local Agent Write Delegation"),
+            "got: {}",
+            exec_blocked.text
+        );
+
+        // 3. Even when write delegation is enabled, read_only workspace rejects mode=execute
+        state.config.write().await.webmcp_allow_write_delegation = true;
+        let ro_ws_blocked = execute_tool_with_run_context(
+            Arc::clone(&state),
+            "WebMCP",
+            "delegate_local_agent",
+            json!({ "action": "start", "goal": "Edit beta", "mode": "execute", "workspace": "beta" }),
+            Some("beta"),
+            None,
+        )
+        .await;
+        assert!(ro_ws_blocked.is_error);
+        assert!(
+            ro_ws_blocked.text.contains("read_only")
+                || ro_ws_blocked.text.to_ascii_lowercase().contains("read-only"),
+            "got: {}",
+            ro_ws_blocked.text
+        );
+
+        // 4. Seed a run belonging to @alpha and confirm cross-workspace pin poll & cancel from @gamma are rejected
+        let (run_id, _rx, _) = state
+            .agent_manager
+            .start_run(
+                None,
+                "delegated_test".to_string(),
+                "alpha".to_string(),
+                "Alpha work".to_string(),
+                "openai_compat".to_string(),
+                "test-local-model".to_string(),
+                "delegated_read_only".to_string(),
+                6,
+            )
+            .await
+            .unwrap();
+        state
+            .agent_manager
+            .set_run_pinned_workspace(&run_id, Some("alpha".to_string()))
+            .await;
+
+        let wrong_pin_poll = execute_tool_with_run_context(
+            Arc::clone(&state),
+            "WebMCP",
+            "delegate_local_agent",
+            json!({ "action": "poll", "run_id": run_id, "wait_secs": 0 }),
+            Some("gamma"),
+            None,
+        )
+        .await;
+        assert!(wrong_pin_poll.is_error);
+        assert!(
+            wrong_pin_poll.text.contains("di-pin ke workspace '@gamma'"),
+            "got: {}",
+            wrong_pin_poll.text
+        );
+
+        let wrong_pin_cancel = execute_tool_with_run_context(
+            Arc::clone(&state),
+            "WebMCP",
+            "delegate_local_agent",
+            json!({ "action": "cancel", "run_id": run_id }),
+            Some("gamma"),
+            None,
+        )
+        .await;
+        assert!(wrong_pin_cancel.is_error);
+        assert!(
+            wrong_pin_cancel.text.contains("di-pin ke workspace '@gamma'"),
+            "got: {}",
+            wrong_pin_cancel.text
+        );
+
+        let _ = state.agent_manager.cancel_run(Some(&run_id)).await;
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn test_delegated_gemini_run_does_not_pollute_session_history_or_checkpoints() {
+        let temp_dir = std::env::temp_dir().join("smart_mcp_delegated_gemini_isolation_test");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let state = Arc::new(AppState::new(temp_dir.clone()));
+        state.provider_secrets.write().await.gemini_api_key = "test-key".to_string();
+        let existing_default_hist = vec![user_text("keep default history")];
+        state.gemini_config.write().await.history = existing_default_hist.clone();
+
+        let (cancel_tx, cancel_rx) = watch::channel(true);
+        let ctx = RunContext {
+            run_id: "run_del_iso".to_string(),
+            parent_run_id: None,
+            session_id: "delegated_ephemeral_1".to_string(),
+            workspace_id: "ws-default".to_string(),
+            workspace_alias: "repo".to_string(),
+            workspace_clean_path: clean_path_string(&temp_dir),
+            execution_mode: "delegated_execute".to_string(),
+            depth: 0,
+            turn_group_id: "del-iso-1".to_string(),
+            subagent_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            acp_event_tx: None,
+        };
+
+        let outcome = run_gemini_turn(
+            Arc::clone(&state),
+            "Delegated task".to_string(),
+            Vec::new(),
+            "sys".to_string(),
+            Vec::new(),
+            None,
+            cancel_rx,
+            false,
+            ctx,
+        )
+        .await
+        .unwrap();
+        drop(cancel_tx);
+        assert!(outcome.cancelled);
+        assert!(
+            state
+                .agent_manager
+                .get_history("gemini", "delegated_ephemeral_1")
+                .await
+                .is_empty(),
+            "Delegated Gemini run must not write into AgentRunManager session history"
+        );
+        assert!(
+            state
+                .agent_manager
+                .get_checkpoint("delegated_ephemeral_1")
+                .await
+                .is_none(),
+            "Delegated Gemini run must not store TurnCheckpoint"
+        );
+        assert_eq!(state.gemini_config.read().await.history, existing_default_hist);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+}
+
+pub async fn has_delegation_provider_ready(state: &AppState) -> bool {
+    let (provider, openai_base_url) = {
+        let cfg = state.config.read().await;
+        (cfg.agent_provider.clone(), cfg.openai_base_url.clone())
+    };
+    let secs = state.provider_secrets.read().await;
+    match provider.trim() {
+        "openai_compat" => {
+            secs.has_key_for("openai_compat") || providers::is_local_url(&openai_base_url)
+        }
+        "anthropic" => secs.has_key_for("anthropic"),
+        _ => secs.has_key_for("gemini"),
+    }
+}
+
+async fn validate_active_delegation_provider(state: &AppState) -> Result<(String, String), String> {
+    let (provider, openai_base_url, openai_model, anthropic_model) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.agent_provider.clone(),
+            cfg.openai_base_url.clone(),
+            cfg.openai_model.clone(),
+            cfg.anthropic_model.clone(),
+        )
+    };
+    let gem_model = state.gemini_config.read().await.model.clone();
+    let secs = state.provider_secrets.read().await;
+
+    match provider.trim() {
+        "openai_compat" => {
+            if !secs.has_key_for("openai_compat") && !providers::is_local_url(&openai_base_url) {
+                return Err("OpenAI-Compatible API key belum dikonfigurasi pada Airlock desktop UI.".to_string());
+            }
+            Ok((provider, openai_model))
+        }
+        "anthropic" => {
+            if !secs.has_key_for("anthropic") {
+                return Err("Anthropic API key belum dikonfigurasi pada Airlock desktop UI.".to_string());
+            }
+            Ok((provider, anthropic_model))
+        }
+        _ => {
+            if !secs.has_key_for("gemini") {
+                return Err("Google AI Studio (Gemini) API key belum dikonfigurasi pada Airlock desktop UI.".to_string());
+            }
+            Ok(("gemini".to_string(), gem_model))
+        }
+    }
+}
+
+async fn verify_delegated_run_pin_access(
+    state: &AppState,
+    run_id: &str,
+    pinned_ws: Option<&str>,
+) -> Result<(), String> {
+    let Some(pin) = pinned_ws.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let pin_ws = resolve_workspace(state, None, Some(pin)).await?;
+    if let Some((ws_alias, orig_pin)) = state.agent_manager.get_run_workspace_pin_info(run_id).await {
+        let matches_ws = ws_alias.eq_ignore_ascii_case(&pin_ws.alias);
+        let matches_orig_pin = orig_pin
+            .as_deref()
+            .map(|p| p.eq_ignore_ascii_case(&pin_ws.alias))
+            .unwrap_or(true);
+        if !matches_ws || !matches_orig_pin {
+            return Err(format!(
+                "Koneksi ini di-pin ke workspace '@{}'; delegated run '{}' milik workspace '@{}' ditolak.",
+                pin_ws.alias, run_id, ws_alias
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn format_delegated_run_result(res: &DelegatedRunResult, default_poll_wait: u64) -> String {
+    let touched = if res.touched_files.is_empty() {
+        "(none)".to_string()
+    } else {
+        res.touched_files.join(", ")
+    };
+    let group_line = res
+        .turn_group_id
+        .as_deref()
+        .map(|g| format!("\nGROUP_ID: {g}"))
+        .unwrap_or_default();
+
+    match res.status {
+        AgentRunStatus::Running => format!(
+            "DELEGATION_RUNNING\nRUN_ID: {}\nWORKSPACE: @{}\nMODE: {}\nSTATUS: running\nELAPSED: {}s\nSTEPS: {}\nHINT: Local Agent is working asynchronously. Call delegate_local_agent(action=\"poll\", run_id=\"{}\") (auto long-polls up to {}s; do NOT run sleep), or action=\"cancel\" to abort.",
+            res.run_id,
+            res.workspace_alias,
+            res.mode,
+            res.elapsed_secs,
+            res.step_count,
+            res.run_id,
+            default_poll_wait
+        ),
+        AgentRunStatus::AwaitingApproval => format!(
+            "STATUS: awaiting_approval\nRUN_ID: {}\nWORKSPACE: @{}\nMODE: {}\nSTEPS: {}\nPENDING_APPROVAL: {}\nHINT: Local Agent paused waiting for user HITL/plan approval on the Airlock desktop window. Resume with delegate_local_agent(action=\"poll\", run_id=\"{}\").",
+            res.run_id,
+            res.workspace_alias,
+            res.mode,
+            res.step_count,
+            res.pending_approval_hint
+                .as_deref()
+                .unwrap_or("Awaiting confirmation on Airlock UI"),
+            res.run_id
+        ),
+        AgentRunStatus::Completed | AgentRunStatus::Cancelled | AgentRunStatus::Failed => {
+            let status_str = match res.status {
+                AgentRunStatus::Completed => "completed",
+                AgentRunStatus::Cancelled => "cancelled",
+                AgentRunStatus::Failed => "failed",
+                _ => "unknown",
+            };
+            format!(
+                "STATUS: {status_str}\nRUN_ID: {}\nWORKSPACE: @{}\nMODE: {}{}\nTOUCHED_FILES: {}\nSTEPS: {}\nELAPSED: {}s\nSUMMARY:\n{}",
+                res.run_id,
+                res.workspace_alias,
+                res.mode,
+                group_line,
+                touched,
+                res.step_count,
+                res.elapsed_secs,
+                res.summary_text
+            )
+        }
+    }
+}
+
+pub async fn exec_delegate_local_agent_poll_or_cancel(
+    state: Arc<AppState>,
+    source: &str,
+    action: &str,
+    args: &Value,
+    pinned_ws: Option<&str>,
+) -> Result<String, String> {
+    let run_id = args
+        .get("run_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("Argumen 'run_id' wajib diisi untuk action='poll' atau 'cancel'.")?;
+    verify_delegated_run_pin_access(&state, run_id, pinned_ws).await?;
+
+    let default_poll_wait = state.config.read().await.effective_webmcp_poll_wait_secs();
+    if action == "poll" {
+        let fallback_wait = if source == "WebMCP" {
+            default_poll_wait
+        } else {
+            0
+        };
+        let wait_secs = args
+            .get("wait_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(fallback_wait)
+            .min(26);
+        let res = state.agent_manager.poll_delegated_run(run_id, wait_secs).await?;
+        Ok(format_delegated_run_result(&res, default_poll_wait))
+    } else {
+        let cancelled = state.agent_manager.cancel_run(Some(run_id)).await;
+        if cancelled > 0 {
+            Ok(format!(
+                "STATUS: cancelling\nRUN_ID: {run_id}\nSinyal pembatalan dikirim ke delegated Local Agent."
+            ))
+        } else {
+            let snap = state.agent_manager.get_delegated_run_snapshot(run_id).await?;
+            Ok(format_delegated_run_result(&snap, default_poll_wait))
+        }
+    }
+}
+
+pub fn exec_delegate_local_agent_start<'a>(
+    state: Arc<AppState>,
+    source: &'a str,
+    ws: &'a ResolvedWorkspace,
+    args: &'a Value,
+    pinned_ws: Option<&'a str>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let goal = args
+            .get("goal")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or("Argumen 'goal' wajib diisi untuk delegate_local_agent.")?;
+
+        let mode = args
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "read_only".to_string());
+        if mode != "read_only" && mode != "execute" {
+            return Err(format!(
+                "Parameter 'mode' tidak valid ('{mode}'). Pilih 'read_only' atau 'execute'."
+            ));
+        }
+
+        let (allow_write_del, auto_promote_secs, default_poll_wait) = {
+            let cfg = state.config.read().await;
+            (
+                cfg.webmcp_allow_write_delegation,
+                cfg.effective_webmcp_auto_promote_secs(),
+                cfg.effective_webmcp_poll_wait_secs(),
+            )
+        };
+
+        if mode == "execute" {
+            if !allow_write_del {
+                return Err(
+                    "Delegasi mode 'execute' dinonaktifkan. Aktifkan 'Allow Local Agent Write Delegation' di panel WebMCP Optimization pada Airlock desktop UI, atau gunakan mode='read_only'."
+                        .to_string(),
+                );
+            }
+            if ws.effective_guardrail == "read_only" {
+                return Err(format!(
+                    "Workspace @{} berada dalam guardrail mode 'read_only'; delegasi mode 'execute' ditolak.",
+                    ws.alias
+                ));
+            }
+        }
+
+        let (provider, model) = validate_active_delegation_provider(&state).await?;
+        let max_steps = args
+            .get("max_steps")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(12)
+            .clamp(1, 20) as usize;
+
+        let focus_paths: Vec<String> = args
+            .get("focus_paths")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                    .filter(|s| !s.is_empty())
+                    .take(8)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let execution_mode = if mode == "execute" {
+            "delegated_execute".to_string()
+        } else {
+            "delegated_read_only".to_string()
+        };
+        let session_id = format!("delegated_{}", &AppState::generate_token()[..10]);
+        let turn_group_id = format!("del-{}", &AppState::generate_token()[..8]);
+
+        let (run_id, cancel_rx, subagent_counter) = state
+            .agent_manager
+            .start_run(
+                None,
+                session_id.clone(),
+                ws.alias.clone(),
+                format!("[WebMCP {mode}] {goal}"),
+                provider,
+                model,
+                execution_mode.clone(),
+                max_steps,
+            )
+            .await?;
+        state
+            .agent_manager
+            .set_run_pinned_workspace(&run_id, pinned_ws.map(str::to_string))
+            .await;
+
+        state
+            .record_audit(
+                AuditEntry {
+                    id: AppState::next_audit_id(),
+                    timestamp: AppState::now_timestamp(),
+                    source: source.to_string(),
+                    tool_name: "delegate_local_agent".to_string(),
+                    target_path: None,
+                    summary: format!(
+                        "Delegated Local Agent ({mode}, {max_steps} steps) on @{}: {}",
+                        ws.alias, goal
+                    ),
+                    diff_text: None,
+                    can_revert: false,
+                    reverted: false,
+                    tokens_saved: 0,
+                    original_content: None,
+                    original_blob_hash: None,
+                    file_existed_before: false,
+                    post_edit_hash: None,
+                    group_id: Some(turn_group_id.clone()),
+                    move_from_path: None,
+                    workspace_id: Some(ws.id.clone()),
+                    workspace_alias: Some(ws.alias.clone()),
+                    workspace_root: Some(ws.clean_path.clone()),
+                },
+                0,
+            )
+            .await;
+
+        let app_handle = state.app_handle.read().await.clone();
+        emit_runs_updated(&app_handle, &state).await;
+
+        let focus_note = if focus_paths.is_empty() {
+            String::new()
+        } else {
+            format!("\nFocus paths to inspect first: {}", focus_paths.join(", "))
+        };
+        let agent_prompt = format!(
+            "Delegated task for workspace @{} ({}):\nGoal: {}{}\n\nKeep tool calls concise and finish with a structured summary citing exact file paths and verification results.",
+            ws.alias, ws.clean_path, goal, focus_note
+        );
+
+        let run_ctx = RunContext {
+            run_id: run_id.clone(),
+            parent_run_id: None,
+            session_id,
+            workspace_id: ws.id.clone(),
+            workspace_alias: ws.alias.clone(),
+            workspace_clean_path: ws.clean_path.clone(),
+            execution_mode,
+            depth: 0,
+            turn_group_id: turn_group_id.clone(),
+            subagent_counter,
+            acp_event_tx: None,
+        };
+
+        let state_bg = Arc::clone(&state);
+        let run_id_bg = run_id.clone();
+        let ws_bg = ws.clone();
+        let mode_bg = mode.clone();
+        let started_at = Instant::now();
+
+        tokio::spawn(async move {
+            let outcome_res = run_agent_turn_inner(
+                Arc::clone(&state_bg),
+                agent_prompt,
+                Vec::new(),
+                cancel_rx,
+                false,
+                &ws_bg.canon_root,
+                run_ctx,
+            )
+            .await;
+
+            let mut touched_files = Vec::new();
+            {
+                let logs = state_bg.audit_logs.read().await;
+                for entry in logs.iter() {
+                    if entry.group_id.as_deref() == Some(turn_group_id.as_str()) {
+                        if let Some(ref tp) = entry.target_path {
+                            if !touched_files.contains(tp) {
+                                touched_files.push(tp.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            let elapsed_secs = started_at.elapsed().as_secs();
+            let final_res = match outcome_res {
+                Ok(outcome) => {
+                    let status = if outcome.cancelled {
+                        AgentRunStatus::Cancelled
+                    } else if outcome.awaiting_approval {
+                        AgentRunStatus::AwaitingApproval
+                    } else {
+                        AgentRunStatus::Completed
+                    };
+                    let step_count = outcome.steps.len();
+                    let mut summary_text: String = outcome.reply.chars().take(4500).collect();
+                    if outcome.reply.chars().count() > 4500 {
+                        summary_text.push_str("\n...[summary clipped to 4500 chars]");
+                    }
+                    DelegatedRunResult {
+                        run_id: run_id_bg.clone(),
+                        workspace_alias: ws_bg.alias.clone(),
+                        mode: mode_bg,
+                        status,
+                        summary_text,
+                        touched_files,
+                        turn_group_id: Some(turn_group_id),
+                        step_count,
+                        elapsed_secs,
+                        pending_approval_hint: if outcome.awaiting_approval {
+                            Some("Plan-First approval requested on Airlock desktop UI".to_string())
+                        } else {
+                            None
+                        },
+                    }
+                }
+                Err(err) => DelegatedRunResult {
+                    run_id: run_id_bg.clone(),
+                    workspace_alias: ws_bg.alias.clone(),
+                    mode: mode_bg,
+                    status: AgentRunStatus::Failed,
+                    summary_text: format!("Delegated run error: {err}"),
+                    touched_files,
+                    turn_group_id: Some(turn_group_id),
+                    step_count: 0,
+                    elapsed_secs,
+                    pending_approval_hint: None,
+                },
+            };
+
+            let should_sync_handoff = final_res.mode == "execute"
+                || !final_res.touched_files.is_empty()
+                || crate::handoff::workspace_has_handoff(&ws_bg);
+            crate::handoff::record_delegated_result(&state_bg, &ws_bg.id, final_res.clone())
+                .await;
+
+            state_bg
+                .agent_manager
+                .finish_delegated_run(&run_id_bg, final_res)
+                .await;
+            emit_runs_updated(&app_handle, &state_bg).await;
+
+            if should_sync_handoff {
+                let _ = crate::handoff::sync_from_state(
+                    &state_bg,
+                    &ws_bg,
+                    crate::handoff::HandoffTrigger::DelegatedFinished(run_id_bg.clone()),
+                    false,
+                )
+                .await;
+            }
+        });
+
+        let wait_default = if source == "WebMCP" {
+            auto_promote_secs
+        } else {
+            0
+        };
+        let wait_secs = args
+            .get("wait_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(wait_default)
+            .min(25);
+        let res = state.agent_manager.poll_delegated_run(&run_id, wait_secs).await?;
+        Ok(format_delegated_run_result(&res, default_poll_wait))
+    })
 }

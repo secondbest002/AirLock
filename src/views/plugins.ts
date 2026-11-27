@@ -452,6 +452,14 @@ function renderSkillsTable(
     scopeBadge.className = `skill-scope-badge skill-scope-${sk.scope}`;
     scopeBadge.textContent = sk.source_label;
     tdScope.appendChild(scopeBadge);
+    if (sk.disable_model_invocation) {
+      const manualBadge = document.createElement("span");
+      manualBadge.className = "skill-scope-badge";
+      manualBadge.title = "disable-model-invocation: true (load manually)";
+      manualBadge.textContent = "manual";
+      tdScope.appendChild(document.createTextNode(" "));
+      tdScope.appendChild(manualBadge);
+    }
 
     const tdTokens = document.createElement("td");
     tdTokens.className = "mono-cell skill-token-meta";

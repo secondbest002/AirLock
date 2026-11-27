@@ -219,6 +219,7 @@ export interface JobSummary {
   label: string | null;
   workspace_alias?: string | null;
   mcp_task_id?: string | null;
+  source?: string | null;
   status: JobStatus;
   exit_code: number | null;
   started_at: string;
@@ -275,6 +276,7 @@ export interface SkillSummary {
   source_label: string;
   plugin_id: string | null;
   enabled: boolean;
+  disable_model_invocation?: boolean;
   dir_path: string;
   resource_files: string[];
   allowed_tools: string[];
@@ -408,6 +410,17 @@ export interface DashboardSnapshot {
   active_runs?: AgentRunSummary[];
   hooks_status?: HooksStatusSummary | null;
   active_lsp_servers?: LspServerSummary[];
+  webmcp_default_profile: "compact" | "full";
+  webmcp_rpc_timeout_secs: number;
+  webmcp_auto_promote_secs: number;
+  webmcp_poll_wait_secs: number;
+  webmcp_max_output_chars: number;
+  webmcp_sse_keepalive: boolean;
+  webmcp_allow_write_delegation: boolean;
+  webmcp_expose_skills: boolean;
+  webmcp_session_harness: boolean;
+  webmcp_auto_verify_on_edit: boolean;
+  webmcp_auto_handoff_dir: boolean;
 }
 
 export interface ToolStepTrace {

@@ -3,9 +3,9 @@ use chrono::Local;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{watch, Mutex, RwLock};
 
 pub const MAX_CONCURRENT_RUNS: usize = 4;
@@ -58,12 +58,30 @@ pub struct RunContext {
     pub acp_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::acp_server::AcpStreamEvent>>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DelegatedRunResult {
+    pub run_id: String,
+    pub workspace_alias: String,
+    pub mode: String,
+    pub status: AgentRunStatus,
+    pub summary_text: String,
+    pub touched_files: Vec<String>,
+    pub turn_group_id: Option<String>,
+    pub step_count: usize,
+    pub elapsed_secs: u64,
+    pub pending_approval_hint: Option<String>,
+}
+
 struct AgentRunHandle {
     summary: AgentRunSummary,
     started_instant: Instant,
     cancel_tx: watch::Sender<bool>,
     #[allow(dead_code)]
     subagent_counter: Arc<AtomicUsize>,
+    pinned_workspace_alias: Option<String>,
+    status_tx: watch::Sender<AgentRunStatus>,
+    pending_approval_hint: Option<String>,
+    final_result: Option<DelegatedRunResult>,
 }
 
 pub struct AgentRunManager {
@@ -115,6 +133,7 @@ impl AgentRunManager {
 
         let run_id = format!("run_{}", &AppState::generate_token()[..8]);
         let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (status_tx, _) = watch::channel(AgentRunStatus::Running);
         let subagent_counter = Arc::new(AtomicUsize::new(0));
         let clean_label: String = label.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(72).collect();
 
@@ -146,9 +165,42 @@ impl AgentRunManager {
                 started_instant: Instant::now(),
                 cancel_tx,
                 subagent_counter: subagent_counter.clone(),
+                pinned_workspace_alias: None,
+                status_tx,
+                pending_approval_hint: None,
+                final_result: None,
             },
         );
         Ok((run_id, cancel_rx, subagent_counter))
+    }
+
+    pub async fn set_run_pinned_workspace(&self, run_id: &str, alias: Option<String>) {
+        let mut runs = self.runs.write().await;
+        if let Some(handle) = runs.get_mut(run_id) {
+            handle.pinned_workspace_alias = alias;
+        }
+    }
+
+    pub async fn get_run_max_steps(&self, run_id: &str) -> Option<usize> {
+        let runs = self.runs.read().await;
+        runs.get(run_id).map(|h| h.summary.max_steps)
+    }
+
+    pub async fn notify_run_status(
+        &self,
+        run_id: &str,
+        status: AgentRunStatus,
+        activity: String,
+        pending_approval_hint: Option<String>,
+    ) {
+        let mut runs = self.runs.write().await;
+        if let Some(handle) = runs.get_mut(run_id) {
+            handle.summary.status = status.clone();
+            handle.summary.last_activity_text = activity;
+            handle.summary.elapsed_secs = handle.started_instant.elapsed().as_secs();
+            handle.pending_approval_hint = pending_approval_hint;
+            let _ = handle.status_tx.send(status);
+        }
     }
 
     pub async fn update_run_step(
@@ -167,14 +219,7 @@ impl AgentRunManager {
         }
     }
 
-    pub async fn finish_run(&self, run_id: &str, status: AgentRunStatus, activity: String) {
-        let mut runs = self.runs.write().await;
-        if let Some(handle) = runs.get_mut(run_id) {
-            handle.summary.status = status;
-            handle.summary.last_activity_text = activity;
-            handle.summary.elapsed_secs = handle.started_instant.elapsed().as_secs();
-        }
-
+    fn trim_excess_finished_runs(runs: &mut HashMap<String, AgentRunHandle>) {
         if runs.len() > MAX_FINISHED_RUNS_RETAINED {
             let mut finished: Vec<(String, Instant)> = runs
                 .iter()
@@ -189,13 +234,106 @@ impl AgentRunManager {
         }
     }
 
+    pub async fn finish_run(&self, run_id: &str, status: AgentRunStatus, activity: String) {
+        let mut runs = self.runs.write().await;
+        if let Some(handle) = runs.get_mut(run_id) {
+            handle.summary.status = status.clone();
+            handle.summary.last_activity_text = activity;
+            handle.summary.elapsed_secs = handle.started_instant.elapsed().as_secs();
+            let _ = handle.status_tx.send(status);
+        }
+        Self::trim_excess_finished_runs(&mut runs);
+    }
+
+    pub async fn finish_delegated_run(&self, run_id: &str, result: DelegatedRunResult) {
+        let mut runs = self.runs.write().await;
+        if let Some(handle) = runs.get_mut(run_id) {
+            handle.summary.status = result.status.clone();
+            handle.summary.last_activity_text = result.summary_text.chars().take(120).collect();
+            handle.summary.elapsed_secs = handle.started_instant.elapsed().as_secs();
+            handle.pending_approval_hint = result.pending_approval_hint.clone();
+            handle.final_result = Some(result.clone());
+            let _ = handle.status_tx.send(result.status);
+        }
+        Self::trim_excess_finished_runs(&mut runs);
+    }
+
+    pub async fn get_run_workspace_pin_info(&self, run_id: &str) -> Option<(String, Option<String>)> {
+        let runs = self.runs.read().await;
+        runs.get(run_id).map(|h| {
+            (
+                h.summary.workspace_alias.clone(),
+                h.pinned_workspace_alias.clone(),
+            )
+        })
+    }
+
+    fn synthesize_delegated_result(handle: &AgentRunHandle) -> DelegatedRunResult {
+        if let Some(ref res) = handle.final_result {
+            return res.clone();
+        }
+        DelegatedRunResult {
+            run_id: handle.summary.run_id.clone(),
+            workspace_alias: handle.summary.workspace_alias.clone(),
+            mode: if handle.summary.execution_mode.contains("execute") {
+                "execute".to_string()
+            } else {
+                "read_only".to_string()
+            },
+            status: handle.summary.status.clone(),
+            summary_text: handle.summary.last_activity_text.clone(),
+            touched_files: Vec::new(),
+            turn_group_id: None,
+            step_count: handle.summary.current_step,
+            elapsed_secs: handle.started_instant.elapsed().as_secs(),
+            pending_approval_hint: handle.pending_approval_hint.clone(),
+        }
+    }
+
+    pub async fn get_delegated_run_snapshot(&self, run_id: &str) -> Result<DelegatedRunResult, String> {
+        let runs = self.runs.read().await;
+        let handle = runs
+            .get(run_id)
+            .ok_or_else(|| format!("Delegated run '{run_id}' tidak ditemukan."))?;
+        Ok(Self::synthesize_delegated_result(handle))
+    }
+
+    pub async fn poll_delegated_run(
+        &self,
+        run_id: &str,
+        wait_secs: u64,
+    ) -> Result<DelegatedRunResult, String> {
+        let mut status_rx = {
+            let runs = self.runs.read().await;
+            let handle = runs
+                .get(run_id)
+                .ok_or_else(|| format!("Delegated run '{run_id}' tidak ditemukan."))?;
+            if handle.summary.status != AgentRunStatus::Running || wait_secs == 0 {
+                return Ok(Self::synthesize_delegated_result(handle));
+            }
+            handle.status_tx.subscribe()
+        };
+
+        let clamped_wait = wait_secs.min(26);
+        let _ = tokio::time::timeout(
+            Duration::from_secs(clamped_wait),
+            status_rx.wait_for(|s| *s != AgentRunStatus::Running),
+        )
+        .await;
+
+        self.get_delegated_run_snapshot(run_id).await
+    }
+
     pub async fn cancel_run(&self, run_id: Option<&str>) -> usize {
         let runs = self.runs.read().await;
         let mut cancelled = 0usize;
         match run_id.map(str::trim).filter(|s| !s.is_empty()) {
             Some(target) => {
                 if let Some(handle) = runs.get(target) {
-                    if handle.summary.status == AgentRunStatus::Running {
+                    if matches!(
+                        handle.summary.status,
+                        AgentRunStatus::Running | AgentRunStatus::AwaitingApproval
+                    ) {
                         let _ = handle.cancel_tx.send(true);
                         cancelled = 1;
                     }
@@ -203,7 +341,10 @@ impl AgentRunManager {
             }
             None => {
                 for handle in runs.values() {
-                    if handle.summary.status == AgentRunStatus::Running {
+                    if matches!(
+                        handle.summary.status,
+                        AgentRunStatus::Running | AgentRunStatus::AwaitingApproval
+                    ) {
                         let _ = handle.cancel_tx.send(true);
                         cancelled += 1;
                     }
@@ -384,6 +525,7 @@ impl AgentRunManager {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::Ordering;
     use tokio::time::Duration;
 
     #[tokio::test]

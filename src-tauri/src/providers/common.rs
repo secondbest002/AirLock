@@ -16,7 +16,7 @@ use tauri::Emitter;
 use tokio::sync::{watch, RwLock, Semaphore};
 use tokio::task::JoinSet;
 
-pub(super) fn is_local_url(raw: &str) -> bool {
+pub fn is_local_url(raw: &str) -> bool {
     let Ok(parsed) = url::Url::parse(raw.trim()) else {
         return false;
     };
@@ -568,6 +568,42 @@ pub(super) fn truncate_str_chars(s: &str, max_chars: usize) -> String {
     }
 }
 
+fn user_home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+}
+
+fn collect_rules_from_dir(
+    dir: &Path,
+    label_prefix: &str,
+    candidates: &[&str],
+    budget: &mut usize,
+    seen_contents: &mut std::collections::HashSet<String>,
+    chunks: &mut Vec<String>,
+) {
+    for rel in candidates {
+        if *budget == 0 {
+            break;
+        }
+        let path = dir.join(rel);
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || !seen_contents.insert(trimmed.to_string()) {
+            continue;
+        }
+        let clipped = truncate_str_chars(trimmed, *budget);
+        let used = clipped.chars().count();
+        chunks.push(format!("### {label_prefix} ({rel})\n{clipped}"));
+        *budget = budget.saturating_sub(used);
+    }
+}
+
 pub fn load_project_rules_snippet(root: &Path) -> Option<String> {
     const CANDIDATES: [&str; 5] = [
         "AGENTS.md",
@@ -577,33 +613,85 @@ pub fn load_project_rules_snippet(root: &Path) -> Option<String> {
         ".github/copilot-instructions.md",
     ];
     let mut chunks = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut remaining = 6000usize;
+    collect_rules_from_dir(
+        root,
+        "Project Rules",
+        &CANDIDATES,
+        &mut remaining,
+        &mut seen,
+        &mut chunks,
+    );
 
-    for rel in CANDIDATES {
-        if remaining == 0 {
-            break;
-        }
-        let path = root.join(rel);
-        if !path.is_file() {
-            continue;
-        }
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let clipped = truncate_str_chars(trimmed, remaining);
-        let used = clipped.chars().count();
-        chunks.push(format!("### Project Rules ({rel})\n{clipped}"));
-        remaining = remaining.saturating_sub(used);
+    if chunks.is_empty() {
+        None
+    } else {
+        Some(chunks.join("\n\n"))
+    }
+}
+
+pub fn load_global_rules_snippet_with_dirs(
+    hub_data_dir: Option<&Path>,
+    home_dir: Option<&Path>,
+) -> Option<String> {
+    const HUB_CANDIDATES: [&str; 3] = ["GEMINI.md", "AGENTS.md", "CLAUDE.md"];
+    const HOME_CANDIDATES: [&str; 5] = [
+        ".gemini/GEMINI.md",
+        "GEMINI.md",
+        "CLAUDE.md",
+        ".claude/CLAUDE.md",
+        "AGENTS.md",
+    ];
+    let mut chunks = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut remaining = 3000usize;
+
+    if let Some(hub_dir) = hub_data_dir {
+        collect_rules_from_dir(
+            hub_dir,
+            "Global Airlock Rules",
+            &HUB_CANDIDATES,
+            &mut remaining,
+            &mut seen,
+            &mut chunks,
+        );
+    }
+    if let Some(home) = home_dir {
+        collect_rules_from_dir(
+            home,
+            "User Global Rules",
+            &HOME_CANDIDATES,
+            &mut remaining,
+            &mut seen,
+            &mut chunks,
+        );
     }
 
     if chunks.is_empty() {
         None
     } else {
         Some(chunks.join("\n\n"))
+    }
+}
+
+pub fn load_combined_rules_snippet(hub_data_dir: Option<&Path>, root: &Path) -> Option<String> {
+    let mut parts = Vec::new();
+    if hub_data_dir.is_some() {
+        let home = user_home_dir();
+        if let Some(global_rules) =
+            load_global_rules_snippet_with_dirs(hub_data_dir, home.as_deref())
+        {
+            parts.push(global_rules);
+        }
+    }
+    if let Some(project_rules) = load_project_rules_snippet(root) {
+        parts.push(project_rules);
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
     }
 }
 
@@ -650,7 +738,13 @@ pub fn sanitize_schema_for_gemini(val: &Value) -> Value {
 }
 
 pub async fn all_mcp_tools(state: &AppState) -> Vec<Value> {
-    let mut tools = mcp_tools_list().as_array().cloned().unwrap_or_default();
+    let mut tools: Vec<Value> = mcp_tools_list()
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| t.get("name").and_then(|v| v.as_str()) != Some("delegate_local_agent"))
+        .collect();
     let cfgs = state.resolved_downstream_mcps().await;
     let aggregated = state.mcp_hub.list_aggregated_tools(&cfgs).await;
     tools.extend(aggregated);
@@ -765,7 +859,7 @@ pub(super) async fn finalize_provider_turn(params: TurnFinalizeParams<'_>) -> Pr
         stream_idle_secs,
     } = params;
 
-    let checkpoint_opt = if run_ctx.depth > 0 {
+    let checkpoint_opt = if run_ctx.depth > 0 || run_ctx.execution_mode.starts_with("delegated_") {
         None
     } else {
         state

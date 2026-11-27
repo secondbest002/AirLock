@@ -30,6 +30,8 @@ pub struct JobSummary {
     pub workspace_alias: Option<String>,
     #[serde(default)]
     pub mcp_task_id: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
     pub status: JobStatus,
     pub exit_code: Option<i32>,
     pub started_at: String,
@@ -60,6 +62,7 @@ pub struct ManagedJob {
     pub label: Option<String>,
     pub workspace_alias: Option<String>,
     pub mcp_task_id: Option<String>,
+    pub source: Option<String>,
     pub status: JobStatus,
     pub exit_code: Option<i32>,
     pub started_at: String,
@@ -165,6 +168,7 @@ impl ManagedJob {
             label: self.label.clone(),
             workspace_alias: self.workspace_alias.clone(),
             mcp_task_id: self.mcp_task_id.clone(),
+            source: self.source.clone(),
             status: self.status,
             exit_code: self.exit_code,
             started_at: self.started_at.clone(),
@@ -213,13 +217,12 @@ fn spawn_pipe_reader<R>(
     job_id: String,
     ansi_re: &'static Regex,
     prefix: &'static str,
-) where
+) -> Option<tokio::task::JoinHandle<()>>
+where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
-    let Some(stream) = pipe else {
-        return;
-    };
-    tokio::spawn(async move {
+    let stream = pipe?;
+    Some(tokio::spawn(async move {
         let mut reader = BufReader::new(stream).lines();
         while let Ok(Some(line)) = reader.next_line().await {
             if let Some(cleaned) = clean_log_line(&line, ansi_re) {
@@ -228,14 +231,61 @@ fn spawn_pipe_reader<R>(
                 } else {
                     format!("{prefix}{cleaned}")
                 };
-                let mut guard = jobs_map.write().await;
-                if let Some(job) = guard.get_mut(&job_id) {
-                    job.last_output_instant = Instant::now();
-                    job.total_lines_seen += 1;
-                    job.lines.push(entry);
-                    if job.lines.len() > 2000 {
-                        let excess = job.lines.len() - 2000;
-                        job.lines.drain(0..excess);
+                append_job_log_line(&jobs_map, &job_id, entry).await;
+            }
+        }
+    }))
+}
+
+async fn append_job_log_line(
+    jobs_map: &Arc<RwLock<HashMap<String, ManagedJob>>>,
+    job_id: &str,
+    entry: String,
+) {
+    let mut guard = jobs_map.write().await;
+    if let Some(job) = guard.get_mut(job_id) {
+        job.last_output_instant = Instant::now();
+        job.total_lines_seen += 1;
+        job.lines.push(entry);
+        if job.lines.len() > 2000 {
+            let excess = job.lines.len() - 2000;
+            job.lines.drain(0..excess);
+        }
+    }
+}
+
+fn spawn_job_tick_emitter(
+    app_handle: &Option<tauri::AppHandle>,
+    jobs_map: Arc<RwLock<HashMap<String, ManagedJob>>>,
+    job_id: String,
+    mut done_tick: watch::Receiver<bool>,
+) {
+    let Some(app_for_tick) = app_handle.clone() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let sum_opt = {
+                        let guard = jobs_map.read().await;
+                        guard
+                            .get(&job_id)
+                            .filter(|j| j.status == JobStatus::Running)
+                            .map(ManagedJob::to_summary)
+                    };
+                    if let Some(sum) = sum_opt {
+                        let _ = app_for_tick.emit("job-updated", &sum);
+                    } else {
+                        break;
+                    }
+                }
+                res = done_tick.changed() => {
+                    if res.is_err() || *done_tick.borrow() {
+                        break;
                     }
                 }
             }
@@ -243,6 +293,16 @@ fn spawn_pipe_reader<R>(
     });
 }
 
+async fn drain_pipe_readers(
+    h_out: Option<tokio::task::JoinHandle<()>>,
+    h_err: Option<tokio::task::JoinHandle<()>>,
+) {
+    for h in [h_out, h_err].into_iter().flatten() {
+        let _ = tokio::time::timeout(Duration::from_millis(150), h).await;
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn start_job(
     state: &AppState,
     root: &Path,
@@ -255,6 +315,27 @@ pub async fn start_job(
     Ok(summary)
 }
 
+async fn resolve_handoff_job_ctx(
+    state: &AppState,
+    workspace_alias: Option<&str>,
+    source: Option<&str>,
+) -> Option<(Arc<crate::handoff::HandoffCoordinator>, crate::workspace::ResolvedWorkspace)> {
+    if !source.is_some_and(crate::handoff::is_webmcp_source) {
+        return None;
+    }
+    if !state.config.read().await.webmcp_auto_handoff_dir {
+        return None;
+    }
+    let ws = crate::workspace::resolve_workspace(state, workspace_alias, None)
+        .await
+        .ok()?;
+    if ws.effective_guardrail == "read_only" {
+        return None;
+    }
+    crate::handoff::prime_job_handoff_context(state, &ws).await;
+    Some((state.handoff_manager.inner.clone(), ws))
+}
+
 pub async fn start_job_with_handle(
     state: &AppState,
     root: &Path,
@@ -263,9 +344,33 @@ pub async fn start_job_with_handle(
     timeout_secs: u64,
     workspace_alias: Option<String>,
 ) -> Result<(JobSummary, watch::Receiver<bool>), String> {
+    start_job_for_source(
+        state,
+        root,
+        command,
+        label,
+        timeout_secs,
+        workspace_alias,
+        None,
+    )
+    .await
+}
+
+pub async fn start_job_for_source(
+    state: &AppState,
+    root: &Path,
+    command: &str,
+    label: Option<String>,
+    timeout_secs: u64,
+    workspace_alias: Option<String>,
+    source: Option<String>,
+) -> Result<(JobSummary, watch::Receiver<bool>), String> {
     let (cmd_policy, cmd_allowlist) = state.command_policy_and_allowlist().await;
     validate_command_with_policy(command, &cmd_policy, &cmd_allowlist)?;
     let effective_timeout = timeout_secs.clamp(5, 1800);
+
+    let handoff_ctx =
+        resolve_handoff_job_ctx(state, workspace_alias.as_deref(), source.as_deref()).await;
 
     let mut cmd = build_shell_command(root, command);
 
@@ -291,6 +396,7 @@ pub async fn start_job_with_handle(
         label: label.clone(),
         workspace_alias,
         mcp_task_id,
+        source,
         status: JobStatus::Running,
         exit_code: None,
         started_at,
@@ -314,44 +420,11 @@ pub async fn start_job_with_handle(
 
     let app_handle = state.app_handle.read().await.clone();
     emit_job_update(&app_handle, &summary);
-
-    if let Some(app_for_tick) = app_handle.clone() {
-        let map_tick = jobs_map.clone();
-        let jid_tick = job_id.clone();
-        let mut done_tick = done_rx.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            interval.tick().await;
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        let sum_opt = {
-                            let guard = map_tick.read().await;
-                            guard
-                                .get(&jid_tick)
-                                .filter(|j| j.status == JobStatus::Running)
-                                .map(ManagedJob::to_summary)
-                        };
-                        if let Some(sum) = sum_opt {
-                            let _ = app_for_tick.emit("job-updated", &sum);
-                        } else {
-                            break;
-                        }
-                    }
-                    res = done_tick.changed() => {
-                        if res.is_err() || *done_tick.borrow() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-    }
+    spawn_job_tick_emitter(&app_handle, jobs_map.clone(), job_id.clone(), done_rx.clone());
 
     let ansi_re = ansi_regex();
-    spawn_pipe_reader(stdout_pipe, jobs_map.clone(), job_id.clone(), ansi_re, "");
-    spawn_pipe_reader(stderr_pipe, jobs_map.clone(), job_id.clone(), ansi_re, "[stderr] ");
+    let h_out = spawn_pipe_reader(stdout_pipe, jobs_map.clone(), job_id.clone(), ansi_re, "");
+    let h_err = spawn_pipe_reader(stderr_pipe, jobs_map.clone(), job_id.clone(), ansi_re, "[stderr] ");
 
     let jid_watch = job_id.clone();
     tokio::spawn(async move {
@@ -385,8 +458,7 @@ pub async fn start_job_with_handle(
             }
         };
 
-        // Brief grace period so reader tasks flush final buffered lines
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        drain_pipe_readers(h_out, h_err).await;
 
         let updated_summary = {
             let mut guard = jobs_map.write().await;
@@ -402,6 +474,290 @@ pub async fn start_job_with_handle(
         };
         if let Some(sum) = updated_summary {
             emit_job_update(&app_handle, &sum);
+        }
+        if let Some((coord, ws)) = handoff_ctx {
+            crate::handoff::sync_after_job_finished(coord, jobs_map, ws, jid_watch).await;
+        }
+        let _ = done_tx.send(true);
+    });
+
+    Ok((summary, done_rx))
+}
+
+/// Runs a sequential pipeline of up to 5 validated commands inside one `ManagedJob`.
+/// Stops immediately on the first non-zero exit code, kill signal, or overall timeout.
+#[allow(dead_code)]
+pub async fn start_pipeline_job_with_handle(
+    state: &AppState,
+    root: &Path,
+    commands: &[String],
+    label: Option<String>,
+    timeout_secs: u64,
+    workspace_alias: Option<String>,
+) -> Result<(JobSummary, watch::Receiver<bool>), String> {
+    start_pipeline_job_for_source(
+        state,
+        root,
+        commands,
+        label,
+        timeout_secs,
+        workspace_alias,
+        None,
+    )
+    .await
+}
+
+pub async fn start_pipeline_job_for_source(
+    state: &AppState,
+    root: &Path,
+    commands: &[String],
+    label: Option<String>,
+    timeout_secs: u64,
+    workspace_alias: Option<String>,
+    source: Option<String>,
+) -> Result<(JobSummary, watch::Receiver<bool>), String> {
+    if commands.is_empty() {
+        return Err("Pipeline 'commands' tidak boleh kosong.".to_string());
+    }
+    if commands.len() > 5 {
+        return Err(format!(
+            "Pipeline maksimal 5 command sekaligus (diterima {}).",
+            commands.len()
+        ));
+    }
+
+    let (cmd_policy, cmd_allowlist) = state.command_policy_and_allowlist().await;
+    let mut validated_steps = Vec::with_capacity(commands.len());
+    for cmd in commands {
+        let trimmed = cmd.trim();
+        if trimmed.is_empty() {
+            return Err("Setiap step dalam pipeline 'commands' tidak boleh kosong.".to_string());
+        }
+        validate_command_with_policy(trimmed, &cmd_policy, &cmd_allowlist)?;
+        validated_steps.push(trimmed.to_string());
+    }
+
+    if validated_steps.len() == 1 {
+        return start_job_for_source(
+            state,
+            root,
+            &validated_steps[0],
+            label,
+            timeout_secs,
+            workspace_alias,
+            source,
+        )
+        .await;
+    }
+
+    let handoff_ctx =
+        resolve_handoff_job_ctx(state, workspace_alias.as_deref(), source.as_deref()).await;
+
+    let effective_timeout = timeout_secs.clamp(5, 1800);
+    let token = AppState::generate_token();
+    let job_id = format!("job-{}", &token[..8]);
+    let started_at = AppState::now_timestamp();
+    let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
+    let (done_tx, done_rx) = watch::channel(false);
+    let mcp_task_id = crate::mcp_tasks::current_task_id();
+    let started_instant = Instant::now();
+
+    let managed = ManagedJob {
+        job_id: job_id.clone(),
+        command: validated_steps.join(" && "),
+        label,
+        workspace_alias,
+        mcp_task_id,
+        source,
+        status: JobStatus::Running,
+        exit_code: None,
+        started_at,
+        started_instant,
+        last_output_instant: started_instant,
+        timeout_secs: effective_timeout,
+        finished_elapsed_secs: None,
+        lines: Vec::new(),
+        total_lines_seen: 0,
+        pid: None,
+        kill_tx: Some(kill_tx),
+        done_rx: done_rx.clone(),
+    };
+
+    let summary = managed.to_summary();
+    let jobs_map = state.jobs.jobs.clone();
+    {
+        let mut guard = jobs_map.write().await;
+        guard.insert(job_id.clone(), managed);
+    }
+
+    let app_handle = state.app_handle.read().await.clone();
+    emit_job_update(&app_handle, &summary);
+    spawn_job_tick_emitter(&app_handle, jobs_map.clone(), job_id.clone(), done_rx.clone());
+
+    let root_owned = root.to_path_buf();
+    let jid_watch = job_id.clone();
+    let ansi_re = ansi_regex();
+    let total_steps = validated_steps.len();
+
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(effective_timeout);
+        let mut final_status = JobStatus::Completed;
+        let mut final_exit_code = Some(0);
+
+        for (idx, cmd_str) in validated_steps.iter().enumerate() {
+            if kill_rx.try_recv().is_ok() {
+                final_status = JobStatus::Killed;
+                final_exit_code = None;
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                append_job_log_line(
+                    &jobs_map,
+                    &jid_watch,
+                    format!("[TIMEOUT setelah {}s sebelum step {}/{}]", effective_timeout, idx + 1, total_steps),
+                )
+                .await;
+                final_status = JobStatus::TimedOut;
+                final_exit_code = None;
+                break;
+            }
+
+            append_job_log_line(
+                &jobs_map,
+                &jid_watch,
+                format!("[STEP {}/{}] $ {}", idx + 1, total_steps, cmd_str),
+            )
+            .await;
+
+            let mut cmd = build_shell_command(&root_owned, cmd_str);
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    append_job_log_line(
+                        &jobs_map,
+                        &jid_watch,
+                        format!("[STEP {}/{} spawn error: {}]", idx + 1, total_steps, e),
+                    )
+                    .await;
+                    final_status = JobStatus::Failed;
+                    final_exit_code = Some(-1);
+                    break;
+                }
+            };
+
+            let step_pid = child.id();
+            {
+                let mut guard = jobs_map.write().await;
+                if let Some(job) = guard.get_mut(&jid_watch) {
+                    job.pid = step_pid;
+                }
+            }
+
+            let h_out = spawn_pipe_reader(child.stdout.take(), jobs_map.clone(), jid_watch.clone(), ansi_re, "");
+            let h_err = spawn_pipe_reader(child.stderr.take(), jobs_map.clone(), jid_watch.clone(), ansi_re, "[stderr] ");
+
+            enum StepOutcome {
+                Exited(std::io::Result<std::process::ExitStatus>),
+                Killed,
+                TimedOut,
+            }
+
+            let outcome = tokio::select! {
+                res = child.wait() => StepOutcome::Exited(res),
+                _ = &mut kill_rx => {
+                    if let Some(p) = child.id() {
+                        kill_pid_tree(p);
+                    }
+                    let _ = child.start_kill();
+                    StepOutcome::Killed
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    if let Some(p) = child.id() {
+                        kill_pid_tree(p);
+                    }
+                    let _ = child.start_kill();
+                    StepOutcome::TimedOut
+                }
+            };
+
+            drain_pipe_readers(h_out, h_err).await;
+            {
+                let mut guard = jobs_map.write().await;
+                if let Some(job) = guard.get_mut(&jid_watch) {
+                    job.pid = None;
+                }
+            }
+
+            match outcome {
+                StepOutcome::Exited(Ok(st)) => {
+                    let code = st.code().unwrap_or(-1);
+                    append_job_log_line(
+                        &jobs_map,
+                        &jid_watch,
+                        format!("[STEP {}/{} exit={}]", idx + 1, total_steps, code),
+                    )
+                    .await;
+                    if !st.success() {
+                        final_status = JobStatus::Failed;
+                        final_exit_code = Some(code);
+                        break;
+                    }
+                    final_exit_code = Some(code);
+                }
+                StepOutcome::Exited(Err(e)) => {
+                    append_job_log_line(
+                        &jobs_map,
+                        &jid_watch,
+                        format!("[STEP {}/{} wait error: {}]", idx + 1, total_steps, e),
+                    )
+                    .await;
+                    final_status = JobStatus::Failed;
+                    final_exit_code = Some(-1);
+                    break;
+                }
+                StepOutcome::Killed => {
+                    append_job_log_line(
+                        &jobs_map,
+                        &jid_watch,
+                        format!("[STEP {}/{} KILLED]", idx + 1, total_steps),
+                    )
+                    .await;
+                    final_status = JobStatus::Killed;
+                    final_exit_code = None;
+                    break;
+                }
+                StepOutcome::TimedOut => {
+                    append_job_log_line(
+                        &jobs_map,
+                        &jid_watch,
+                        format!("[STEP {}/{} TIMED OUT after {}s]", idx + 1, total_steps, effective_timeout),
+                    )
+                    .await;
+                    final_status = JobStatus::TimedOut;
+                    final_exit_code = None;
+                    break;
+                }
+            }
+        }
+
+        let updated_summary = {
+            let mut guard = jobs_map.write().await;
+            if let Some(job) = guard.get_mut(&jid_watch) {
+                job.pid = None;
+                job.status = final_status;
+                job.exit_code = final_exit_code;
+                job.finished_elapsed_secs = Some(job.started_instant.elapsed().as_secs());
+                job.kill_tx = None;
+                Some(job.to_summary())
+            } else {
+                None
+            }
+        };
+        if let Some(sum) = updated_summary {
+            emit_job_update(&app_handle, &sum);
+        }
+        if let Some((coord, ws)) = handoff_ctx {
+            crate::handoff::sync_after_job_finished(coord, jobs_map, ws, jid_watch).await;
         }
         let _ = done_tx.send(true);
     });
@@ -457,6 +813,7 @@ pub async fn find_job_id_by_mcp_task(state: &AppState, task_id: &str) -> Option<
         .map(|j| j.job_id.clone())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn poll_job(
     state: &AppState,
     job_id: &str,
@@ -473,7 +830,7 @@ pub async fn poll_job_with_wait(
     max_lines: usize,
     wait_secs: u64,
 ) -> Result<String, String> {
-    let effective_wait = wait_secs.min(18);
+    let effective_wait = wait_secs.min(26);
     if effective_wait > 0 {
         let wait_target = {
             let guard = state.jobs.jobs.read().await;
@@ -527,9 +884,10 @@ pub async fn poll_job_with_wait(
         .as_deref()
         .map(|w| format!("\nSTALL_WARNING: {w}"))
         .unwrap_or_default();
+    let display_wait = if effective_wait > 0 { effective_wait } else { 22 };
     let next_hint = if summary.status == JobStatus::Running {
         format!(
-            "\nHINT: Still running. Call poll_command_job(job_id=\"{}\", from_line={next_from_line}) directly (waits up to 12s automatically; do NOT run sleep) or stop_command_job to cancel.",
+            "\nHINT: Still running. Call poll_command_job(job_id=\"{}\", from_line={next_from_line}) directly (waits up to {display_wait}s automatically; do NOT run sleep) or stop_command_job to cancel.",
             summary.job_id
         )
     } else {

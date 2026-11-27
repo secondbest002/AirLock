@@ -52,12 +52,61 @@ async fn resolve_entry_root(
     Ok(state.workspace_root.read().await.clone())
 }
 
+async fn maybe_sync_handoff_after_revert(
+    state: &AppState,
+    ws_id: Option<&str>,
+    ws_alias: Option<&str>,
+    ws_root: Option<&str>,
+    is_webmcp: bool,
+) {
+    if !is_webmcp {
+        return;
+    }
+    let req = ws_id.or(ws_alias);
+    let resolved = if let Some(key) = req.filter(|s| !s.trim().is_empty()) {
+        crate::workspace::resolve_workspace(state, Some(key), None)
+            .await
+            .ok()
+    } else if let Some(raw_root) = ws_root.filter(|s| !s.trim().is_empty()) {
+        let current_default = state.workspace_root.read().await.clone();
+        let clean_def = crate::workspace::clean_path_string(&current_default);
+        if crate::workspace::paths_equal(raw_root, &clean_def) {
+            crate::workspace::resolve_workspace(state, None, None).await.ok()
+        } else {
+            None
+        }
+    } else {
+        crate::workspace::resolve_workspace(state, None, None).await.ok()
+    };
+
+    if let Some(ws) = resolved {
+        if crate::handoff::workspace_has_handoff(&ws) {
+            let _ = crate::handoff::sync_from_state(
+                state,
+                &ws,
+                crate::handoff::HandoffTrigger::AuditReverted,
+                false,
+            )
+            .await;
+        }
+    }
+}
+
 pub async fn revert_audit_entry(
     state: &AppState,
     audit_id: &str,
     force: bool,
 ) -> Result<String, String> {
-    let (entry_ws_root, entry_ws_id) = {
+    revert_audit_entry_inner(state, audit_id, force, true).await
+}
+
+async fn revert_audit_entry_inner(
+    state: &AppState,
+    audit_id: &str,
+    force: bool,
+    sync_handoff: bool,
+) -> Result<String, String> {
+    let (entry_ws_root, entry_ws_id, entry_ws_alias, entry_source) = {
         let logs = state.audit_logs.read().await;
         let entry = logs
             .iter()
@@ -69,10 +118,15 @@ pub async fn revert_audit_entry(
         if entry.reverted {
             return Err("Perubahan ini sudah pernah di-revert.".to_string());
         }
-        (entry.workspace_root.clone(), entry.workspace_id.clone())
+        (
+            entry.workspace_root.clone(),
+            entry.workspace_id.clone(),
+            entry.workspace_alias.clone(),
+            entry.source.clone(),
+        )
     };
 
-    let root = resolve_entry_root(state, entry_ws_root, entry_ws_id).await?;
+    let root = resolve_entry_root(state, entry_ws_root.clone(), entry_ws_id.clone()).await?;
     let mut logs = state.audit_logs.write().await;
 
     let entry = logs
@@ -165,6 +219,17 @@ pub async fn revert_audit_entry(
     state.snapshot_store.save_audit_entries(&logs);
     drop(logs);
     state.emit_dashboard().await;
+
+    if sync_handoff {
+        maybe_sync_handoff_after_revert(
+            state,
+            entry_ws_id.as_deref(),
+            entry_ws_alias.as_deref(),
+            entry_ws_root.as_deref(),
+            crate::handoff::is_webmcp_source(&entry_source),
+        )
+        .await;
+    }
     Ok(msg)
 }
 
@@ -173,15 +238,28 @@ pub async fn revert_audit_group(
     group_id: &str,
     force: bool,
 ) -> Result<String, String> {
-    let ids: Vec<String> = {
+    let (ids, sync_meta) = {
         let logs = state.audit_logs.read().await;
-        logs.iter()
+        let matching: Vec<&crate::state::AuditEntry> = logs
+            .iter()
             .rev()
             .filter(|e| {
                 e.group_id.as_deref() == Some(group_id) && e.can_revert && !e.reverted
             })
-            .map(|e| e.id.clone())
-            .collect()
+            .collect();
+        let has_webmcp = matching
+            .iter()
+            .any(|e| crate::handoff::is_webmcp_source(&e.source));
+        let meta = matching.first().map(|e| {
+            (
+                has_webmcp,
+                e.workspace_id.clone(),
+                e.workspace_alias.clone(),
+                e.workspace_root.clone(),
+            )
+        });
+        let ids: Vec<String> = matching.into_iter().map(|e| e.id.clone()).collect();
+        (ids, meta)
     };
 
     if ids.is_empty() {
@@ -192,7 +270,18 @@ pub async fn revert_audit_group(
 
     let count = ids.len();
     for id in ids {
-        revert_audit_entry(state, &id, force).await?;
+        revert_audit_entry_inner(state, &id, force, false).await?;
+    }
+
+    if let Some((is_webmcp, ws_id, ws_alias, ws_root)) = sync_meta {
+        maybe_sync_handoff_after_revert(
+            state,
+            ws_id.as_deref(),
+            ws_alias.as_deref(),
+            ws_root.as_deref(),
+            is_webmcp,
+        )
+        .await;
     }
 
     Ok(format!(

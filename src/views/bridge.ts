@@ -107,6 +107,26 @@ const SIM_DEFAULTS: Record<string, string> = {
     null,
     2
   ),
+  run_command: JSON.stringify(
+    { action: "run", command: "git status -s" },
+    null,
+    2
+  ),
+  lsp_query: JSON.stringify(
+    { op: "diagnostics", path: "src/main.ts", severity: "all" },
+    null,
+    2
+  ),
+  session_checkpoint: JSON.stringify(
+    { op: "load" },
+    null,
+    2
+  ),
+  delegate_local_agent: JSON.stringify(
+    { action: "start", goal: "Inspect repository architecture", mode: "read_only", max_steps: 6 },
+    null,
+    2
+  ),
 };
 
 let secretsVisible = false;
@@ -183,7 +203,42 @@ function buildTrafficRow(item: HttpTrafficEntry): HTMLTableRowElement {
   tdDur.textContent = `${item.duration_ms}ms`;
 
   const tdNote = document.createElement("td");
-  tdNote.textContent = item.note;
+  const noteSpan = document.createElement("span");
+  noteSpan.textContent = item.note;
+  tdNote.appendChild(noteSpan);
+
+  const preview = item.response_preview ?? "";
+  const badges: Array<{ label: string; cls: string; title: string }> = [];
+  if (preview.includes("[HARNESS_HINT:")) {
+    badges.push({
+      label: "HARNESS",
+      cls: "status-online",
+      title: "WebMCP Session Harness menyuntikkan steering hint",
+    });
+  }
+  if (preview.includes("=== WORKSPACE RULES")) {
+    badges.push({
+      label: "RULES",
+      cls: "status-online",
+      title: "Aturan GEMINI.md workspace disuntikkan otomatis",
+    });
+  }
+  if (preview.includes("AUTO_PROMOTED_TO_BACKGROUND_JOB")) {
+    badges.push({
+      label: "AUTO-JOB",
+      cls: "status-warn",
+      title: "Eksekusi lambat dipromosikan otomatis ke background JobManager",
+    });
+  }
+  for (const b of badges) {
+    const tag = document.createElement("span");
+    tag.className = `status-dot ${b.cls}`;
+    tag.style.marginLeft = "6px";
+    tag.style.fontSize = "10px";
+    tag.textContent = b.label;
+    tag.title = b.title;
+    tdNote.appendChild(tag);
+  }
 
   tr.append(tdTime, tdMethod, tdRpc, tdStatus, tdDur, tdNote);
   return tr;
@@ -845,6 +900,50 @@ export function renderBridgeView(
 
   renderSecrets(snap);
 
+  const webmcpBadge = $("bridge-webmcp-profile-badge");
+  const isCompact = (snap.webmcp_default_profile ?? "compact") === "compact";
+  const compactCount = 9 + (snap.webmcp_expose_skills ? 3 : 0) + (snap.has_api_key ? 1 : 0);
+  webmcpBadge.textContent = isCompact
+    ? `COMPACT (${compactCount} TOOLS)`
+    : "FULL PROFILE";
+  webmcpBadge.className = `badge ${isCompact ? "badge-online" : "badge-muted"}`;
+
+  const webmcpProfileSel = $("webmcp-profile-select") as HTMLSelectElement;
+  if (document.activeElement !== webmcpProfileSel) {
+    webmcpProfileSel.value = snap.webmcp_default_profile ?? "compact";
+  }
+  const promoteInput = $("webmcp-promote-input") as HTMLInputElement;
+  if (document.activeElement !== promoteInput) {
+    promoteInput.value = String(snap.webmcp_auto_promote_secs ?? 18);
+  }
+  const pollInput = $("webmcp-poll-input") as HTMLInputElement;
+  if (document.activeElement !== pollInput) {
+    pollInput.value = String(snap.webmcp_poll_wait_secs ?? 22);
+  }
+  const rpcTimeoutInput = $("webmcp-rpc-timeout-input") as HTMLInputElement;
+  if (document.activeElement !== rpcTimeoutInput) {
+    rpcTimeoutInput.value = String(snap.webmcp_rpc_timeout_secs ?? 32);
+  }
+  const maxCharsInput = $("webmcp-max-chars-input") as HTMLInputElement;
+  if (document.activeElement !== maxCharsInput) {
+    maxCharsInput.value = String(snap.webmcp_max_output_chars ?? 6000);
+  }
+  ($("toggle-webmcp-sse") as HTMLInputElement).checked = Boolean(snap.webmcp_sse_keepalive);
+  ($("toggle-webmcp-write-delegation") as HTMLInputElement).checked = Boolean(
+    snap.webmcp_allow_write_delegation
+  );
+  ($("toggle-webmcp-expose-skills") as HTMLInputElement).checked = Boolean(
+    snap.webmcp_expose_skills
+  );
+  ($("toggle-webmcp-session-harness") as HTMLInputElement).checked = Boolean(
+    snap.webmcp_session_harness
+  );
+  ($("toggle-webmcp-auto-verify-edit") as HTMLInputElement).checked = Boolean(
+    snap.webmcp_auto_verify_on_edit
+  );
+  ($("toggle-webmcp-auto-handoff") as HTMLInputElement).checked =
+    snap.webmcp_auto_handoff_dir ?? true;
+
   const btnServer = $("btn-toggle-server");
   btnServer.textContent = snap.server_running ? "Stop Server" : "Start Server";
   btnServer.className = `btn ${snap.server_running ? "btn-danger" : "btn-primary"}`;
@@ -1079,6 +1178,110 @@ export function initBridgeView(
     } catch (err) {
       setToast(`Gagal menyimpan Command Allowlist: ${String(err)}`, "warn");
     }
+  });
+
+  const saveWebmcpSettings = async (patch: Record<string, unknown>, label?: string): Promise<void> => {
+    try {
+      const snap = await invoke<DashboardSnapshot>("update_webmcp_settings", patch);
+      onSnapshot(snap);
+      if (label) {
+        setToast(label, "info");
+      }
+    } catch (err) {
+      setToast(`Gagal menyimpan WebMCP settings: ${String(err)}`, "warn");
+    }
+  };
+
+  $("webmcp-profile-select").addEventListener("change", async (e) => {
+    const profile = (e.target as HTMLSelectElement).value;
+    await saveWebmcpSettings(
+      { webmcpDefaultProfile: profile },
+      profile === "compact"
+        ? "WebMCP profile default: Compact (hemat konteks & anti-timeout)."
+        : "WebMCP profile default: Full (seluruh tool granular)."
+    );
+  });
+
+  $("toggle-webmcp-sse").addEventListener("change", async (e) => {
+    const enabled = (e.target as HTMLInputElement).checked;
+    await saveWebmcpSettings(
+      { webmcpSseKeepalive: enabled },
+      enabled ? "SSE keepalive WebMCP diaktifkan." : "SSE keepalive WebMCP dinonaktifkan."
+    );
+  });
+
+  $("toggle-webmcp-write-delegation").addEventListener("change", async (e) => {
+    const enabled = (e.target as HTMLInputElement).checked;
+    await saveWebmcpSettings(
+      { webmcpAllowWriteDelegation: enabled },
+      enabled
+        ? "Delegasi write Local Agent (mode=execute) diaktifkan."
+        : "Delegasi write Local Agent dinonaktifkan (hanya mode read_only)."
+    );
+  });
+
+  $("toggle-webmcp-expose-skills").addEventListener("change", async (e) => {
+    const enabled = (e.target as HTMLInputElement).checked;
+    await saveWebmcpSettings(
+      { webmcpExposeSkills: enabled },
+      enabled
+        ? "Skill tools diekspos pada Compact profile."
+        : "Skill tools disembunyikan di Compact profile (resource skill:// tetap aktif)."
+    );
+  });
+
+  $("toggle-webmcp-session-harness").addEventListener("change", async (e) => {
+    const enabled = (e.target as HTMLInputElement).checked;
+    await saveWebmcpSettings(
+      { webmcpSessionHarness: enabled },
+      enabled
+        ? "WebMCP Session Harness & loop guard diaktifkan."
+        : "WebMCP Session Harness dinonaktifkan."
+    );
+  });
+
+  $("toggle-webmcp-auto-verify-edit").addEventListener("change", async (e) => {
+    const enabled = (e.target as HTMLInputElement).checked;
+    await saveWebmcpSettings(
+      { webmcpAutoVerifyOnEdit: enabled },
+      enabled
+        ? "Auto warm-LSP verify setelah edit WebMCP diaktifkan."
+        : "Auto warm-LSP verify setelah edit WebMCP dinonaktifkan."
+    );
+  });
+
+  $("toggle-webmcp-auto-handoff").addEventListener("change", async (e) => {
+    const enabled = (e.target as HTMLInputElement).checked;
+    await saveWebmcpSettings(
+      { webmcpAutoHandoffDir: enabled },
+      enabled
+        ? "Auto-Export .airlock/HANDOFF.md diaktifkan."
+        : "Auto-Export .airlock/HANDOFF.md dinonaktifkan."
+    );
+  });
+
+  $("btn-save-webmcp").addEventListener("click", async () => {
+    const profile = ($("webmcp-profile-select") as HTMLSelectElement).value;
+    const autoPromoteSecs = Number(($("webmcp-promote-input") as HTMLInputElement).value) || 18;
+    const pollWaitSecs = Number(($("webmcp-poll-input") as HTMLInputElement).value) || 22;
+    const rpcTimeoutSecs = Number(($("webmcp-rpc-timeout-input") as HTMLInputElement).value) || 32;
+    const maxOutputChars = Number(($("webmcp-max-chars-input") as HTMLInputElement).value) || 6000;
+    await saveWebmcpSettings(
+      {
+        webmcpDefaultProfile: profile,
+        webmcpAutoPromoteSecs: autoPromoteSecs,
+        webmcpPollWaitSecs: pollWaitSecs,
+        webmcpRpcTimeoutSecs: rpcTimeoutSecs,
+        webmcpMaxOutputChars: maxOutputChars,
+        webmcpSseKeepalive: ($("toggle-webmcp-sse") as HTMLInputElement).checked,
+        webmcpAllowWriteDelegation: ($("toggle-webmcp-write-delegation") as HTMLInputElement).checked,
+        webmcpExposeSkills: ($("toggle-webmcp-expose-skills") as HTMLInputElement).checked,
+        webmcpSessionHarness: ($("toggle-webmcp-session-harness") as HTMLInputElement).checked,
+        webmcpAutoVerifyOnEdit: ($("toggle-webmcp-auto-verify-edit") as HTMLInputElement).checked,
+        webmcpAutoHandoffDir: ($("toggle-webmcp-auto-handoff") as HTMLInputElement).checked,
+      },
+      "Pengaturan WebMCP Optimization disimpan."
+    );
   });
 
   $("btn-reset-command-allowlist").addEventListener("click", async () => {

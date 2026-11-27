@@ -4,13 +4,16 @@ mod rpc;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use auth::compute_base_url;
+pub(crate) use auth::{compute_base_url, McpToolProfile};
 #[allow(unused_imports)]
-pub(crate) use rpc::{handle_single_rpc, handle_single_rpc_with_context};
+pub(crate) use rpc::{
+    handle_single_rpc, handle_single_rpc_with_context, handle_single_rpc_with_request_context,
+    RpcRequestContext,
+};
 
 use crate::oauth;
 use crate::state::AppState;
-use crate::tools::mcp_tools_list;
+use crate::tools::{mcp_tools_list, mcp_tools_list_for_profile};
 use axum::extract::State;
 use axum::http::{header, HeaderName, HeaderValue, Method};
 use axum::response::IntoResponse;
@@ -103,8 +106,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             HeaderName::from_static("mcp-method"),
             HeaderName::from_static("mcp-name"),
             HeaderName::from_static("x-airlock-workspace"),
+            HeaderName::from_static("x-airlock-profile"),
         ])
-        .expose_headers([HeaderName::from_static("mcp-session-id")]);
+        .expose_headers([
+            HeaderName::from_static("mcp-session-id"),
+            header::WWW_AUTHENTICATE,
+        ]);
 
     Router::new()
         .route("/health", get(handle_health))
@@ -289,7 +296,7 @@ pub async fn run_self_diagnostic(state: &AppState) -> DiagnosticReport {
     };
 
     let tools_count = match client
-        .post(format!("{base_local}/mcp"))
+        .post(format!("{base_local}/mcp?profile=full"))
         .timeout(diag_timeout)
         .bearer_auth(&auth_token)
         .json(&json!({
@@ -312,7 +319,12 @@ pub async fn run_self_diagnostic(state: &AppState) -> DiagnosticReport {
 
     let latency_ms = started.elapsed().as_millis() as u64;
 
-    let expected_builtin = mcp_tools_list().as_array().map(|a| a.len()).unwrap_or(28);
+    let enable_delegation = crate::local_agent::has_delegation_provider_ready(&state).await;
+    let expected_builtin =
+        mcp_tools_list_for_profile(McpToolProfile::Full, enable_delegation, true, true)
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(27);
     if health_ok && mcp_initialize_ok && tools_count >= expected_builtin {
         notes.push(format!("Loopback MCP sehat ({latency_ms}ms, {tools_count} tools siap)."));
     }

@@ -32,26 +32,84 @@ fn secret_placeholder_re() -> &'static Regex {
     })
 }
 
+const PLUGIN_MANIFEST_CANDIDATES: &[&str] = &[
+    "plugin.json",
+    ".claude-plugin/plugin.json",
+    ".gemini-plugin/plugin.json",
+    ".antigravity-plugin/plugin.json",
+    "gemini-extension.json",
+];
+
+const PLUGIN_MCP_CANDIDATES: &[&str] = &["mcp.json", ".mcp.json", "mcp_config.json"];
+
+fn find_first_existing_rel(dir: &Path, candidates: &[&str]) -> Option<PathBuf> {
+    candidates.iter().map(|rel| dir.join(rel)).find(|p| p.is_file())
+}
+
+fn format_author_value(val: &serde_json::Value) -> Option<String> {
+    match val {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        serde_json::Value::Object(map) => {
+            let name = map
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let url = map
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let email = map
+                .get("email")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            match (name, url, email) {
+                (Some(n), Some(u), _) => Some(format!("{n} ({u})")),
+                (Some(n), None, Some(e)) => Some(format!("{n} <{e}>")),
+                (Some(n), None, None) => Some(n.to_string()),
+                (None, Some(u), _) => Some(u.to_string()),
+                (None, None, Some(e)) => Some(e.to_string()),
+                (None, None, None) => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn deserialize_optional_author<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    Ok(opt.and_then(|val| format_author_value(&val)))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
+    #[serde(default)]
     pub name: String,
     #[serde(default = "default_plugin_version")]
     pub version: String,
     #[serde(default)]
     pub description: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_author")]
     pub author: Option<String>,
     #[serde(default)]
     pub homepage: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "keywords")]
     pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginMcpServerDef {
-    #[serde(default)]
+    #[serde(default, alias = "type")]
     pub transport: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "httpUrl", alias = "serverUrl")]
     pub url: Option<String>,
     #[serde(default)]
     pub headers: HashMap<String, String>,
@@ -272,24 +330,38 @@ pub fn interpolate_secret_str(raw: &str, secret_map: &HashMap<String, String>) -
 }
 
 fn load_plugin_mcp_file(dir: &Path) -> Result<Option<PluginMcpFile>, String> {
-    let mcp_path = dir.join("mcp.json");
-    if !mcp_path.is_file() {
-        return Ok(None);
+    if let Some(mcp_path) = find_first_existing_rel(dir, PLUGIN_MCP_CANDIDATES) {
+        let label = mcp_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("mcp.json");
+        let raw = fs::read_to_string(&mcp_path)
+            .map_err(|e| format!("Gagal membaca {label} plugin: {e}"))?;
+        let parsed = serde_json::from_str::<PluginMcpFile>(&raw)
+            .map_err(|e| format!("Format {label} plugin tidak valid: {e}"))?;
+        return Ok(Some(parsed));
     }
-    let raw = fs::read_to_string(&mcp_path)
-        .map_err(|e| format!("Gagal membaca mcp.json plugin: {e}"))?;
-    let parsed = serde_json::from_str::<PluginMcpFile>(&raw)
-        .map_err(|e| format!("Format mcp.json plugin tidak valid: {e}"))?;
-    Ok(Some(parsed))
+
+    // Fallback for Claude/Gemini manifests (e.g. gemini-extension.json) that inline `mcpServers`
+    if let Some(manifest_path) = find_first_existing_rel(dir, PLUGIN_MANIFEST_CANDIDATES) {
+        if let Ok(raw) = fs::read_to_string(&manifest_path) {
+            if let Ok(parsed) = serde_json::from_str::<PluginMcpFile>(&raw) {
+                if !parsed.mcp_servers.is_empty() {
+                    return Ok(Some(parsed));
+                }
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 fn load_or_synthesize_manifest(dir: &Path) -> Result<(PluginManifest, Vec<String>), String> {
-    let manifest_path = dir.join("plugin.json");
-    if manifest_path.is_file() {
+    if let Some(manifest_path) = find_first_existing_rel(dir, PLUGIN_MANIFEST_CANDIDATES) {
         let raw = fs::read_to_string(&manifest_path)
-            .map_err(|e| format!("Gagal membaca plugin.json: {e}"))?;
+            .map_err(|e| format!("Gagal membaca manifest plugin: {e}"))?;
         let mut parsed = serde_json::from_str::<PluginManifest>(&raw)
-            .map_err(|e| format!("Format plugin.json tidak valid: {e}"))?;
+            .map_err(|e| format!("Format manifest plugin tidak valid: {e}"))?;
         parsed.name = parsed.name.trim().to_string();
         if parsed.name.is_empty() {
             parsed.name = dir
@@ -320,8 +392,12 @@ fn load_or_synthesize_manifest(dir: &Path) -> Result<(PluginManifest, Vec<String
 }
 
 fn compute_plugin_manifest_hash(dir: &Path) -> String {
-    let plugin_bytes = fs::read(dir.join("plugin.json")).unwrap_or_default();
-    let mcp_bytes = fs::read(dir.join("mcp.json")).unwrap_or_default();
+    let plugin_bytes = find_first_existing_rel(dir, PLUGIN_MANIFEST_CANDIDATES)
+        .and_then(|p| fs::read(p).ok())
+        .unwrap_or_default();
+    let mcp_bytes = find_first_existing_rel(dir, PLUGIN_MCP_CANDIDATES)
+        .and_then(|p| fs::read(p).ok())
+        .unwrap_or_default();
     let mut combined = Vec::with_capacity(plugin_bytes.len() + mcp_bytes.len() + 2);
     combined.extend_from_slice(&plugin_bytes);
     combined.push(b'\n');
@@ -624,15 +700,15 @@ pub async fn inspect_plugin_source(
 
     let inspected_res = (|| -> Result<(PathBuf, PluginManifest, String, Vec<PluginMcpPreviewItem>, Vec<SkillSummary>, Vec<String>, Vec<String>), String> {
         let source_dir = resolve_optional_subdir(&base_dir, subdir)?;
-        let has_manifest = source_dir.join("plugin.json").is_file();
-        let has_mcp = source_dir.join("mcp.json").is_file();
+        let has_manifest = find_first_existing_rel(&source_dir, PLUGIN_MANIFEST_CANDIDATES).is_some();
+        let mcp_opt = load_plugin_mcp_file(&source_dir)?;
+        let has_mcp = mcp_opt.is_some();
         let bundled_skills = scan_plugin_skills_preview(&source_dir);
         if !has_manifest && !has_mcp && bundled_skills.is_empty() {
-            return Err("Folder tidak berisi plugin.json, mcp.json, maupun skills/*/SKILL.md yang valid.".to_string());
+            return Err("Folder tidak berisi manifest plugin (plugin.json / .claude-plugin / gemini-extension.json), mcp.json, maupun skills/*/SKILL.md yang valid.".to_string());
         }
 
         let (manifest, mut warnings) = load_or_synthesize_manifest(&source_dir)?;
-        let mcp_opt = load_plugin_mcp_file(&source_dir)?;
         let (mcp_items, required_secrets, mcp_warnings) = match mcp_opt {
             Some(ref m) => build_mcp_preview_items(m),
             None => (Vec::new(), Vec::new(), Vec::new()),
@@ -1230,16 +1306,43 @@ mod tests {
             .await
             .unwrap();
         assert!(!record.enabled);
-        assert!(state.skills_cache.read().await.is_empty());
+        assert_eq!(
+            state
+                .skills_cache
+                .read()
+                .await
+                .iter()
+                .filter(|s| s.summary.plugin_id.as_deref() == Some(record.id.as_str()))
+                .count(),
+            0
+        );
 
         // Enable -> skill and downstream MCP appear
         toggle_plugin(&state, &record.id, true).await.unwrap();
-        assert_eq!(state.skills_cache.read().await.len(), 1);
+        assert_eq!(
+            state
+                .skills_cache
+                .read()
+                .await
+                .iter()
+                .filter(|s| s.summary.plugin_id.as_deref() == Some(record.id.as_str()))
+                .count(),
+            1
+        );
         assert_eq!(state.resolved_downstream_mcps().await.len(), 1);
 
         // Disable -> skill and downstream MCP disappear immediately
         toggle_plugin(&state, &record.id, false).await.unwrap();
-        assert!(state.skills_cache.read().await.is_empty());
+        assert_eq!(
+            state
+                .skills_cache
+                .read()
+                .await
+                .iter()
+                .filter(|s| s.summary.plugin_id.as_deref() == Some(record.id.as_str()))
+                .count(),
+            0
+        );
         assert!(state.resolved_downstream_mcps().await.is_empty());
 
         // Re-enable then uninstall -> everything cleaned from config, disk, skills, secrets
@@ -1256,7 +1359,16 @@ mod tests {
         uninstall_plugin(&state, &record.id).await.unwrap();
         assert!(!install_dir.exists());
         assert!(state.config.read().await.installed_plugins.is_empty());
-        assert!(state.skills_cache.read().await.is_empty());
+        assert_eq!(
+            state
+                .skills_cache
+                .read()
+                .await
+                .iter()
+                .filter(|s| s.summary.plugin_id.as_deref() == Some(record.id.as_str()))
+                .count(),
+            0
+        );
         assert!(state.resolved_downstream_mcps().await.is_empty());
         assert!(!state
             .provider_secrets
@@ -1264,6 +1376,96 @@ mod tests {
             .await
             .plugin_secrets
             .contains_key(&record.id));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn test_plugin_object_author_keywords_and_claude_gemini_manifests() {
+        let base = std::env::temp_dir().join("smart_mcp_plugin_object_author_test");
+        let _ = fs::remove_dir_all(&base);
+        let data_dir = base.join("data");
+        let mwg_dir = base.join("mwg_like");
+        let claude_dir = base.join("claude_like");
+        fs::create_dir_all(mwg_dir.join("skills/modern-web-guidance")).unwrap();
+        fs::create_dir_all(claude_dir.join(".claude-plugin")).unwrap();
+        fs::create_dir_all(claude_dir.join("skills/helper")).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+
+        fs::write(
+            mwg_dir.join("plugin.json"),
+            r#"{
+              "name": "modern-web-guidance-plugin",
+              "displayName": "Modern Web Guidance",
+              "version": "1.0.1",
+              "description": "Web best practices",
+              "author": { "name": "Google Chrome", "url": "https://developer.chrome.com" },
+              "keywords": ["web", "html", "css"]
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            mwg_dir.join("skills/modern-web-guidance/SKILL.md"),
+            "---\nname: modern-web-guidance\ndescription: Web APIs\n---\nInstructions",
+        )
+        .unwrap();
+
+        fs::write(
+            claude_dir.join(".claude-plugin/plugin.json"),
+            r#"{
+              "name": "claude-ext",
+              "version": "0.2.0",
+              "description": "Claude style manifest",
+              "author": { "name": "Google", "email": "dev@example.com" }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            claude_dir.join(".mcp.json"),
+            r#"{"mcpServers":{"web":{"type":"http","httpUrl":"http://127.0.0.1:59997/mcp"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            claude_dir.join("skills/helper/SKILL.md"),
+            "---\nname: helper\ndescription: Helper\n---\nHelp",
+        )
+        .unwrap();
+
+        let state = AppState::new_persistent(
+            base.clone(),
+            data_dir.join("auth.json"),
+            data_dir.join("config.json"),
+        );
+
+        let mwg_preview =
+            inspect_plugin_source(&state, "local", mwg_dir.to_str().unwrap(), None)
+                .await
+                .unwrap();
+        assert_eq!(mwg_preview.manifest.name, "modern-web-guidance-plugin");
+        assert_eq!(
+            mwg_preview.manifest.author.as_deref(),
+            Some("Google Chrome (https://developer.chrome.com)")
+        );
+        assert_eq!(mwg_preview.manifest.tags, vec!["web", "html", "css"]);
+        assert_eq!(mwg_preview.skills.len(), 1);
+        cancel_staging(&state, &mwg_preview.staging_id).await;
+
+        let claude_preview =
+            inspect_plugin_source(&state, "local", claude_dir.to_str().unwrap(), None)
+                .await
+                .unwrap();
+        assert_eq!(claude_preview.manifest.name, "claude-ext");
+        assert_eq!(
+            claude_preview.manifest.author.as_deref(),
+            Some("Google <dev@example.com>")
+        );
+        assert_eq!(claude_preview.mcp_servers.len(), 1);
+        assert_eq!(claude_preview.mcp_servers[0].transport, "http");
+        assert_eq!(
+            claude_preview.mcp_servers[0].url,
+            "http://127.0.0.1:59997/mcp"
+        );
+        cancel_staging(&state, &claude_preview.staging_id).await;
 
         let _ = fs::remove_dir_all(&base);
     }

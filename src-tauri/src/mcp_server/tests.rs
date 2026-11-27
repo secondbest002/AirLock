@@ -1,7 +1,7 @@
 use super::*;
 use crate::oauth;
 use crate::state::{AppState, OAuthDecision};
-use crate::tools::mcp_tools_list;
+use crate::tools::{mcp_tools_list, mcp_tools_list_for_profile};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::post;
@@ -79,10 +79,28 @@ async fn test_mcp_http_endpoints_end_to_end() {
     let init_resp: Value = init_http.json().await.unwrap();
     assert_eq!(init_resp["result"]["protocolVersion"], "2025-03-26");
 
-    // 3. tools/list returns all built-in smart tools with MCP annotations & _meta cacheControl
-    let expected_builtin = mcp_tools_list().as_array().unwrap().len();
+    // 3. tools/list with ?profile=full returns WebMCP-eligible built-in tools (excluding Local-Agent-only spawn_subagent, and gating delegate_local_agent on provider readiness)
+    let expected_webmcp_full =
+        mcp_tools_list_for_profile(McpToolProfile::Full, false, true, true)
+            .as_array()
+            .unwrap()
+            .len();
+    assert_eq!(
+        expected_webmcp_full,
+        mcp_tools_list().as_array().unwrap().len() - 2
+    );
+    let expected_webmcp_full_with_delegate =
+        mcp_tools_list_for_profile(McpToolProfile::Full, true, true, true)
+            .as_array()
+            .unwrap()
+            .len();
+    assert_eq!(
+        expected_webmcp_full_with_delegate,
+        mcp_tools_list().as_array().unwrap().len() - 1
+    );
+    let full_endpoint = format!("{endpoint}?profile=full");
     let list_resp: Value = client
-        .post(&endpoint)
+        .post(&full_endpoint)
         .bearer_auth(&token)
         .json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
         .send()
@@ -92,7 +110,7 @@ async fn test_mcp_http_endpoints_end_to_end() {
         .await
         .unwrap();
     let tools_arr = list_resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools_arr.len(), expected_builtin);
+    assert_eq!(tools_arr.len(), expected_webmcp_full);
     assert_eq!(
         list_resp["result"]["_meta"]["cacheControl"]["type"],
         "ephemeral"
@@ -106,7 +124,7 @@ async fn test_mcp_http_endpoints_end_to_end() {
 
     // 3b. MCP 2026 forward-compat server/discover, resources/*, prompts/*
     let discover_resp: Value = client
-        .post(&endpoint)
+        .post(&full_endpoint)
         .bearer_auth(&token)
         .header("Mcp-Method", "server/discover")
         .header("Mcp-Name", "smart-tauri-hub")
@@ -119,7 +137,7 @@ async fn test_mcp_http_endpoints_end_to_end() {
         .unwrap();
     assert_eq!(
         discover_resp["result"]["tools"].as_array().unwrap().len(),
-        expected_builtin
+        expected_webmcp_full
     );
     assert_eq!(
         discover_resp["result"]["resources"].as_array().unwrap().len(),
@@ -130,7 +148,11 @@ async fn test_mcp_http_endpoints_end_to_end() {
     );
     assert_eq!(
         discover_resp["result"]["prompts"].as_array().unwrap().len(),
-        4
+        crate::mcp_resources::prompts_list_for_context(&state, None)
+            .await
+            .as_array()
+            .unwrap()
+            .len()
     );
 
     let read_res_resp: Value = client
@@ -541,7 +563,7 @@ async fn test_mcp_oauth2_pkce_flow_end_to_end() {
     assert_eq!(mcp_init["result"]["serverInfo"]["name"], "smart-tauri-hub");
 
     let mcp_list: Value = client
-        .post(format!("{base}/mcp"))
+        .post(format!("{base}/mcp?profile=full"))
         .bearer_auth(&access_token)
         .json(&json!({"jsonrpc":"2.0","id":11,"method":"tools/list"}))
         .send()
@@ -550,9 +572,14 @@ async fn test_mcp_oauth2_pkce_flow_end_to_end() {
         .json()
         .await
         .unwrap();
+    let expected_full_webmcp =
+        mcp_tools_list_for_profile(McpToolProfile::Full, false, true, true)
+            .as_array()
+            .unwrap()
+            .len();
     assert_eq!(
         mcp_list["result"]["tools"].as_array().unwrap().len(),
-        mcp_tools_list().as_array().unwrap().len()
+        expected_full_webmcp
     );
 
     // 7. GET /mcp with Accept: text/event-stream must return 405 Method Not Allowed
@@ -594,7 +621,7 @@ async fn test_mcp_oauth2_pkce_flow_end_to_end() {
         .json()
         .await
         .unwrap();
-    assert_eq!(prm_list["result"]["prompts"].as_array().unwrap().len(), 4);
+    assert_eq!(prm_list["result"]["prompts"].as_array().unwrap().len(), 5);
 
     // 9. Revoking the OAuth client must immediately return 401 on subsequent /mcp calls
     oauth::revoke_oauth_client(&state, &client_id)
@@ -1048,7 +1075,7 @@ async fn test_mcp_hub_http_aggregation_end_to_end() {
     let token = state.auth_token.read().await.clone();
     let client = reqwest::Client::new();
     let list_resp: Value = client
-        .post(format!("http://{hub_addr}/mcp"))
+        .post(format!("http://{hub_addr}/mcp?profile=full"))
         .bearer_auth(&token)
         .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
         .send()
@@ -1057,7 +1084,11 @@ async fn test_mcp_hub_http_aggregation_end_to_end() {
         .json()
         .await
         .unwrap();
-    let expected_builtin = mcp_tools_list().as_array().unwrap().len();
+    let expected_builtin =
+        mcp_tools_list_for_profile(McpToolProfile::Full, false, true, true)
+            .as_array()
+            .unwrap()
+            .len();
     let tools_arr = list_resp["result"]["tools"].as_array().unwrap();
     assert_eq!(tools_arr.len(), expected_builtin + 1);
     assert!(tools_arr.iter().any(|t| t["name"] == "docshub__ping_doc"));
@@ -1433,9 +1464,17 @@ async fn test_mcp_skills_over_mcp_rpc_and_resource_read() {
         .await
         .unwrap();
     let skills_arr = list_val["result"]["skills"].as_array().unwrap();
-    assert_eq!(skills_arr.len(), 1);
-    assert_eq!(skills_arr[0]["name"], "rust-check");
-    assert_eq!(skills_arr[0]["uri"], "skill://rust-check");
+    assert_eq!(skills_arr.len(), 2);
+    let rust_skill = skills_arr
+        .iter()
+        .find(|s| s["name"] == "rust-check")
+        .expect("workspace rust-check skill should be listed");
+    assert_eq!(rust_skill["uri"], "skill://rust-check");
+    let builtin_skill = skills_arr
+        .iter()
+        .find(|s| s["name"] == "airlock-blueprint-workflow")
+        .expect("builtin airlock-blueprint-workflow skill should be listed");
+    assert_eq!(builtin_skill["sourceLabel"], "builtin:airlock");
 
     // 3. skills/get returns full SKILL.md and reference URIs
     let get_val: Value = client
@@ -1502,4 +1541,932 @@ async fn test_mcp_skills_over_mcp_rpc_and_resource_read() {
 
     handle.abort();
     let _ = fs::remove_dir_all(&base);
+}
+
+#[tokio::test]
+async fn test_webmcp_compact_profile_hides_granular_and_dead_tools() {
+    let temp_dir = std::env::temp_dir().join("smart_mcp_compact_profile_test");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    fs::write(temp_dir.join("notes.txt"), "line one\nline two\n").unwrap();
+
+    let state = Arc::new(AppState::new(temp_dir.clone()));
+    let token = state.auth_token.read().await.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let client = reqwest::Client::new();
+
+    // 1. Default /mcp and explicit ?profile=compact return <= 10 tools without dead/excluded tools
+    for url in [
+        format!("http://{addr}/mcp"),
+        format!("http://{addr}/mcp?profile=compact"),
+    ] {
+        let resp: Value = client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        assert!(tools.len() <= 10, "Expected <=10 compact tools, got {}", tools.len());
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"batch_inspect"));
+        assert!(names.contains(&"multi_surgical_edit"));
+        assert!(names.contains(&"run_command"));
+        assert!(names.contains(&"lsp_query"));
+        assert!(names.contains(&"session_checkpoint"));
+        for hidden in [
+            "spawn_subagent",
+            "upsert_artifact",
+            "request_plan_approval",
+            "surgical_edit",
+            "project_overview",
+            "smart_search",
+            "list_skills",
+            "read_file_range",
+            "run_command_compressed",
+            "poll_command_job",
+            "lsp_diagnostics",
+        ] {
+            assert!(
+                !names.contains(&hidden),
+                "Compact tools/list on {url} must hide '{hidden}'"
+            );
+        }
+    }
+
+    // 2. Query ?profile=compact overrides X-Airlock-Profile: full (Priority 1 > Priority 2)
+    let override_resp: Value = client
+        .post(format!("http://{addr}/mcp?profile=compact"))
+        .bearer_auth(&token)
+        .header("X-Airlock-Profile", "full")
+        .json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(override_resp["result"]["tools"].as_array().unwrap().len() <= 10);
+
+    // 3. Header X-Airlock-Profile: full exposes full WebMCP tools WITHOUT spawn_subagent
+    let full_hdr_resp: Value = client
+        .post(format!("http://{addr}/mcp"))
+        .bearer_auth(&token)
+        .header("X-Airlock-Profile", "full")
+        .json(&json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let full_names: Vec<&str> = full_hdr_resp["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(!full_names.contains(&"spawn_subagent"));
+    assert!(full_names.contains(&"surgical_edit"));
+    assert!(full_names.contains(&"project_overview"));
+
+    // 3b. When a Local Agent provider is ready (e.g. local Ollama URL), WebMCP tools/list exposes delegate_local_agent even in compact mode
+    {
+        let mut cfg = state.config.write().await;
+        cfg.agent_provider = "openai_compat".to_string();
+        cfg.openai_base_url = "http://127.0.0.1:11434/v1".to_string();
+    }
+    let compact_with_delegate: Value = client
+        .post(format!("http://{addr}/mcp?profile=compact"))
+        .bearer_auth(&token)
+        .json(&json!({"jsonrpc":"2.0","id":10,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let compact_del_names: Vec<&str> = compact_with_delegate["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(
+        compact_del_names.contains(&"delegate_local_agent"),
+        "Compact WebMCP should expose delegate_local_agent when provider is ready: {compact_del_names:?}"
+    );
+    assert!(compact_del_names.len() <= 10);
+
+    // 4. Backward compatibility: calling hidden granular tools directly on ?profile=compact still works
+    let call_read: Value = client
+        .post(format!("http://{addr}/mcp?profile=compact"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": { "name": "read_file_range", "arguments": { "path": "notes.txt" } }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(call_read["result"]["isError"], false);
+    assert!(call_read["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("line one"));
+
+    let call_edit: Value = client
+        .post(format!("http://{addr}/mcp?profile=compact"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "surgical_edit",
+                "arguments": {
+                    "path": "notes.txt",
+                    "edits": [{ "search": "line two", "replace": "line TWO" }]
+                }
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(call_edit["result"]["isError"], false);
+    assert!(fs::read_to_string(temp_dir.join("notes.txt"))
+        .unwrap()
+        .contains("line TWO"));
+
+    handle.abort();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_initialize_returns_profile_aware_instructions() {
+    use crate::workspace::{normalize_clean_path, WorkspaceProfile};
+
+    let base = std::env::temp_dir().join("smart_mcp_init_instructions_test");
+    let _ = fs::remove_dir_all(&base);
+    let dir_api = base.join("api-core");
+    let dir_web = base.join("web-ui");
+    fs::create_dir_all(&dir_api).unwrap();
+    fs::create_dir_all(&dir_web).unwrap();
+
+    let (_, clean_api) = normalize_clean_path(&dir_api).unwrap();
+    let (_, clean_web) = normalize_clean_path(&dir_web).unwrap();
+
+    let state = Arc::new(AppState::new(dir_api.clone()));
+    {
+        let mut cfg = state.config.write().await;
+        cfg.workspaces = vec![
+            WorkspaceProfile {
+                id: "ws-api".to_string(),
+                alias: "api-core".to_string(),
+                path: clean_api,
+                enabled: true,
+                guardrail_override: None,
+                allow_sensitive_override: None,
+                extra_sensitive_patterns: vec![],
+                pinned: false,
+            },
+            WorkspaceProfile {
+                id: "ws-web".to_string(),
+                alias: "web-ui".to_string(),
+                path: clean_web,
+                enabled: true,
+                guardrail_override: Some("read_only".to_string()),
+                allow_sensitive_override: None,
+                extra_sensitive_patterns: vec![],
+                pinned: false,
+            },
+        ];
+        cfg.default_workspace_id = Some("ws-api".to_string());
+    }
+    state.sync_default_workspace_root().await;
+
+    let token = state.auth_token.read().await.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state);
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let client = reqwest::Client::new();
+
+    let init_compact: Value = client
+        .post(format!("http://{addr}/mcp?profile=compact"))
+        .bearer_auth(&token)
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let instr = init_compact["result"]["instructions"].as_str().unwrap();
+    assert!(!instr.trim().is_empty());
+    assert!(instr.chars().count() <= 1200, "Instructions too long: {}", instr.len());
+    assert!(instr.contains("Profile: compact"));
+    assert!(instr.contains("@api-core"));
+    assert!(instr.contains("batch_inspect"));
+    assert!(instr.contains("multi_surgical_edit"));
+
+    // Pinned workspace initialize only advertises pinned workspace
+    let init_pinned: Value = client
+        .post(format!("http://{addr}/mcp?profile=full&workspace=web-ui"))
+        .bearer_auth(&token)
+        .json(&json!({"jsonrpc":"2.0","id":2,"method":"initialize"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let pin_instr = init_pinned["result"]["instructions"].as_str().unwrap();
+    assert!(pin_instr.contains("Profile: full"));
+    assert!(pin_instr.contains("@web-ui"));
+    assert!(!pin_instr.contains("@api-core"));
+
+    handle.abort();
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[tokio::test]
+async fn test_http_batch_executes_read_only_in_parallel_and_mutative_in_order() {
+    let temp_dir = std::env::temp_dir().join("smart_mcp_http_hybrid_batch_test");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(temp_dir.join("src")).unwrap();
+    fs::write(
+        temp_dir.join("src").join("alpha.txt"),
+        "alpha line 1\nalpha_value_before\n",
+    )
+    .unwrap();
+    fs::write(
+        temp_dir.join("src").join("beta.txt"),
+        "beta line 1\nbeta_target_marker\n",
+    )
+    .unwrap();
+
+    let state = Arc::new(AppState::new(temp_dir.clone()));
+    let token = state.auth_token.read().await.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let client = reqwest::Client::new();
+    let batch_payload = json!([
+        { "jsonrpc": "2.0", "id": 10, "method": "ping" },
+        {
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "batch_inspect",
+                "arguments": {
+                    "read_slices": [{ "path": "src/alpha.txt", "start_line": 1, "end_line": 5 }],
+                    "searches": [{ "query": "beta_target_marker" }]
+                }
+            }
+        },
+        {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {
+                "name": "multi_surgical_edit",
+                "arguments": {
+                    "files": [{
+                        "path": "src/alpha.txt",
+                        "edits": [{ "search": "alpha_value_before", "replace": "alpha_value_after" }]
+                    }]
+                }
+            }
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 13,
+            "method": "tools/call",
+            "params": {
+                "name": "batch_inspect",
+                "arguments": {
+                    "read_slices": [{ "path": "src/alpha.txt", "start_line": 1, "end_line": 5 }]
+                }
+            }
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 14,
+            "method": "tools/call",
+            "params": {
+                "name": "session_checkpoint",
+                "arguments": {
+                    "op": "save",
+                    "goal": "Hybrid batch check",
+                    "status": "in_progress",
+                    "next_steps": ["verify resource read"]
+                }
+            }
+        }
+    ]);
+
+    let resp: Value = client
+        .post(format!("http://{addr}/mcp?profile=compact"))
+        .bearer_auth(&token)
+        .json(&batch_payload)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let arr = resp.as_array().expect("Batch must return JSON array");
+    assert_eq!(arr.len(), 5, "Notification omits response; 5 ID requests remain");
+    assert_eq!(arr[0]["id"], 10);
+    assert_eq!(arr[1]["id"], 11);
+    assert_eq!(arr[2]["id"], 12);
+    assert_eq!(arr[3]["id"], 13);
+    assert_eq!(arr[4]["id"], 14);
+
+    // Pre-edit read saw old content; post-edit read strictly saw new content
+    let before_txt = arr[1]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(before_txt.contains("alpha_value_before"));
+    assert!(before_txt.contains("beta_target_marker"));
+
+    let after_txt = arr[3]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(after_txt.contains("alpha_value_after"));
+
+    // Verify airlock://workspace/checkpoint resource serves the saved checkpoint
+    let res_read: Value = client
+        .post(format!("http://{addr}/mcp"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 15,
+            "method": "resources/read",
+            "params": { "uri": "airlock://workspace/checkpoint" }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let res_text = res_read["result"]["contents"][0]["text"].as_str().unwrap();
+    assert!(res_text.contains("Hybrid batch check"));
+
+    handle.abort();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_http_sse_keepalive_fast_vs_slow() {
+    let temp_dir = std::env::temp_dir().join("smart_mcp_http_sse_keepalive_test");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let state = Arc::new(AppState::new(temp_dir.clone()));
+    state.config.write().await.webmcp_sse_keepalive = true;
+    let token = state.auth_token.read().await.clone();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let client = reqwest::Client::new();
+
+    // 1. Fast tools/call (<3s) even with Accept: text/event-stream returns standard JSON
+    let fast_resp = client
+        .post(format!("http://{addr}/mcp"))
+        .bearer_auth(&token)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "list_workspaces", "arguments": {} }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fast_resp.status(), StatusCode::OK);
+    let fast_ct = fast_resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        fast_ct.contains("application/json"),
+        "Fast call should stay JSON, got content-type: {fast_ct}"
+    );
+
+    // 2. Slow tools/call (>3s) upgrades cleanly to text/event-stream and delivers final message
+    let slow_cmd = if cfg!(target_os = "windows") {
+        "ping -n 5 127.0.0.1 >NUL && echo sse_slow_done"
+    } else {
+        "sleep 4 && echo sse_slow_done"
+    };
+    let slow_resp = client
+        .post(format!("http://{addr}/mcp"))
+        .bearer_auth(&token)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "run_command",
+                "arguments": { "action": "run", "command": slow_cmd }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(slow_resp.status(), StatusCode::OK);
+    let slow_ct = slow_resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        slow_ct.contains("text/event-stream"),
+        "Slow call >3s should stream SSE, got content-type: {slow_ct}"
+    );
+    let body_text = slow_resp.text().await.unwrap();
+    assert!(body_text.contains("event: message"), "SSE body:\n{body_text}");
+    assert!(body_text.contains("sse_slow_done"), "SSE body:\n{body_text}");
+
+    handle.abort();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_webmcp_session_harness_steering_and_checkpoint_anchor() {
+    let temp_dir = std::env::temp_dir().join("smart_mcp_webmcp_harness_http_test");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    fs::write(temp_dir.join("notes.txt"), "alpha\nbeta\n").unwrap();
+
+    let state = Arc::new(AppState::new(temp_dir.clone()));
+    let token = state.auth_token.read().await.clone();
+
+    // Seed an existing session_checkpoint with next_steps
+    let ws = crate::workspace::resolve_workspace(&state, None, None)
+        .await
+        .unwrap();
+    crate::checkpoints::exec_session_checkpoint(
+        &state,
+        "WebMCP",
+        &ws,
+        &json!({
+            "op": "save",
+            "goal": "Finish auth flow",
+            "next_steps": ["Verify auth flow"]
+        }),
+    )
+    .await
+    .unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/mcp?profile=compact");
+
+    let init_resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize"}))
+        .send()
+        .await
+        .unwrap();
+    let session_id = init_resp
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // 1. First non-checkpoint call surfaces active checkpoint anchor
+    let first_call: Value = client
+        .post(&url)
+        .bearer_auth(&token)
+        .header("mcp-session-id", &session_id)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "list_workspaces", "arguments": {} }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let first_txt = first_call["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        first_txt.contains("[HARNESS_HINT:") && first_txt.contains("Verify auth flow"),
+        "Expected checkpoint anchor hint, got:\n{first_txt}"
+    );
+
+    // 2. Reading same file twice consecutively without editing triggers read-loop hint
+    let _read1: Value = client
+        .post(&url)
+        .bearer_auth(&token)
+        .header("mcp-session-id", &session_id)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": { "name": "read_file_range", "arguments": { "path": "notes.txt" } }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let read2: Value = client
+        .post(&url)
+        .bearer_auth(&token)
+        .header("mcp-session-id", &session_id)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": { "name": "read_file_range", "arguments": { "path": "notes.txt" } }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let read2_txt = read2["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        read2_txt.contains("[HARNESS_HINT:") && read2_txt.contains("notes.txt"),
+        "Expected read-loop hint, got:\n{read2_txt}"
+    );
+
+    // 3. Two consecutive identical command errors trigger error-loop hint
+    let fail_cmd = if cfg!(target_os = "windows") {
+        "cmd /C exit 9"
+    } else {
+        "exit 9"
+    };
+    for rpc_id in [5, 6] {
+        let cmd_res: Value = client
+            .post(&url)
+            .bearer_auth(&token)
+            .header("mcp-session-id", &session_id)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "method": "tools/call",
+                "params": { "name": "run_command", "arguments": { "action": "run", "command": fail_cmd } }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let txt = cmd_res["result"]["content"][0]["text"].as_str().unwrap();
+        if rpc_id == 6 {
+            assert!(
+                txt.contains("[HARNESS_HINT:") && txt.contains("Repeated failure"),
+                "Expected error-loop hint on 2nd failure, got:\n{txt}"
+            );
+        }
+    }
+
+    handle.abort();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_webmcp_blueprint_write_and_checkpoint_emits_handoff_prompt() {
+    let temp_dir = std::env::temp_dir().join("smart_mcp_webmcp_blueprint_handoff_e2e");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let state = Arc::new(AppState::new(temp_dir.clone()));
+    {
+        let mut cfg = state.config.write().await;
+        cfg.webmcp_expose_skills = true;
+        cfg.agent_provider = "openai_compat".to_string();
+        cfg.openai_base_url = "http://127.0.0.1:11434/v1".to_string();
+    }
+    let token = state.auth_token.read().await.clone();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/mcp?profile=compact");
+
+    // 1. initialize.instructions includes handoff rule and stays within 1200 chars even with delegation+skills
+    let init_resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize"}))
+        .send()
+        .await
+        .unwrap();
+    let session_id = init_resp
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let init_val: Value = init_resp.json().await.unwrap();
+    let instr = init_val["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instr.chars().count() <= 1200,
+        "Instructions exceeded 1200 chars ({}):\n{instr}",
+        instr.chars().count()
+    );
+    assert!(
+        instr.contains("ANTIGRAVITY_HANDOFF_PROMPT"),
+        "initialize.instructions missing ANTIGRAVITY_HANDOFF_PROMPT rule:\n{instr}"
+    );
+
+    // 2. Writing a blueprint triggers the harness handoff nudge
+    let bp_write: Value = client
+        .post(&url)
+        .bearer_auth(&token)
+        .header("mcp-session-id", &session_id)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "write_file_jailed",
+                "arguments": {
+                    "path": ".gemini/Blueprints/10-test-blueprint.md",
+                    "content": "# Blueprint 10\nAuto handoff flow.\n"
+                }
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let bp_txt = bp_write["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        bp_txt.contains("[HARNESS_HINT:")
+            && bp_txt.contains("ANTIGRAVITY_HANDOFF_PROMPT")
+            && bp_txt.contains(".gemini/Blueprints/10-test-blueprint.md"),
+        "Missing blueprint harness nudge:\n{bp_txt}"
+    );
+
+    // 3. Saving session_checkpoint emits a copy-pasteable ANTIGRAVITY_HANDOFF_PROMPT referencing the blueprint
+    let cp_save: Value = client
+        .post(&url)
+        .bearer_auth(&token)
+        .header("mcp-session-id", &session_id)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "session_checkpoint",
+                "arguments": {
+                    "op": "save",
+                    "goal": "Implement Blueprint 10 handoff",
+                    "next_steps": ["Verify E2E flow"]
+                }
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let cp_txt = cp_save["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        cp_txt.contains("ANTIGRAVITY_HANDOFF_PROMPT:")
+            && cp_txt.contains(".gemini/Blueprints/10-test-blueprint.md")
+            && cp_txt.contains("airlock://workspace/checkpoint"),
+        "Missing handoff prompt from session_checkpoint save:\n{cp_txt}"
+    );
+
+    handle.abort();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_oauth_protected_resource_preserves_query_and_cors_expose_headers() {
+    let temp_dir = std::env::temp_dir().join("smart_mcp_oauth_prm_query_test");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let state = Arc::new(AppState::new(temp_dir.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state);
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // 1. Unauthenticated /mcp?profile=compact&workspace=alpha preserves safe query in resource_metadata
+    //    AND exposes WWW-Authenticate via Access-Control-Expose-Headers for Gemini Web origin.
+    let unauth = client
+        .post(format!("{base}/mcp?profile=compact&workspace=alpha"))
+        .header("Origin", "https://gemini.google.com")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+    let expose = unauth
+        .headers()
+        .get("access-control-expose-headers")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    assert!(
+        expose.contains("mcp-session-id") && expose.contains("www-authenticate"),
+        "CORS expose headers should expose mcp-session-id and www-authenticate, got: {expose}"
+    );
+    let www_auth = unauth
+        .headers()
+        .get("www-authenticate")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        www_auth.contains("/.well-known/oauth-protected-resource/mcp?profile=compact&workspace=alpha"),
+        "Expected query-preserving resource_metadata URL, got: {www_auth}"
+    );
+
+    // 2. Protected resource endpoints preserve safe query params and strip sensitive token query param
+    let prm_suffix: Value = client
+        .get(format!("{base}/.well-known/oauth-protected-resource/mcp?profile=compact&workspace=alpha"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        prm_suffix["resource"].as_str(),
+        Some(format!("{base}/mcp?profile=compact&workspace=alpha").as_str())
+    );
+
+    let prm_root: Value = client
+        .get(format!("{base}/.well-known/oauth-protected-resource?workspace=alpha&token=supersecret"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        prm_root["resource"].as_str(),
+        Some(format!("{base}/mcp?workspace=alpha").as_str())
+    );
+
+    handle.abort();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_mcp_post_notification_echoes_session_id_and_sse_headers() {
+    let temp_dir = std::env::temp_dir().join("smart_mcp_post_202_sse_hdr_test");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let state = Arc::new(AppState::new(temp_dir.clone()));
+    state.config.write().await.webmcp_sse_keepalive = true;
+    let token = state.auth_token.read().await.clone();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state);
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/mcp");
+
+    let init_resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize"}))
+        .send()
+        .await
+        .unwrap();
+    let sid = init_resp
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // 1. 202 Accepted on notification MUST echo mcp-session-id header back
+    let notif_resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .header("mcp-session-id", &sid)
+        .json(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(notif_resp.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        notif_resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok()),
+        Some(sid.as_str()),
+        "202 Accepted must preserve mcp-session-id header"
+    );
+
+    // 2. Slow SSE keepalive (>3s) MUST include x-accel-buffering: no
+    let slow_cmd = if cfg!(target_os = "windows") {
+        "ping -n 5 127.0.0.1 >NUL && echo sse_hdr_ok"
+    } else {
+        "sleep 4 && echo sse_hdr_ok"
+    };
+    let slow_resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .header("mcp-session-id", &sid)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "run_command",
+                "arguments": { "action": "run", "command": slow_cmd }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(slow_resp.status(), StatusCode::OK);
+    assert_eq!(
+        slow_resp
+            .headers()
+            .get("x-accel-buffering")
+            .and_then(|v| v.to_str().ok()),
+        Some("no"),
+        "SSE response must include X-Accel-Buffering: no"
+    );
+    let _ = slow_resp.text().await.unwrap();
+
+    handle.abort();
+    let _ = fs::remove_dir_all(&temp_dir);
 }

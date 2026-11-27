@@ -11,6 +11,19 @@ const MAX_SKILL_MD_BYTES: u64 = 256 * 1024;
 const MAX_RESOURCE_SCAN_BYTES: u64 = 512 * 1024;
 const MAX_RESOURCE_READ_BYTES: u64 = 128 * 1024;
 
+const MAX_SKILL_RESOURCE_FILES: usize = 160;
+const SKILL_RESOURCE_SUBDIRS: &[&str] = &[
+    "references",
+    "scripts",
+    "assets",
+    "examples",
+    "resources",
+    "guides",
+    "docs",
+];
+const PLUGIN_SHARED_RESOURCE_SUBDIRS: &[&str] = &["agents", "resources", "docs", "policies"];
+const PLUGIN_SKILL_CONTAINERS: &[&str] = &["skills", ".claude/skills", ".gemini/skills"];
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillScope {
@@ -27,6 +40,7 @@ pub struct SkillSummary {
     pub source_label: String,
     pub plugin_id: Option<String>,
     pub enabled: bool,
+    pub disable_model_invocation: bool,
     pub dir_path: String,
     pub resource_files: Vec<String>,
     pub allowed_tools: Vec<String>,
@@ -39,6 +53,7 @@ pub struct SkillSummary {
 pub struct SkillEntry {
     pub summary: SkillSummary,
     pub canon_dir: PathBuf,
+    pub plugin_root: Option<PathBuf>,
     pub body_md: String,
     pub raw_md: String,
 }
@@ -59,6 +74,7 @@ pub struct ParsedSkill {
     #[allow(dead_code)]
     pub compatibility: Option<String>,
     pub allowed_tools: Vec<String>,
+    pub disable_model_invocation: bool,
     #[allow(dead_code)]
     pub metadata: BTreeMap<String, String>,
     pub body_md: String,
@@ -251,6 +267,7 @@ pub fn parse_skill_markdown(
     let mut license: Option<String> = None;
     let mut compatibility: Option<String> = None;
     let mut allowed_tools: Vec<String> = Vec::new();
+    let mut disable_model_invocation = false;
     let mut metadata: BTreeMap<String, String> = BTreeMap::new();
 
     let mut i = 0;
@@ -353,6 +370,10 @@ pub fn parse_skill_markdown(
             "allowed-tools" | "allowed_tools" => {
                 allowed_tools = parse_allowed_tools_inline(val_trim);
             }
+            "disable-model-invocation" | "disable_model_invocation" => {
+                disable_model_invocation =
+                    matches!(scalar.trim().to_ascii_lowercase().as_str(), "true" | "yes" | "1");
+            }
             _ => {}
         }
         i += 1;
@@ -398,18 +419,20 @@ pub fn parse_skill_markdown(
         license,
         compatibility,
         allowed_tools,
+        disable_model_invocation,
         metadata,
         body_md,
     })
 }
 
 fn scan_resource_dir_recursive(
-    canon_skill_dir: &Path,
+    canon_root: &Path,
     dir: &Path,
     depth: usize,
+    prefix: Option<&str>,
     out: &mut Vec<String>,
 ) {
-    if depth > 4 || out.len() >= 100 {
+    if depth > 4 || out.len() >= MAX_SKILL_RESOURCE_FILES {
         return;
     }
     let Ok(entries) = fs::read_dir(dir) else {
@@ -418,6 +441,9 @@ fn scan_resource_dir_recursive(
     let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
     children.sort();
     for path in children {
+        if out.len() >= MAX_SKILL_RESOURCE_FILES {
+            break;
+        }
         let Some(fname) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
@@ -427,36 +453,52 @@ fn scan_resource_dir_recursive(
         let Ok(canon_entry) = fs::canonicalize(&path) else {
             continue;
         };
-        if !canon_entry.starts_with(canon_skill_dir) {
+        if !canon_entry.starts_with(canon_root) {
             continue;
         }
         let Ok(meta) = fs::metadata(&canon_entry) else {
             continue;
         };
         if meta.is_dir() {
-            scan_resource_dir_recursive(canon_skill_dir, &canon_entry, depth + 1, out);
+            scan_resource_dir_recursive(canon_root, &canon_entry, depth + 1, prefix, out);
         } else if meta.is_file() && meta.len() <= MAX_RESOURCE_SCAN_BYTES {
-            if let Ok(rel) = canon_entry.strip_prefix(canon_skill_dir) {
+            if let Ok(rel) = canon_entry.strip_prefix(canon_root) {
                 let rel_slash = rel.to_string_lossy().replace('\\', "/");
                 if !rel_slash.is_empty() {
-                    out.push(rel_slash);
+                    match prefix {
+                        Some(pfx) => out.push(format!("{pfx}/{rel_slash}")),
+                        None => out.push(rel_slash),
+                    }
                 }
             }
         }
     }
 }
 
-fn scan_skill_resources(canon_skill_dir: &Path) -> Vec<String> {
-    let mut files = Vec::new();
-    for sub in ["references", "scripts", "assets"] {
-        let sub_path = canon_skill_dir.join(sub);
+fn scan_subdirs_into(
+    canon_root: &Path,
+    subdirs: &[&str],
+    prefix: Option<&str>,
+    out: &mut Vec<String>,
+) {
+    for sub in subdirs {
+        let sub_path = canon_root.join(sub);
         if let Ok(canon_sub) = fs::canonicalize(&sub_path) {
-            if canon_sub.starts_with(canon_skill_dir) && canon_sub.is_dir() {
-                scan_resource_dir_recursive(canon_skill_dir, &canon_sub, 1, &mut files);
+            if canon_sub.starts_with(canon_root) && canon_sub.is_dir() {
+                scan_resource_dir_recursive(canon_root, &canon_sub, 1, prefix, out);
             }
         }
     }
+}
+
+fn scan_skill_resources(canon_skill_dir: &Path, canon_plugin_root: Option<&Path>) -> Vec<String> {
+    let mut files = Vec::new();
+    scan_subdirs_into(canon_skill_dir, SKILL_RESOURCE_SUBDIRS, None, &mut files);
+    if let Some(plg_root) = canon_plugin_root {
+        scan_subdirs_into(plg_root, PLUGIN_SHARED_RESOURCE_SUBDIRS, Some("plugin"), &mut files);
+    }
     files.sort();
+    files.dedup();
     files
 }
 
@@ -476,12 +518,17 @@ fn load_single_skill_dir(
     let Ok(canon_dir) = fs::canonicalize(skill_dir) else {
         return None;
     };
-    if let Some(root) = jail_root {
-        let canon_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        if !canon_dir.starts_with(&canon_root) {
+    let canon_root_opt = jail_root.map(|r| fs::canonicalize(r).unwrap_or_else(|_| r.to_path_buf()));
+    if let Some(ref canon_root) = canon_root_opt {
+        if !canon_dir.starts_with(canon_root) {
             return None;
         }
     }
+    let plugin_root = if matches!(scope, SkillScope::Plugin) {
+        canon_root_opt
+    } else {
+        None
+    };
     let Ok(canon_md) = fs::canonicalize(&skill_md_path) else {
         return None;
     };
@@ -511,6 +558,7 @@ fn load_single_skill_dir(
                     source_label: source_label.to_string(),
                     plugin_id: plugin_id.map(|s| s.to_string()),
                     enabled: false,
+                    disable_model_invocation: false,
                     dir_path: clean_dir,
                     resource_files: Vec::new(),
                     allowed_tools: Vec::new(),
@@ -519,6 +567,7 @@ fn load_single_skill_dir(
                     parse_error: Some(format!("Gagal membaca metadata SKILL.md: {e}")),
                 },
                 canon_dir,
+                plugin_root,
                 body_md: String::new(),
                 raw_md: String::new(),
             });
@@ -539,6 +588,7 @@ fn load_single_skill_dir(
                 source_label: source_label.to_string(),
                 plugin_id: plugin_id.map(|s| s.to_string()),
                 enabled: false,
+                disable_model_invocation: false,
                 dir_path: clean_dir,
                 resource_files: Vec::new(),
                 allowed_tools: Vec::new(),
@@ -547,6 +597,7 @@ fn load_single_skill_dir(
                 parse_error: Some("Ukuran SKILL.md melebihi batas maksimum 256 KB.".to_string()),
             },
             canon_dir,
+            plugin_root,
             body_md: String::new(),
             raw_md: String::new(),
         });
@@ -568,6 +619,7 @@ fn load_single_skill_dir(
                     source_label: source_label.to_string(),
                     plugin_id: plugin_id.map(|s| s.to_string()),
                     enabled: false,
+                    disable_model_invocation: false,
                     dir_path: clean_dir,
                     resource_files: Vec::new(),
                     allowed_tools: Vec::new(),
@@ -576,13 +628,14 @@ fn load_single_skill_dir(
                     parse_error: Some(format!("Gagal membaca SKILL.md sebagai UTF-8: {e}")),
                 },
                 canon_dir,
+                plugin_root,
                 body_md: String::new(),
                 raw_md: String::new(),
             });
         }
     };
 
-    let resource_files = scan_skill_resources(&canon_dir);
+    let resource_files = scan_skill_resources(&canon_dir, plugin_root.as_deref());
     match parse_skill_markdown(&raw_md, dir_name.as_deref()) {
         Ok(parsed) => {
             let name_lower = parsed.name.to_ascii_lowercase();
@@ -597,6 +650,7 @@ fn load_single_skill_dir(
                     source_label: source_label.to_string(),
                     plugin_id: plugin_id.map(|s| s.to_string()),
                     enabled,
+                    disable_model_invocation: parsed.disable_model_invocation,
                     dir_path: clean_dir,
                     resource_files,
                     allowed_tools: parsed.allowed_tools,
@@ -605,6 +659,7 @@ fn load_single_skill_dir(
                     parse_error: None,
                 },
                 canon_dir,
+                plugin_root,
                 body_md: parsed.body_md,
                 raw_md,
             })
@@ -623,6 +678,7 @@ fn load_single_skill_dir(
                     source_label: source_label.to_string(),
                     plugin_id: plugin_id.map(|s| s.to_string()),
                     enabled: false,
+                    disable_model_invocation: false,
                     dir_path: clean_dir,
                     resource_files,
                     allowed_tools: Vec::new(),
@@ -631,6 +687,7 @@ fn load_single_skill_dir(
                     parse_error: Some(err),
                 },
                 canon_dir,
+                plugin_root,
                 body_md: String::new(),
                 raw_md,
             })
@@ -684,6 +741,32 @@ fn scan_skills_container(
     }
 }
 
+fn scan_plugin_skill_containers(
+    plugin_root: &Path,
+    source_label: &str,
+    plugin_id: Option<&str>,
+    disabled_set: &HashSet<String>,
+    valid_map: &mut BTreeMap<String, SkillEntry>,
+    broken_list: &mut Vec<SkillEntry>,
+) {
+    for rel in PLUGIN_SKILL_CONTAINERS {
+        if valid_map.len() + broken_list.len() >= MAX_DISCOVERED_SKILLS {
+            break;
+        }
+        let container = plugin_root.join(rel);
+        scan_skills_container(
+            &container,
+            Some(plugin_root),
+            SkillScope::Plugin,
+            source_label,
+            plugin_id,
+            disabled_set,
+            valid_map,
+            broken_list,
+        );
+    }
+}
+
 pub fn discover_skills(
     workspace_roots: &[(String, PathBuf)],
     plugins: &[InstalledPluginRecord],
@@ -731,12 +814,9 @@ pub fn discover_skills(
             break;
         }
         let plg_dir = PathBuf::from(&plugin.install_dir);
-        let container = plg_dir.join("skills");
         let src_label = format!("plugin:{}", plugin.name);
-        scan_skills_container(
-            &container,
-            Some(&plg_dir),
-            SkillScope::Plugin,
+        scan_plugin_skill_containers(
+            &plg_dir,
             &src_label,
             Some(&plugin.id),
             &disabled_norm,
@@ -766,16 +846,124 @@ pub fn discover_skills(
     combined
 }
 
+pub const BUILTIN_WORKFLOW_SKILL_NAME: &str = "airlock-blueprint-workflow";
+
+const BUILTIN_WORKFLOW_SKILL_DESC: &str = "Structured multi-turn WebMCP & Antigravity workflow: (1) multi-turn inspect with relevant skills, (2) max 1 blueprint per turn in .gemini/blueprints/, (3) save stage-aware checkpoint with dual WebMCP + Antigravity handoff prompts, (4) self-pacing implementation (pre-flight checkup, 1 phase/turn) ending every active turn with 1 follow-up question and 2-4 concise choices.";
+
+const BUILTIN_WORKFLOW_SKILL_BODY: &str = r#"# Airlock Multi-Turn Blueprint & Handoff Workflow
+
+Follow this 4-stage discipline strictly in WebMCP sessions so context stays sharp and handoffs never collapse into monolithic 1-turn dumps.
+
+## Turn-End Follow-Up Choices Protocol (MANDATORY on EVERY active turn)
+- At the end of EVERY turn during `inspect`, `blueprint`, `handoff`, or `implement`, ALWAYS close with:
+  1. **1 short follow-up question** naming what comes next.
+  2. **2-4 concise, single-line actionable choices** the user can click or reply with immediately.
+- Never silently finish without offering next-step choices when work spans multiple turns or awaits direction.
+
+## Stage 1 — `inspect` (Multi-Turn Exploration)
+1. Call `list_skills` first and `load_skill(name)` for every domain/architecture/debugging skill matching the task.
+2. Explore using parallel `batch_inspect` calls (or `delegate_local_agent(mode="read_only")` for broad sweeps).
+3. If the target surface is large, split inspection cleanly across turns by subsystem. Do NOT modify product code or write blueprints yet.
+4. Each turn: report verified files/symbols, list remaining areas (if any), and close with 2-4 choices (e.g. inspect next area / proceed to blueprint list / save checkpoint & handoff prompts).
+
+## Stage 2 — `blueprint` (Max 1 Blueprint per Turn)
+1. Call `list_skills` + `load_skill` for specification/architecture/UI/domain skills matching the feature.
+2. Agree on the blueprint file list first when creating multiple blueprints.
+3. Write **AT MOST ONE complete blueprint markdown file per turn** under `.gemini/blueprints/<NN>-<slug>.md` (or the workspace's existing `.gemini/Blueprints/` folder).
+4. **STRICT:** Never mix implementation code edits into a blueprint turn, and never generate multiple blueprint files in one turn.
+5. After finishing 1 blueprint, STOP and offer choices (draft next blueprint / revise this blueprint / save checkpoint & generate handoff prompts).
+
+## Stage 3 — `handoff` (Checkpoint + Dual Next-Session Prompts)
+1. Call `session_checkpoint(op="save", stage="inspect"|"blueprint"|"implement", goal=..., blueprint_path=..., blueprint_paths=[...], recommended_skills=[...], decisions=[...], completed=[...], next_steps=[...])`.
+2. Present **BOTH** `WEBMCP_NEXT_SESSION_PROMPT` and `ANTIGRAVITY_HANDOFF_PROMPT` from the tool output **verbatim** (never summarize or merge them into one monolithic prompt).
+3. Close with follow-up choices letting the user pick WebMCP continuation, Antigravity handoff, or edits.
+
+## Stage 4 — `implement` (Self-Pacing Multi-Turn for 1 Blueprint)
+1. Load `.airlock/HANDOFF.md`, the checkpoint, and the single target blueprint.
+2. Call `list_skills` + `load_skill` for the recommended implementation/TDD/verification skills.
+3. **PRE-FLIGHT CHECKUP (Before First Edit):** Inspect live target files/symbols via `batch_inspect` to confirm alignment with the blueprint. Report any drift or missing assumptions first.
+4. Execute **ONLY ONE small phase/batch per turn** (`multi_surgical_edit` / targeted checks), update `session_checkpoint` if needed, then **STOP** and end with 1 short follow-up question + 2-4 choices (continue next phase / debug or re-check / handoff to Antigravity).
+"#;
+
+pub fn builtin_skills(disabled_norm: &HashSet<String>) -> Vec<SkillEntry> {
+    let raw_md = format!(
+        "---\nname: {BUILTIN_WORKFLOW_SKILL_NAME}\ndescription: {BUILTIN_WORKFLOW_SKILL_DESC}\n---\n{BUILTIN_WORKFLOW_SKILL_BODY}"
+    );
+    let body_md = BUILTIN_WORKFLOW_SKILL_BODY.trim().to_string();
+    let catalog_tokens_est =
+        ((BUILTIN_WORKFLOW_SKILL_NAME.len() + BUILTIN_WORKFLOW_SKILL_DESC.len() + 12) / 4).max(1);
+    let body_tokens_est = (body_md.len() / 4).max(1);
+    let enabled = !disabled_norm.contains(BUILTIN_WORKFLOW_SKILL_NAME);
+
+    vec![SkillEntry {
+        summary: SkillSummary {
+            name: BUILTIN_WORKFLOW_SKILL_NAME.to_string(),
+            description: BUILTIN_WORKFLOW_SKILL_DESC.to_string(),
+            scope: SkillScope::Global,
+            source_label: "builtin:airlock".to_string(),
+            plugin_id: None,
+            enabled,
+            disable_model_invocation: false,
+            dir_path: "<builtin:airlock>".to_string(),
+            resource_files: Vec::new(),
+            allowed_tools: Vec::new(),
+            catalog_tokens_est,
+            body_tokens_est,
+            parse_error: None,
+        },
+        canon_dir: PathBuf::new(),
+        plugin_root: None,
+        body_md,
+        raw_md,
+    }]
+}
+
+pub fn inject_builtin_skills(entries: &mut Vec<SkillEntry>, disabled_skills: &HashSet<String>) {
+    let disabled_norm: HashSet<String> = disabled_skills
+        .iter()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut valid_names: HashSet<String> = entries
+        .iter()
+        .filter(|e| e.summary.parse_error.is_none())
+        .map(|e| e.summary.name.to_ascii_lowercase())
+        .collect();
+
+    let mut added = false;
+    for b in builtin_skills(&disabled_norm) {
+        let key = b.summary.name.to_ascii_lowercase();
+        if !valid_names.contains(&key) {
+            valid_names.insert(key);
+            entries.push(b);
+            added = true;
+        }
+    }
+
+    if added {
+        let mut valid: Vec<SkillEntry> = Vec::with_capacity(entries.len());
+        let mut broken: Vec<SkillEntry> = Vec::new();
+        for e in entries.drain(..) {
+            if e.summary.parse_error.is_some() {
+                broken.push(e);
+            } else {
+                valid.push(e);
+            }
+        }
+        valid.sort_by(|a, b| a.summary.name.cmp(&b.summary.name));
+        valid.extend(broken);
+        *entries = valid;
+    }
+}
+
 /// Scans skills bundled directly inside a staging/local plugin directory during install preview.
 pub fn scan_plugin_skills_preview(plugin_root: &Path) -> Vec<SkillSummary> {
     let mut valid_map: BTreeMap<String, SkillEntry> = BTreeMap::new();
     let mut broken_list: Vec<SkillEntry> = Vec::new();
     let empty_disabled = HashSet::new();
-    let skills_dir = plugin_root.join("skills");
-    scan_skills_container(
-        &skills_dir,
-        Some(plugin_root),
-        SkillScope::Plugin,
+    scan_plugin_skill_containers(
+        plugin_root,
         "plugin:preview",
         None,
         &empty_disabled,
@@ -788,6 +976,12 @@ pub fn scan_plugin_skills_preview(plugin_root: &Path) -> Vec<SkillSummary> {
 }
 
 pub fn read_skill_resource_file(skill: &SkillEntry, rel_path: &str) -> Result<String, String> {
+    if skill.summary.source_label.starts_with("builtin:") || skill.canon_dir.as_os_str().is_empty() {
+        return Err(format!(
+            "Skill bawaan '{}' tidak memiliki file resource eksternal.",
+            skill.summary.name
+        ));
+    }
     let trimmed = rel_path.trim();
     if trimmed.is_empty() {
         return Err("Parameter 'path' resource skill wajib diisi.".to_string());
@@ -817,7 +1011,27 @@ pub fn read_skill_resource_file(skill: &SkillEntry, rel_path: &str) -> Result<St
         }
     }
 
-    let resolved = resolve_jailed_path(&skill.canon_dir, trimmed)?;
+    let norm = trimmed.replace('\\', "/");
+    let resolved = if let Some(plugin_rel) = norm.strip_prefix("plugin/") {
+        let Some(plg_root) = skill.plugin_root.as_ref() else {
+            return Err(format!(
+                "Skill '{}' tidak memiliki plugin root untuk membaca '{trimmed}'.",
+                skill.summary.name
+            ));
+        };
+        let allowed_top = PLUGIN_SHARED_RESOURCE_SUBDIRS.iter().any(|sub| {
+            plugin_rel == *sub || plugin_rel.starts_with(&format!("{sub}/"))
+        });
+        if !allowed_top {
+            return Err(format!(
+                "Akses shared plugin resource '{trimmed}' ditolak: hanya direktori {:?} yang diizinkan.",
+                PLUGIN_SHARED_RESOURCE_SUBDIRS
+            ));
+        }
+        resolve_jailed_path(plg_root, plugin_rel)?
+    } else {
+        resolve_jailed_path(&skill.canon_dir, trimmed)?
+    };
     let meta = fs::metadata(&resolved)
         .map_err(|e| format!("Resource skill '{trimmed}' tidak ditemukan: {e}"))?;
     if !meta.is_file() {
@@ -893,7 +1107,11 @@ pub fn create_global_skill_file(
 pub fn build_skills_prompt_section(skills: &[SkillEntry]) -> Option<String> {
     let active: Vec<&SkillEntry> = skills
         .iter()
-        .filter(|s| s.summary.enabled && s.summary.parse_error.is_none())
+        .filter(|s| {
+            s.summary.enabled
+                && s.summary.parse_error.is_none()
+                && !s.summary.disable_model_invocation
+        })
         .collect();
     if active.is_empty() {
         return None;
@@ -1103,6 +1321,136 @@ mod tests {
         assert!(read_skill_resource_file(skill, r"C:\Windows\System32\drivers\etc\hosts").is_err());
         assert!(read_skill_resource_file(skill, "/etc/passwd").is_err());
         assert!(read_skill_resource_file(skill, r"\\server\share\secret.txt").is_err());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_disable_model_invocation_and_plugin_shared_resources() {
+        let base = std::env::temp_dir().join("smart_mcp_skill_plugin_shared_res_test");
+        let _ = fs::remove_dir_all(&base);
+        let plg_dir = base.join("plg_egm_like");
+        fs::create_dir_all(plg_dir.join("agents")).unwrap();
+        fs::create_dir_all(plg_dir.join("skills/egm-review/examples")).unwrap();
+        fs::create_dir_all(plg_dir.join("skills/auto-guide")).unwrap();
+
+        fs::write(plg_dir.join("plugin.json"), r#"{"name":"egm-like"}"#).unwrap();
+        fs::write(
+            plg_dir.join("agents/design_critic.md"),
+            "# Design Critic Persona\nChallenge assumptions.",
+        )
+        .unwrap();
+        fs::write(
+            plg_dir.join("skills/egm-review/SKILL.md"),
+            "---\nname: egm-review\ndescription: Manual review workflow\ndisable-model-invocation: true\n---\nRun review.",
+        )
+        .unwrap();
+        fs::write(
+            plg_dir.join("skills/egm-review/examples/sample.md"),
+            "Sample review",
+        )
+        .unwrap();
+        fs::write(
+            plg_dir.join("skills/auto-guide/SKILL.md"),
+            "---\nname: auto-guide\ndescription: Auto catalog skill\n---\nAuto body",
+        )
+        .unwrap();
+
+        let plugins = vec![InstalledPluginRecord {
+            id: "plg_egm_123456".to_string(),
+            name: "egm-like".to_string(),
+            version: "0.1.0".to_string(),
+            description: "EGM".to_string(),
+            source: "local:test".to_string(),
+            install_dir: clean_path_string(&plg_dir),
+            enabled: true,
+            trusted: true,
+            manifest_sha256: "hash".to_string(),
+            mcp_server_ids: vec![],
+            required_secrets: vec![],
+            installed_at: String::new(),
+        }];
+
+        let discovered = discover_skills(&[], &plugins, None, &HashSet::new());
+        let review = discovered
+            .iter()
+            .find(|s| s.summary.name == "egm-review")
+            .unwrap();
+        assert!(review.summary.disable_model_invocation);
+        assert!(review
+            .summary
+            .resource_files
+            .contains(&"examples/sample.md".to_string()));
+        assert!(review
+            .summary
+            .resource_files
+            .contains(&"plugin/agents/design_critic.md".to_string()));
+
+        // Auto prompt catalog omits disable-model-invocation skills while keeping auto-guide
+        let prompt_block = build_skills_prompt_section(&discovered).unwrap();
+        assert!(prompt_block.contains("auto-guide"));
+        assert!(!prompt_block.contains("egm-review"));
+
+        // Shared plugin/agents resource is readable, while plugin/plugin.json is blocked
+        let critic = read_skill_resource_file(review, "plugin/agents/design_critic.md").unwrap();
+        assert!(critic.contains("Design Critic Persona"));
+        assert!(read_skill_resource_file(review, "plugin/plugin.json").is_err());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_builtin_workflow_skill_injection_override_and_toggle() {
+        let base = std::env::temp_dir().join("smart_mcp_builtin_workflow_skill_test");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        // 1. Default injection adds enabled airlock-blueprint-workflow
+        let mut list = discover_skills(&[], &[], None, &HashSet::new());
+        inject_builtin_skills(&mut list, &HashSet::new());
+        let wf = list
+            .iter()
+            .find(|s| s.summary.name == BUILTIN_WORKFLOW_SKILL_NAME)
+            .expect("built-in workflow skill should be injected");
+        assert!(wf.summary.enabled);
+        assert_eq!(wf.summary.source_label, "builtin:airlock");
+        assert!(wf.body_md.contains("Turn-End Follow-Up Choices Protocol"));
+        assert!(wf.body_md.contains("WEBMCP_NEXT_SESSION_PROMPT"));
+        assert!(wf.body_md.contains("ANTIGRAVITY_HANDOFF_PROMPT"));
+        assert!(
+            read_skill_resource_file(wf, "README.md").is_err(),
+            "built-in virtual skill must reject external resource reads"
+        );
+
+        // 2. disabled_skills marks built-in skill disabled without crashing discovery
+        let mut disabled = HashSet::new();
+        disabled.insert(BUILTIN_WORKFLOW_SKILL_NAME.to_string());
+        let mut list_dis = discover_skills(&[], &[], None, &disabled);
+        inject_builtin_skills(&mut list_dis, &disabled);
+        let wf_dis = list_dis
+            .iter()
+            .find(|s| s.summary.name == BUILTIN_WORKFLOW_SKILL_NAME)
+            .unwrap();
+        assert!(!wf_dis.summary.enabled);
+
+        // 3. Workspace skill with the same name cleanly overrides the built-in entry
+        let ws_override = base.join(".airlock/skills").join(BUILTIN_WORKFLOW_SKILL_NAME);
+        fs::create_dir_all(&ws_override).unwrap();
+        fs::write(
+            ws_override.join("SKILL.md"),
+            format!("---\nname: {BUILTIN_WORKFLOW_SKILL_NAME}\ndescription: Custom workspace workflow override.\n---\n# Custom Override"),
+        )
+        .unwrap();
+        let ws_roots = vec![("repo".to_string(), base.clone())];
+        let mut list_ov = discover_skills(&ws_roots, &[], None, &HashSet::new());
+        inject_builtin_skills(&mut list_ov, &HashSet::new());
+        let matching: Vec<_> = list_ov
+            .iter()
+            .filter(|s| s.summary.name == BUILTIN_WORKFLOW_SKILL_NAME)
+            .collect();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].summary.source_label, "workspace:repo");
+        assert!(matching[0].body_md.contains("Custom Override"));
 
         let _ = fs::remove_dir_all(&base);
     }

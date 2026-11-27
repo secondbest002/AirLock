@@ -1,3 +1,4 @@
+pub use crate::config::McpToolProfile;
 use crate::security::{hash_oauth_token, secure_token_eq};
 use crate::state::AppState;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -11,6 +12,25 @@ use std::sync::atomic::Ordering;
 pub struct TokenQuery {
     pub(super) token: Option<String>,
     pub(super) workspace: Option<String>,
+    pub(super) profile: Option<String>,
+}
+
+pub(super) fn extract_tool_profile(
+    headers: &HeaderMap,
+    query: &TokenQuery,
+    default_profile: &str,
+) -> McpToolProfile {
+    if let Some(q_prof) = query.profile.as_deref().and_then(McpToolProfile::parse) {
+        return q_prof;
+    }
+    if let Some(h_prof) = headers
+        .get("x-airlock-profile")
+        .and_then(|v| v.to_str().ok())
+        .and_then(McpToolProfile::parse)
+    {
+        return h_prof;
+    }
+    McpToolProfile::parse(default_profile).unwrap_or(McpToolProfile::Compact)
 }
 
 pub(super) fn extract_pinned_workspace(headers: &HeaderMap, query: &TokenQuery) -> Option<String> {
@@ -134,13 +154,35 @@ pub(super) async fn check_auth(
     false
 }
 
-pub(super) fn unauthorized_response(base: &str) -> Response {
+fn build_safe_resource_query(query: &TokenQuery) -> Option<String> {
+    let mut ser = url::form_urlencoded::Serializer::new(String::new());
+    let mut count = 0usize;
+    if let Some(p) = query.profile.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        ser.append_pair("profile", p);
+        count += 1;
+    }
+    if let Some(w) = query.workspace.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        ser.append_pair("workspace", w);
+        count += 1;
+    }
+    if count > 0 {
+        Some(ser.finish())
+    } else {
+        None
+    }
+}
+
+pub(super) fn unauthorized_response(base: &str, query: Option<&TokenQuery>) -> Response {
     let mut resp = (
         StatusCode::UNAUTHORIZED,
         Json(json!({ "error": "unauthorized", "message": "Invalid or missing Bearer token" })),
     )
         .into_response();
-    let header_val = format!("Bearer resource_metadata=\"{base}/.well-known/oauth-protected-resource\"");
+    let meta_url = match query.and_then(build_safe_resource_query) {
+        Some(qs) => format!("{base}/.well-known/oauth-protected-resource/mcp?{qs}"),
+        None => format!("{base}/.well-known/oauth-protected-resource"),
+    };
+    let header_val = format!("Bearer resource_metadata=\"{meta_url}\"");
     if let Ok(val) = HeaderValue::from_str(&header_val) {
         resp.headers_mut().insert(header::WWW_AUTHENTICATE, val);
     }

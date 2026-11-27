@@ -62,6 +62,50 @@ fn default_stream_idle_timeout_secs() -> u64 {
     35
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpToolProfile {
+    Compact,
+    Full,
+}
+
+impl McpToolProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Full => "full",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "compact" => Some(Self::Compact),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+}
+
+fn default_webmcp_default_profile() -> String {
+    "compact".to_string()
+}
+
+fn default_webmcp_rpc_timeout_secs() -> u64 {
+    32
+}
+
+fn default_webmcp_auto_promote_secs() -> u64 {
+    18
+}
+
+fn default_webmcp_poll_wait_secs() -> u64 {
+    22
+}
+
+fn default_webmcp_max_output_chars() -> usize {
+    6000
+}
+
 fn default_sensitive_patterns() -> Vec<String> {
     vec![
         ".env".to_string(),
@@ -173,6 +217,28 @@ pub struct AppConfig {
     pub hooks: Vec<crate::hooks::HookDefinition>,
     #[serde(default)]
     pub lsp_servers: HashMap<String, LspServerOverride>,
+    #[serde(default = "default_webmcp_default_profile")]
+    pub webmcp_default_profile: String,
+    #[serde(default = "default_webmcp_rpc_timeout_secs")]
+    pub webmcp_rpc_timeout_secs: u64,
+    #[serde(default = "default_webmcp_auto_promote_secs")]
+    pub webmcp_auto_promote_secs: u64,
+    #[serde(default = "default_webmcp_poll_wait_secs")]
+    pub webmcp_poll_wait_secs: u64,
+    #[serde(default = "default_webmcp_max_output_chars")]
+    pub webmcp_max_output_chars: usize,
+    #[serde(default)]
+    pub webmcp_sse_keepalive: bool,
+    #[serde(default)]
+    pub webmcp_allow_write_delegation: bool,
+    #[serde(default)]
+    pub webmcp_expose_skills: bool,
+    #[serde(default = "default_true")]
+    pub webmcp_session_harness: bool,
+    #[serde(default)]
+    pub webmcp_auto_verify_on_edit: bool,
+    #[serde(default = "default_true")]
+    pub webmcp_auto_handoff_dir: bool,
 }
 
 impl Default for AppConfig {
@@ -209,11 +275,47 @@ impl Default for AppConfig {
             trusted_hook_hashes: HashMap::new(),
             hooks: Vec::new(),
             lsp_servers: HashMap::new(),
+            webmcp_default_profile: default_webmcp_default_profile(),
+            webmcp_rpc_timeout_secs: default_webmcp_rpc_timeout_secs(),
+            webmcp_auto_promote_secs: default_webmcp_auto_promote_secs(),
+            webmcp_poll_wait_secs: default_webmcp_poll_wait_secs(),
+            webmcp_max_output_chars: default_webmcp_max_output_chars(),
+            webmcp_sse_keepalive: false,
+            webmcp_allow_write_delegation: false,
+            webmcp_expose_skills: false,
+            webmcp_session_harness: true,
+            webmcp_auto_verify_on_edit: false,
+            webmcp_auto_handoff_dir: default_true(),
         }
     }
 }
 
 impl AppConfig {
+    pub fn normalized_webmcp_default_profile(&self) -> &'static str {
+        McpToolProfile::parse(&self.webmcp_default_profile)
+            .unwrap_or(McpToolProfile::Compact)
+            .as_str()
+    }
+
+    pub fn effective_webmcp_poll_wait_secs(&self) -> u64 {
+        self.webmcp_poll_wait_secs.clamp(0, 26)
+    }
+
+    pub fn effective_webmcp_auto_promote_secs(&self) -> u64 {
+        self.webmcp_auto_promote_secs.clamp(5, 25)
+    }
+
+    pub fn effective_webmcp_rpc_timeout_secs(&self) -> u64 {
+        let min_for_poll = self.effective_webmcp_poll_wait_secs().saturating_add(6);
+        self.webmcp_rpc_timeout_secs
+            .clamp(20, 60)
+            .max(min_for_poll)
+            .min(60)
+    }
+
+    pub fn effective_webmcp_max_output_chars(&self) -> usize {
+        self.webmcp_max_output_chars.clamp(3000, 16000)
+    }
     /// Returns `~/.smart-tauri-hub/config.json`.
     pub fn default_path() -> PathBuf {
         let base = std::env::var_os("USERPROFILE")
@@ -362,5 +464,31 @@ mod tests {
         assert_eq!(loaded.pinned_workspaces, vec![r"D:\Projects\Beta"]);
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_legacy_config_without_webmcp_fields_loads_defaults() {
+        let legacy_json = r#"{
+            "server_port": 9494,
+            "guardrail_mode": "safe_edit"
+        }"#;
+        let mut cfg: AppConfig = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(cfg.normalized_webmcp_default_profile(), "compact");
+        assert_eq!(cfg.effective_webmcp_rpc_timeout_secs(), 32);
+        assert_eq!(cfg.effective_webmcp_auto_promote_secs(), 18);
+        assert_eq!(cfg.effective_webmcp_poll_wait_secs(), 22);
+        assert_eq!(cfg.effective_webmcp_max_output_chars(), 6000);
+        assert!(!cfg.webmcp_sse_keepalive);
+        assert!(!cfg.webmcp_allow_write_delegation);
+        assert!(!cfg.webmcp_expose_skills);
+        assert!(cfg.webmcp_session_harness);
+        assert!(!cfg.webmcp_auto_verify_on_edit);
+        assert!(cfg.webmcp_auto_handoff_dir);
+
+        // Invariant: rpc_timeout is always >= poll_wait + 6
+        cfg.webmcp_poll_wait_secs = 26;
+        cfg.webmcp_rpc_timeout_secs = 20;
+        assert_eq!(cfg.effective_webmcp_poll_wait_secs(), 26);
+        assert_eq!(cfg.effective_webmcp_rpc_timeout_secs(), 32);
     }
 }
