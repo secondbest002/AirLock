@@ -1711,6 +1711,14 @@ fn main() {
         std::process::exit(webmcp_benchmark::run_benchmark_cli(json_output));
     }
 
+    if snapshots::is_portable_mode() {
+        let wv2_dir = snapshots::default_data_dir().join("webview2");
+        let _ = std::fs::create_dir_all(&wv2_dir);
+        if std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_none() {
+            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &wv2_dir);
+        }
+    }
+
     let app_state = Arc::new(AppState::new_persistent(
         default_workspace_dir(),
         AppState::default_auth_file_path(),

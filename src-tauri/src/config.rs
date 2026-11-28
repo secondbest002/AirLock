@@ -361,13 +361,9 @@ impl AppConfig {
             WebMcpExecutionMode::Task => self.webmcp_max_output_chars.max(10_000).clamp(3000, 20_000),
         }
     }
-    /// Returns `~/.smart-tauri-hub/config.json`.
+    /// Returns `<data_dir>/config.json` (portable `airlock-data` or `~/.smart-tauri-hub`).
     pub fn default_path() -> PathBuf {
-        let base = std::env::var_os("USERPROFILE")
-            .or_else(|| std::env::var_os("HOME"))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        base.join(".smart-tauri-hub").join("config.json")
+        crate::snapshots::default_data_dir().join("config.json")
     }
 
     /// Loads config from `path`, falling back to `Default` if missing or invalid.

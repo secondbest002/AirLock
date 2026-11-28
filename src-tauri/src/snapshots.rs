@@ -1,13 +1,64 @@
 use crate::state::AuditEntry;
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+pub const PORTABLE_FLAG_FILE: &str = "portable.flag";
+pub const PORTABLE_DATA_DIR_NAME: &str = "airlock-data";
+pub const DATA_DIR_ENV_VAR: &str = "AIRLOCK_DATA_DIR";
+
+/// Resolves the Airlock data directory and whether portable/custom-dir mode is active.
+///
+/// Precedence:
+/// 1. `AIRLOCK_DATA_DIR` environment variable (non-empty)
+/// 2. `<exe_dir>/airlock-data` when `--portable` is passed, `<exe_dir>/portable.flag` exists,
+///    or `<exe_dir>/airlock-data` directory already exists
+/// 3. `~/.smart-tauri-hub` (default installed mode)
+pub fn resolve_data_dir_with(
+    env_override: Option<&str>,
+    exe_dir: Option<&Path>,
+    force_portable: bool,
+    home_dir: Option<&Path>,
+) -> (PathBuf, bool) {
+    if let Some(custom) = env_override.map(str::trim).filter(|s| !s.is_empty()) {
+        return (PathBuf::from(custom), true);
+    }
+
+    if let Some(dir) = exe_dir {
+        let portable_dir = dir.join(PORTABLE_DATA_DIR_NAME);
+        if force_portable || dir.join(PORTABLE_FLAG_FILE).is_file() || portable_dir.is_dir() {
+            return (portable_dir, true);
+        }
+    }
+
+    let base = home_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    (base.join(".smart-tauri-hub"), false)
+}
+
+fn resolve_runtime_data_dir() -> (PathBuf, bool) {
+    let env_override = std::env::var(DATA_DIR_ENV_VAR).ok();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    let force_portable = std::env::args().any(|a| a == "--portable");
+    let home_dir = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+    resolve_data_dir_with(
+        env_override.as_deref(),
+        exe_dir.as_deref(),
+        force_portable,
+        home_dir.as_deref(),
+    )
+}
 
 pub fn default_data_dir() -> PathBuf {
-    let base = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join(".smart-tauri-hub")
+    resolve_runtime_data_dir().0
+}
+
+pub fn is_portable_mode() -> bool {
+    resolve_runtime_data_dir().1
 }
 
 #[derive(Debug, Clone)]
@@ -144,5 +195,48 @@ mod tests {
         assert!(loaded[0].file_existed_before);
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_resolve_data_dir_portable_modes() {
+        let temp_root = std::env::temp_dir().join("smart_mcp_portable_resolve_test");
+        let _ = fs::remove_dir_all(&temp_root);
+        let exe_dir = temp_root.join("app");
+        let home_dir = temp_root.join("home");
+        fs::create_dir_all(&exe_dir).unwrap();
+        fs::create_dir_all(&home_dir).unwrap();
+
+        // 1. Default installed mode -> home/.smart-tauri-hub
+        let (path, portable) = resolve_data_dir_with(None, Some(&exe_dir), false, Some(&home_dir));
+        assert_eq!(path, home_dir.join(".smart-tauri-hub"));
+        assert!(!portable);
+
+        // 2. CLI --portable flag -> exe_dir/airlock-data
+        let (path, portable) = resolve_data_dir_with(None, Some(&exe_dir), true, Some(&home_dir));
+        assert_eq!(path, exe_dir.join(PORTABLE_DATA_DIR_NAME));
+        assert!(portable);
+
+        // 3. portable.flag marker file -> exe_dir/airlock-data
+        fs::write(exe_dir.join(PORTABLE_FLAG_FILE), "").unwrap();
+        let (path, portable) = resolve_data_dir_with(None, Some(&exe_dir), false, Some(&home_dir));
+        assert_eq!(path, exe_dir.join(PORTABLE_DATA_DIR_NAME));
+        assert!(portable);
+        let _ = fs::remove_file(exe_dir.join(PORTABLE_FLAG_FILE));
+
+        // 4. Existing airlock-data directory -> exe_dir/airlock-data
+        fs::create_dir_all(exe_dir.join(PORTABLE_DATA_DIR_NAME)).unwrap();
+        let (path, portable) = resolve_data_dir_with(None, Some(&exe_dir), false, Some(&home_dir));
+        assert_eq!(path, exe_dir.join(PORTABLE_DATA_DIR_NAME));
+        assert!(portable);
+
+        // 5. AIRLOCK_DATA_DIR env override takes highest precedence
+        let custom_dir = temp_root.join("custom-data");
+        let custom_str = custom_dir.to_string_lossy().to_string();
+        let (path, portable) =
+            resolve_data_dir_with(Some(&custom_str), Some(&exe_dir), false, Some(&home_dir));
+        assert_eq!(path, custom_dir);
+        assert!(portable);
+
+        let _ = fs::remove_dir_all(&temp_root);
     }
 }

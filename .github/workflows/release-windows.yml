@@ -1,4 +1,4 @@
-name: Release Windows (NSIS)
+name: Release Windows (NSIS + Portable)
 
 on:
   push:
@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   build-windows:
-    name: Build Windows NSIS Installer
+    name: Build Windows NSIS & Portable
     runs-on: windows-latest
 
     steps:
@@ -47,7 +47,51 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: 'Airlock v__VERSION__'
-          releaseBody: 'Installer Windows (NSIS) untuk **Airlock v__VERSION__**. Unduh file `*-setup.exe` di bagian Assets di bawah.'
+          releaseBody: |
+            Rilis Windows untuk **Airlock v__VERSION__**.
+
+            - **Installer (NSIS):** Unduh `*-setup.exe` untuk instalasi standar (data di `%USERPROFILE%\.smart-tauri-hub\`).
+            - **True Portable (ZIP):** Unduh `*-windows-x64-portable.zip`, ekstrak, lalu jalankan `tauri-mcp-hub.exe` (seluruh data & cache WebView2 tersimpan di folder `airlock-data\`).
           releaseDraft: ${{ github.event_name != 'workflow_dispatch' || inputs.release_draft }}
           prerelease: false
           args: '--bundles nsis'
+
+      - name: Package & Upload True Portable ZIP to GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tauriConf = Get-Content "src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json
+          $version = $tauriConf.version
+          $releaseDir = "src-tauri/target/release"
+          $portableRoot = "$releaseDir/portable/Airlock-Portable"
+          $zipPath = "$releaseDir/Airlock-v$version-windows-x64-portable.zip"
+
+          if (Test-Path $portableRoot) { Remove-Item $portableRoot -Recurse -Force }
+          New-Item -ItemType Directory -Path "$portableRoot/airlock-data" -Force | Out-Null
+          Copy-Item "$releaseDir/tauri-mcp-hub.exe" "$portableRoot/tauri-mcp-hub.exe" -Force
+
+          $loader = Get-ChildItem "$releaseDir/build" -Filter "WebView2Loader.dll" -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "\\x64\\" } |
+            Select-Object -First 1
+          if ($loader) {
+            Copy-Item $loader.FullName "$portableRoot/WebView2Loader.dll" -Force
+          } elseif (Test-Path "$releaseDir/WebView2Loader.dll") {
+            Copy-Item "$releaseDir/WebView2Loader.dll" "$portableRoot/WebView2Loader.dll" -Force
+          }
+
+          Set-Content -Path "$portableRoot/portable.flag" -Value "Airlock True Portable Mode marker. Keep this file next to tauri-mcp-hub.exe." -Encoding UTF8
+          @"
+          Airlock v$version — True Portable Edition (Windows x64)
+          =======================================================
+
+          1. Jalankan tauri-mcp-hub.exe langsung dari folder ini (tanpa instalasi).
+          2. File portable.flag mengaktifkan True Portable Mode: seluruh data aplikasi
+             (config.json, auth.json, secrets.dpapi, snapshots, checkpoints, chat history,
+             dan cache WebView2) disimpan di dalam folder airlock-data\.
+          3. Catatan Keamanan (Windows DPAPI): secrets.dpapi terikat ke akun Windows pada
+             PC saat ini. Jika folder dipindah ke PC lain, masukkan ulang API key / token.
+          "@ | Set-Content -Path "$portableRoot/PORTABLE-README.txt" -Encoding UTF8
+
+          Compress-Archive -Path "$portableRoot/*" -DestinationPath $zipPath -Force
+          gh release upload "v$version" "$zipPath" --clobber

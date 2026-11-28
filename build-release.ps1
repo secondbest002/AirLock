@@ -1,5 +1,6 @@
 param(
-    [switch]$Bundle
+    [switch]$Bundle,
+    [switch]$Portable
 )
 
 $ErrorActionPreference = "Stop"
@@ -57,3 +58,40 @@ if (!(Test-Path "$releaseDir\WebView2Loader.dll")) {
 }
 
 Write-Host "Release build complete: $releaseDir\tauri-mcp-hub.exe" -ForegroundColor Green
+
+if ($Portable) {
+    $tauriConf = Get-Content "$PSScriptRoot\src-tauri\tauri.conf.json" -Raw | ConvertFrom-Json
+    $version = $tauriConf.version
+    $portableRoot = "$releaseDir\portable\Airlock-Portable"
+    $zipPath = "$releaseDir\Airlock-v$version-windows-x64-portable.zip"
+
+    if (Test-Path $portableRoot) {
+        Remove-Item $portableRoot -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path "$portableRoot\airlock-data" -Force | Out-Null
+    Copy-Item "$releaseDir\tauri-mcp-hub.exe" "$portableRoot\tauri-mcp-hub.exe" -Force
+    if (Test-Path "$releaseDir\WebView2Loader.dll") {
+        Copy-Item "$releaseDir\WebView2Loader.dll" "$portableRoot\WebView2Loader.dll" -Force
+    }
+    Set-Content -Path "$portableRoot\portable.flag" -Value "Airlock True Portable Mode marker. Keep this file next to tauri-mcp-hub.exe." -Encoding UTF8
+    @"
+Airlock v$version — True Portable Edition (Windows x64)
+=======================================================
+
+1. Jalankan `tauri-mcp-hub.exe` langsung dari folder ini (tanpa instalasi).
+2. Karena file `portable.flag` ada di sebelah `.exe`, seluruh data aplikasi
+   (config.json, auth.json, secrets.dpapi, snapshots, checkpoints, chat history,
+   dan cache WebView2) disimpan di dalam folder `airlock-data\`.
+3. Anda juga dapat menjalankan dengan flag `--portable` atau mengatur environment
+   variable `AIRLOCK_DATA_DIR` untuk menentukan lokasi folder data khusus.
+4. Catatan Keamanan (Windows DPAPI): `secrets.dpapi` dienkripsi memakai Windows
+   DPAPI yang terikat ke akun Windows pada PC saat ini. Jika folder portable
+   dipindahkan ke PC lain, cukup masukkan ulang API key / token di PC baru.
+"@ | Set-Content -Path "$portableRoot\PORTABLE-README.txt" -Encoding UTF8
+
+    if (Test-Path $zipPath) {
+        Remove-Item $zipPath -Force
+    }
+    Compress-Archive -Path "$portableRoot\*" -DestinationPath $zipPath -Force
+    Write-Host "Portable package complete: $zipPath" -ForegroundColor Green
+}

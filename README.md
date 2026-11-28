@@ -2,7 +2,7 @@
 
 Token-efficient desktop MCP server, remote tunnel bridge, downstream MCP aggregator, and multi-provider local coding agent built with **Tauri v2**, **Axum**, and **Vanilla TypeScript** featuring the dark-first **Obsidian Studio** 5-view workspace UI (`Local Agent`, `MCP Bridge`, `Hub & Tools`, `Live Monitor`, `Diff & Audit`) and zero external UI runtime frameworks.
 
-> **Persistence Compatibility:** Airlock stores configuration, Windows DPAPI encrypted keys, OAuth tokens, chat history, and SHA-256 rollback snapshots under `~/.smart-tauri-hub/` so existing setups carry over seamlessly.
+> **Persistence Compatibility & True Portable Mode:** By default, Airlock stores configuration, Windows DPAPI encrypted keys, OAuth tokens, chat history, and SHA-256 rollback snapshots under `~/.smart-tauri-hub/`. For **True Portable Mode**, place a `portable.flag` file (or an `airlock-data/` directory) next to `tauri-mcp-hub.exe`, launch with `--portable`, or set `AIRLOCK_DATA_DIR` — all app state and the WebView2 user data folder (`airlock-data/webview2`) will stay self-contained inside that folder (note: `secrets.dpapi` remains bound to the current Windows user/machine via DPAPI, so re-enter keys if moving to a different PC).
 
 ## Core Architecture
 
@@ -55,9 +55,10 @@ Token-efficient desktop MCP server, remote tunnel bridge, downstream MCP aggrega
    ```powershell
    .\run-dev.ps1
    ```
-4. Build release executable (`src-tauri\target\release\tauri-mcp-hub.exe`) or full installer bundle:
+4. Build release executable (`src-tauri\target\release\tauri-mcp-hub.exe`), true portable ZIP, or full installer bundle:
    ```powershell
    .\build-release.ps1
+   .\build-release.ps1 -Portable
    .\build-release.ps1 -Bundle
    ```
 5. Run automated tests:
