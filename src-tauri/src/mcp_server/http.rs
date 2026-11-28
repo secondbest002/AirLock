@@ -1,6 +1,7 @@
 use super::auth::{
-    check_auth, compute_base_url, extract_pinned_workspace, extract_tool_profile, sanitize_preview,
-    unauthorized_response, McpToolProfile, TokenQuery,
+    check_auth, compute_base_url, extract_execution_mode, extract_pinned_workspace,
+    extract_tool_profile, sanitize_preview, unauthorized_response, McpToolProfile, TokenQuery,
+    WebMcpExecutionMode,
 };
 use super::rpc::{handle_single_rpc_with_request_context, RpcRequestContext};
 use super::total_tools_count;
@@ -53,6 +54,7 @@ async fn execute_rpc_batch_hybrid(
     messages: Vec<Value>,
     pinned_ws: Option<String>,
     tool_profile: McpToolProfile,
+    execution_mode: WebMcpExecutionMode,
     source: &'static str,
     session_id: Option<String>,
 ) -> Vec<Value> {
@@ -70,6 +72,7 @@ async fn execute_rpc_batch_hybrid(
                 let ctx = RpcRequestContext {
                     pinned_ws: pinned_ws.as_deref(),
                     tool_profile,
+                    execution_mode,
                     source,
                     session_id: session_id.as_deref(),
                 };
@@ -86,6 +89,7 @@ async fn execute_rpc_batch_hybrid(
                         let ctx = RpcRequestContext {
                             pinned_ws: pin_owned.as_deref(),
                             tool_profile,
+                            execution_mode,
                             source,
                             session_id: sid_owned.as_deref(),
                         };
@@ -105,6 +109,7 @@ async fn execute_rpc_batch_hybrid(
             let ctx = RpcRequestContext {
                 pinned_ws: pinned_ws.as_deref(),
                 tool_profile,
+                execution_mode,
                 source,
                 session_id: session_id.as_deref(),
             };
@@ -294,9 +299,18 @@ async fn process_mcp_post(
     };
 
     let pinned_ws = extract_pinned_workspace(&headers, &query);
-    let default_profile = state.config.read().await.webmcp_default_profile.clone();
-    let sse_keepalive_enabled = state.config.read().await.webmcp_sse_keepalive;
+    let (default_profile, default_mode, sse_keepalive_enabled) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.webmcp_default_profile.clone(),
+            cfg.webmcp_execution_mode.clone(),
+            cfg.webmcp_sse_keepalive,
+        )
+    };
     let tool_profile = extract_tool_profile(&headers, &query, &default_profile);
+    let execution_mode = extract_execution_mode(&headers, &query, &default_mode);
+    let effective_sse_keepalive =
+        sse_keepalive_enabled || execution_mode == WebMcpExecutionMode::Task;
 
     let mcp_method_hdr = headers
         .get("mcp-method")
@@ -313,6 +327,9 @@ async fn process_mcp_post(
     if let Some(ref pin) = pinned_ws {
         let clean = pin.strip_prefix('@').unwrap_or(pin);
         note_parts.push(format!("ws: @{clean}"));
+    }
+    if execution_mode == WebMcpExecutionMode::Task {
+        note_parts.push("mode: task".to_string());
     }
     if let Some(ref m) = mcp_method_hdr {
         note_parts.push(format!("Mcp-Method: {m}"));
@@ -339,7 +356,7 @@ async fn process_mcp_post(
         .find_map(|m| m.get("id").cloned())
         .unwrap_or(Value::Null);
 
-    let outs = if !is_init && sse_keepalive_enabled && accepts_sse && has_tools_call {
+    let outs = if !is_init && effective_sse_keepalive && accepts_sse && has_tools_call {
         let (tx, mut rx) = tokio::sync::oneshot::channel::<Vec<Value>>();
         let st_bg = Arc::clone(&state);
         let msgs_bg = messages;
@@ -351,6 +368,7 @@ async fn process_mcp_post(
                 msgs_bg,
                 pin_bg,
                 tool_profile,
+                execution_mode,
                 "WebMCP",
                 sid_bg,
             )
@@ -433,6 +451,7 @@ async fn process_mcp_post(
             messages,
             pinned_ws.clone(),
             tool_profile,
+            execution_mode,
             "WebMCP",
             session_id.clone(),
         )

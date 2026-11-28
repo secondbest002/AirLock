@@ -86,8 +86,37 @@ impl McpToolProfile {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebMcpExecutionMode {
+    #[default]
+    Chat,
+    Task,
+}
+
+impl WebMcpExecutionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Task => "task",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "chat" => Some(Self::Chat),
+            "task" => Some(Self::Task),
+            _ => None,
+        }
+    }
+}
+
 fn default_webmcp_default_profile() -> String {
     "compact".to_string()
+}
+
+fn default_webmcp_execution_mode() -> String {
+    "chat".to_string()
 }
 
 fn default_webmcp_rpc_timeout_secs() -> u64 {
@@ -219,6 +248,8 @@ pub struct AppConfig {
     pub lsp_servers: HashMap<String, LspServerOverride>,
     #[serde(default = "default_webmcp_default_profile")]
     pub webmcp_default_profile: String,
+    #[serde(default = "default_webmcp_execution_mode")]
+    pub webmcp_execution_mode: String,
     #[serde(default = "default_webmcp_rpc_timeout_secs")]
     pub webmcp_rpc_timeout_secs: u64,
     #[serde(default = "default_webmcp_auto_promote_secs")]
@@ -276,6 +307,7 @@ impl Default for AppConfig {
             hooks: Vec::new(),
             lsp_servers: HashMap::new(),
             webmcp_default_profile: default_webmcp_default_profile(),
+            webmcp_execution_mode: default_webmcp_execution_mode(),
             webmcp_rpc_timeout_secs: default_webmcp_rpc_timeout_secs(),
             webmcp_auto_promote_secs: default_webmcp_auto_promote_secs(),
             webmcp_poll_wait_secs: default_webmcp_poll_wait_secs(),
@@ -297,6 +329,12 @@ impl AppConfig {
             .as_str()
     }
 
+    pub fn normalized_webmcp_execution_mode(&self) -> &'static str {
+        WebMcpExecutionMode::parse(&self.webmcp_execution_mode)
+            .unwrap_or(WebMcpExecutionMode::Chat)
+            .as_str()
+    }
+
     pub fn effective_webmcp_poll_wait_secs(&self) -> u64 {
         self.webmcp_poll_wait_secs.clamp(0, 26)
     }
@@ -315,6 +353,13 @@ impl AppConfig {
 
     pub fn effective_webmcp_max_output_chars(&self) -> usize {
         self.webmcp_max_output_chars.clamp(3000, 16000)
+    }
+
+    pub fn effective_webmcp_max_output_chars_for_mode(&self, mode: WebMcpExecutionMode) -> usize {
+        match mode {
+            WebMcpExecutionMode::Chat => self.effective_webmcp_max_output_chars(),
+            WebMcpExecutionMode::Task => self.webmcp_max_output_chars.max(10_000).clamp(3000, 20_000),
+        }
     }
     /// Returns `~/.smart-tauri-hub/config.json`.
     pub fn default_path() -> PathBuf {
@@ -490,5 +535,36 @@ mod tests {
         cfg.webmcp_rpc_timeout_secs = 20;
         assert_eq!(cfg.effective_webmcp_poll_wait_secs(), 26);
         assert_eq!(cfg.effective_webmcp_rpc_timeout_secs(), 32);
+    }
+
+    #[test]
+    fn test_webmcp_execution_mode_defaults_and_task_output_floor() {
+        let mut cfg = AppConfig::default();
+        assert_eq!(cfg.normalized_webmcp_execution_mode(), "chat");
+        assert_eq!(
+            cfg.effective_webmcp_max_output_chars_for_mode(WebMcpExecutionMode::Chat),
+            6000
+        );
+        assert_eq!(
+            cfg.effective_webmcp_max_output_chars_for_mode(WebMcpExecutionMode::Task),
+            10_000
+        );
+
+        cfg.webmcp_max_output_chars = 18_000;
+        assert_eq!(
+            cfg.effective_webmcp_max_output_chars_for_mode(WebMcpExecutionMode::Task),
+            18_000
+        );
+
+        cfg.webmcp_max_output_chars = 24_000;
+        assert_eq!(
+            cfg.effective_webmcp_max_output_chars_for_mode(WebMcpExecutionMode::Task),
+            20_000
+        );
+
+        cfg.webmcp_execution_mode = "bogus".to_string();
+        assert_eq!(cfg.normalized_webmcp_execution_mode(), "chat");
+        cfg.webmcp_execution_mode = " TASK ".to_string();
+        assert_eq!(cfg.normalized_webmcp_execution_mode(), "task");
     }
 }

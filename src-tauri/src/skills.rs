@@ -885,20 +885,54 @@ Follow this 4-stage discipline strictly in WebMCP sessions so context stays shar
 4. Execute **ONLY ONE small phase/batch per turn** (`multi_surgical_edit` / targeted checks), update `session_checkpoint` if needed, then **STOP** and end with 1 short follow-up question + 2-4 choices (continue next phase / debug or re-check / handoff to Antigravity).
 "#;
 
-pub fn builtin_skills(disabled_norm: &HashSet<String>) -> Vec<SkillEntry> {
-    let raw_md = format!(
-        "---\nname: {BUILTIN_WORKFLOW_SKILL_NAME}\ndescription: {BUILTIN_WORKFLOW_SKILL_DESC}\n---\n{BUILTIN_WORKFLOW_SKILL_BODY}"
-    );
-    let body_md = BUILTIN_WORKFLOW_SKILL_BODY.trim().to_string();
-    let catalog_tokens_est =
-        ((BUILTIN_WORKFLOW_SKILL_NAME.len() + BUILTIN_WORKFLOW_SKILL_DESC.len() + 12) / 4).max(1);
-    let body_tokens_est = (body_md.len() / 4).max(1);
-    let enabled = !disabled_norm.contains(BUILTIN_WORKFLOW_SKILL_NAME);
+pub const BUILTIN_TASK_WORKFLOW_SKILL_NAME: &str = "airlock-task-workflow";
 
-    vec![SkillEntry {
+const BUILTIN_TASK_WORKFLOW_SKILL_DESC: &str = "Autonomous milestone-based Gemini Task Mode workflow: (1) deep research & complete blueprint(s), (2) adversarial pre-merge review via git_ops + lsp_query + tests, (3) closed-loop implement & verify with multi_surgical_edit until green, (4) checkpoint at milestone completion.";
+
+const BUILTIN_TASK_WORKFLOW_SKILL_BODY: &str = r#"# Airlock Gemini Task Mode — Autonomous Milestone Workflow
+
+Operate in autonomous milestone mode: complete one full deliverable or verification loop per run instead of stopping after every single file or phase.
+
+## Execution Discipline (Task Mode)
+- Do NOT pause after every file read, blueprint section, or minor edit. Continue through research -> verification -> artifact/code until the milestone is complete and verified.
+- Pause and ask the user ONLY for: (1) unresolved architectural or product trade-offs, (2) breaking API/schema/migration decisions, or (3) blocked destructive operations.
+- Always load matching domain skills via `list_skills` + `load_skill` before specialized UI, architecture, debugging, or security work.
+
+## Playbook 1 — Deep Research & Blueprint (`stage="blueprint"`)
+1. Call `list_skills` and `load_skill` for relevant planning/architecture/domain skills.
+2. Map the codebase concurrently with `batch_inspect` and `lsp_query` (or `delegate_local_agent(mode="read_only")` for broad sweeps) to verify exact file paths, symbols, and invariants.
+3. Write the complete blueprint document(s) under `.gemini/blueprints/` with concrete signatures, failure modes, and verification commands.
+4. Save `session_checkpoint(op="save", stage="blueprint", goal=..., blueprint_path=..., blueprint_paths=[...], recommended_skills=[...], decisions=[...], completed=[...], next_steps=[...])` so `.airlock/HANDOFF.md` is ready for Antigravity takeover.
+
+## Playbook 2 — Adversarial / Pre-Merge Review (`stage="inspect"`)
+1. Inspect `git_ops(op="status")` and `git_ops(op="diff")` / `diff_staged` for the active workspace.
+2. Verify all modified symbols, callers, and compiler diagnostics via `lsp_query(op="references" | "diagnostics")` and `batch_inspect`.
+3. Run the relevant build/test suite via `run_command` (`action="run"` / `"poll"`) to prove behavior.
+4. Report ONLY code-verified findings with exact file paths, line references, reproduction impact, and concrete fixes.
+
+## Playbook 3 — Closed-Loop Implement & Verify (`stage="implement"`)
+1. Load `.airlock/HANDOFF.md`, `session_checkpoint(op="load")`, and any target blueprint; run a pre-flight `batch_inspect` against live files.
+2. Apply atomic edits with `multi_surgical_edit(post_check_lsp=true, verify_command=...)` (or `run_command` for multi-step test suites).
+3. If compiler diagnostics or tests fail, inspect the compressed error output, adapt, and iterate until green.
+4. At milestone completion, save `session_checkpoint(op="save", stage="implement", ...)` to refresh `.airlock/HANDOFF.md`.
+"#;
+
+fn make_builtin_skill_entry(
+    name: &str,
+    description: &str,
+    body: &str,
+    disabled_norm: &HashSet<String>,
+) -> SkillEntry {
+    let raw_md = format!("---\nname: {name}\ndescription: {description}\n---\n{body}");
+    let body_md = body.trim().to_string();
+    let catalog_tokens_est = ((name.len() + description.len() + 12) / 4).max(1);
+    let body_tokens_est = (body_md.len() / 4).max(1);
+    let enabled = !disabled_norm.contains(name);
+
+    SkillEntry {
         summary: SkillSummary {
-            name: BUILTIN_WORKFLOW_SKILL_NAME.to_string(),
-            description: BUILTIN_WORKFLOW_SKILL_DESC.to_string(),
+            name: name.to_string(),
+            description: description.to_string(),
             scope: SkillScope::Global,
             source_label: "builtin:airlock".to_string(),
             plugin_id: None,
@@ -915,7 +949,24 @@ pub fn builtin_skills(disabled_norm: &HashSet<String>) -> Vec<SkillEntry> {
         plugin_root: None,
         body_md,
         raw_md,
-    }]
+    }
+}
+
+pub fn builtin_skills(disabled_norm: &HashSet<String>) -> Vec<SkillEntry> {
+    vec![
+        make_builtin_skill_entry(
+            BUILTIN_WORKFLOW_SKILL_NAME,
+            BUILTIN_WORKFLOW_SKILL_DESC,
+            BUILTIN_WORKFLOW_SKILL_BODY,
+            disabled_norm,
+        ),
+        make_builtin_skill_entry(
+            BUILTIN_TASK_WORKFLOW_SKILL_NAME,
+            BUILTIN_TASK_WORKFLOW_SKILL_DESC,
+            BUILTIN_TASK_WORKFLOW_SKILL_BODY,
+            disabled_norm,
+        ),
+    ]
 }
 
 pub fn inject_builtin_skills(entries: &mut Vec<SkillEntry>, disabled_skills: &HashSet<String>) {
@@ -1453,5 +1504,39 @@ mod tests {
         assert!(matching[0].body_md.contains("Custom Override"));
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_builtin_task_workflow_skill_injected_and_disableable() {
+        let mut list = discover_skills(&[], &[], None, &HashSet::new());
+        inject_builtin_skills(&mut list, &HashSet::new());
+
+        assert!(
+            list.iter().any(|s| s.summary.name == BUILTIN_WORKFLOW_SKILL_NAME),
+            "Chat workflow skill must remain present"
+        );
+        let task_skill = list
+            .iter()
+            .find(|s| s.summary.name == BUILTIN_TASK_WORKFLOW_SKILL_NAME)
+            .expect("built-in task workflow skill should be injected");
+        assert!(task_skill.summary.enabled);
+        assert!(task_skill.body_md.contains("Playbook 1"));
+        assert!(task_skill.body_md.contains("Playbook 2"));
+        assert!(task_skill.body_md.contains("Playbook 3"));
+
+        let mut disabled = HashSet::new();
+        disabled.insert(BUILTIN_TASK_WORKFLOW_SKILL_NAME.to_string());
+        let mut list_dis = discover_skills(&[], &[], None, &disabled);
+        inject_builtin_skills(&mut list_dis, &disabled);
+        let wf_chat = list_dis
+            .iter()
+            .find(|s| s.summary.name == BUILTIN_WORKFLOW_SKILL_NAME)
+            .unwrap();
+        let wf_task = list_dis
+            .iter()
+            .find(|s| s.summary.name == BUILTIN_TASK_WORKFLOW_SKILL_NAME)
+            .unwrap();
+        assert!(wf_chat.summary.enabled);
+        assert!(!wf_task.summary.enabled);
     }
 }

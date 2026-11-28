@@ -622,6 +622,7 @@ async fn update_app_settings(
 async fn update_webmcp_settings(
     state: State<'_, Arc<AppState>>,
     webmcp_default_profile: Option<String>,
+    webmcp_execution_mode: Option<String>,
     webmcp_auto_promote_secs: Option<u64>,
     webmcp_poll_wait_secs: Option<u64>,
     webmcp_rpc_timeout_secs: Option<u64>,
@@ -640,6 +641,12 @@ async fn update_webmcp_settings(
                 format!("WebMCP profile tidak valid: '{profile}'. Pilih 'compact' atau 'full'.")
             })?;
             cfg.webmcp_default_profile = parsed.as_str().to_string();
+        }
+        if let Some(mode) = webmcp_execution_mode {
+            let parsed = crate::config::WebMcpExecutionMode::parse(&mode).ok_or_else(|| {
+                format!("WebMCP execution mode tidak valid: '{mode}'. Pilih 'chat' atau 'task'.")
+            })?;
+            cfg.webmcp_execution_mode = parsed.as_str().to_string();
         }
         if let Some(val) = webmcp_auto_promote_secs {
             cfg.webmcp_auto_promote_secs = val.clamp(10, 24);
@@ -691,6 +698,20 @@ async fn sync_workspace_handoff_now(
 ) -> Result<String, String> {
     let ws = resolve_workspace(&state, workspace_alias.as_deref(), None).await?;
     handoff::sync_from_state(&state, &ws, handoff::HandoffTrigger::ManualSync, true).await
+}
+
+#[tauri::command]
+async fn get_antigravity_handoff_prompt(
+    state: State<'_, Arc<AppState>>,
+    workspace_alias: Option<String>,
+) -> Result<String, String> {
+    let ws = resolve_workspace(&state, workspace_alias.as_deref(), None).await?;
+    let _ = handoff::sync_from_state(&state, &ws, handoff::HandoffTrigger::ManualSync, true).await;
+    if let Some(cp) = checkpoints::load_checkpoint_struct(&state, &ws.id) {
+        Ok(checkpoints::build_antigravity_handoff_prompt(&cp))
+    } else {
+        Ok(checkpoints::build_fallback_antigravity_handoff_prompt(&ws.alias))
+    }
 }
 
 #[tauri::command]
@@ -1678,6 +1699,7 @@ fn default_workspace_dir() -> PathBuf {
 }
 
 fn main() {
+    process_util::suppress_windows_error_dialogs();
     if std::env::args().any(|a| a == "--stdio") {
         std::process::exit(stdio_bridge::run_stdio_bridge());
     }
@@ -1865,6 +1887,7 @@ fn main() {
             update_app_settings,
             update_webmcp_settings,
             sync_workspace_handoff_now,
+            get_antigravity_handoff_prompt,
             toggle_pin_workspace,
             set_server_port,
             configure_cloudflare_named,

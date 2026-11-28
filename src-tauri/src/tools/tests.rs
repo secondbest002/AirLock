@@ -1818,3 +1818,58 @@ async fn test_concurrent_slow_run_command_does_not_block_concurrent_write_or_edi
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[tokio::test]
+async fn test_webmcp_output_guard_applies_task_mode_floor() {
+    let temp_dir = std::env::temp_dir().join("smart_mcp_webmcp_task_output_floor_test");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let payload: String = (0..150)
+        .map(|i| format!("line_{i:03}_0123456789abcdefghijklmnopqrstuvwxyz0123456789"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let payload_len = payload.chars().count();
+    assert!(payload_len > 7500 && payload_len < 10_000, "payload_len={payload_len}");
+    fs::write(temp_dir.join("big.txt"), &payload).unwrap();
+
+    let state = Arc::new(AppState::new(temp_dir.clone()));
+    assert_eq!(state.config.read().await.effective_webmcp_max_output_chars(), 6000);
+
+    let chat_out = execute_tool_with_webmcp_context(
+        Arc::clone(&state),
+        "WebMCP",
+        "read_file_range",
+        json!({ "path": "big.txt", "start_line": 1, "end_line": 200 }),
+        None,
+        None,
+        None,
+        crate::config::WebMcpExecutionMode::Chat,
+    )
+    .await;
+    assert!(!chat_out.is_error);
+    assert!(
+        chat_out.text.contains("WebMCP Output Guard"),
+        "Chat mode should compress >6000 chars"
+    );
+
+    let task_out = execute_tool_with_webmcp_context(
+        Arc::clone(&state),
+        "WebMCP",
+        "read_file_range",
+        json!({ "path": "big.txt", "start_line": 1, "end_line": 200 }),
+        None,
+        None,
+        None,
+        crate::config::WebMcpExecutionMode::Task,
+    )
+    .await;
+    assert!(!task_out.is_error);
+    assert!(
+        !task_out.text.contains("WebMCP Output Guard"),
+        "Task mode floor (10000 chars) should preserve 8.5k output intact, got len={}",
+        task_out.text.chars().count()
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

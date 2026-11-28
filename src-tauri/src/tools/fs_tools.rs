@@ -1258,6 +1258,7 @@ pub(crate) async fn exec_list_workspaces(
     Ok(output)
 }
 
+#[allow(dead_code)]
 pub(crate) async fn exec_batch_inspect(
     state: &AppState,
     source: &str,
@@ -1265,6 +1266,27 @@ pub(crate) async fn exec_batch_inspect(
     top_level_ws: Option<&str>,
     pinned_ws: Option<&str>,
     args: &Value,
+) -> Result<String, String> {
+    exec_batch_inspect_with_mode(
+        state,
+        source,
+        ws,
+        top_level_ws,
+        pinned_ws,
+        args,
+        crate::config::WebMcpExecutionMode::Chat,
+    )
+    .await
+}
+
+pub(crate) async fn exec_batch_inspect_with_mode(
+    state: &AppState,
+    source: &str,
+    ws: &ResolvedWorkspace,
+    top_level_ws: Option<&str>,
+    pinned_ws: Option<&str>,
+    args: &Value,
+    execution_mode: crate::config::WebMcpExecutionMode,
 ) -> Result<String, String> {
     let include_instructions = args
         .get("include_instructions")
@@ -1633,7 +1655,13 @@ pub(crate) async fn exec_batch_inspect(
     };
 
     let webmcp_max_chars = if is_webmcp {
-        Some(state.config.read().await.effective_webmcp_max_output_chars())
+        Some(
+            state
+                .config
+                .read()
+                .await
+                .effective_webmcp_max_output_chars_for_mode(execution_mode),
+        )
     } else {
         None
     };

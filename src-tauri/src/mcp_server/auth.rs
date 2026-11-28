@@ -1,4 +1,4 @@
-pub use crate::config::McpToolProfile;
+pub use crate::config::{McpToolProfile, WebMcpExecutionMode};
 use crate::security::{hash_oauth_token, secure_token_eq};
 use crate::state::AppState;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -13,6 +13,7 @@ pub struct TokenQuery {
     pub(super) token: Option<String>,
     pub(super) workspace: Option<String>,
     pub(super) profile: Option<String>,
+    pub(super) mode: Option<String>,
 }
 
 pub(super) fn extract_tool_profile(
@@ -31,6 +32,24 @@ pub(super) fn extract_tool_profile(
         return h_prof;
     }
     McpToolProfile::parse(default_profile).unwrap_or(McpToolProfile::Compact)
+}
+
+pub(super) fn extract_execution_mode(
+    headers: &HeaderMap,
+    query: &TokenQuery,
+    default_mode: &str,
+) -> WebMcpExecutionMode {
+    if let Some(q_mode) = query.mode.as_deref().and_then(WebMcpExecutionMode::parse) {
+        return q_mode;
+    }
+    if let Some(h_mode) = headers
+        .get("x-airlock-mode")
+        .and_then(|v| v.to_str().ok())
+        .and_then(WebMcpExecutionMode::parse)
+    {
+        return h_mode;
+    }
+    WebMcpExecutionMode::parse(default_mode).unwrap_or(WebMcpExecutionMode::Chat)
 }
 
 pub(super) fn extract_pinned_workspace(headers: &HeaderMap, query: &TokenQuery) -> Option<String> {
@@ -163,6 +182,10 @@ fn build_safe_resource_query(query: &TokenQuery) -> Option<String> {
     }
     if let Some(w) = query.workspace.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         ser.append_pair("workspace", w);
+        count += 1;
+    }
+    if let Some(m) = query.mode.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        ser.append_pair("mode", m);
         count += 1;
     }
     if count > 0 {

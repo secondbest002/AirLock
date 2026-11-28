@@ -5,9 +5,6 @@ use crate::tools::{check_sensitive_guard_for_workspace, overview_text_for_resour
 use crate::workspace::{build_workspace_summaries, resolve_workspace, ResolvedWorkspace};
 use serde_json::{json, Value};
 use std::fs;
-use std::process::Stdio;
-use std::time::Duration;
-use tokio::process::Command;
 
 pub fn resources_list() -> Value {
     json!([
@@ -137,24 +134,9 @@ fn percent_decode(raw: &str) -> String {
 }
 
 async fn read_ws_git_diff(ws: &ResolvedWorkspace) -> Result<String, String> {
-    let mut cmd = Command::new("git");
-    cmd.arg("diff")
-        .current_dir(&ws.canon_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(0x08000000);
-
-    let out = tokio::time::timeout(Duration::from_secs(8), cmd.output())
-        .await
-        .map_err(|_| "Perintah git diff timeout setelah 8 detik.".to_string())?
-        .map_err(|e| format!("Gagal menjalankan git diff: {e}"))?;
-
-    let code = out.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let (code, stdout, stderr) =
+        crate::process_util::run_git_command_bounded(&ws.canon_root, &["diff"], true, 8)
+            .await?;
     let (compressed, _) = compress_output(&stdout, &stderr, 120);
     Ok(format!("EXIT CODE: {code}\n{compressed}"))
 }
@@ -776,11 +758,14 @@ mod tests {
 
         let prm = prompts_list_for_context(&state, None).await;
         let arr = prm.as_array().unwrap();
-        assert_eq!(arr.len(), 6);
+        assert_eq!(arr.len(), 7);
         assert!(arr.iter().any(|p| p["name"] == "skill:demo-skill"));
         assert!(arr
             .iter()
             .any(|p| p["name"] == "skill:airlock-blueprint-workflow"));
+        assert!(arr
+            .iter()
+            .any(|p| p["name"] == "skill:airlock-task-workflow"));
 
         let loaded = get_prompt_with_context(
             &state,

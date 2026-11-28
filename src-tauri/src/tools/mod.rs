@@ -85,7 +85,18 @@ pub async fn execute_tool_with_context(
     args: Value,
     pinned_ws: Option<&str>,
 ) -> ToolOutput {
-    execute_tool_core(state, None, source, tool_name, args, pinned_ws, None, None).await
+    execute_tool_core(
+        state,
+        None,
+        source,
+        tool_name,
+        args,
+        pinned_ws,
+        None,
+        None,
+        crate::config::WebMcpExecutionMode::Chat,
+    )
+    .await
 }
 
 pub async fn execute_tool_with_run_context(
@@ -105,10 +116,12 @@ pub async fn execute_tool_with_run_context(
         pinned_ws,
         run_ctx,
         None,
+        crate::config::WebMcpExecutionMode::Chat,
     )
     .await
 }
 
+#[allow(dead_code)]
 pub async fn execute_tool_with_session_context(
     state: std::sync::Arc<AppState>,
     source: &str,
@@ -117,6 +130,30 @@ pub async fn execute_tool_with_session_context(
     pinned_ws: Option<&str>,
     run_ctx: Option<&crate::agent_manager::RunContext>,
     session_id: Option<&str>,
+) -> ToolOutput {
+    execute_tool_with_webmcp_context(
+        state,
+        source,
+        tool_name,
+        args,
+        pinned_ws,
+        run_ctx,
+        session_id,
+        crate::config::WebMcpExecutionMode::Chat,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_tool_with_webmcp_context(
+    state: std::sync::Arc<AppState>,
+    source: &str,
+    tool_name: &str,
+    args: Value,
+    pinned_ws: Option<&str>,
+    run_ctx: Option<&crate::agent_manager::RunContext>,
+    session_id: Option<&str>,
+    execution_mode: crate::config::WebMcpExecutionMode,
 ) -> ToolOutput {
     execute_tool_core(
         state.as_ref(),
@@ -127,6 +164,7 @@ pub async fn execute_tool_with_session_context(
         pinned_ws,
         run_ctx,
         session_id,
+        execution_mode,
     )
     .await
 }
@@ -344,12 +382,17 @@ async fn apply_webmcp_output_guard(
     state: &AppState,
     source: &str,
     tool_name: &str,
+    execution_mode: crate::config::WebMcpExecutionMode,
     mut out: ToolOutput,
 ) -> ToolOutput {
     if source != "WebMCP" {
         return out;
     }
-    let max_chars = state.config.read().await.effective_webmcp_max_output_chars();
+    let max_chars = state
+        .config
+        .read()
+        .await
+        .effective_webmcp_max_output_chars_for_mode(execution_mode);
     let orig_chars = out.text.chars().count();
     if orig_chars <= max_chars {
         return out;
@@ -484,6 +527,7 @@ fn should_sync_webmcp_tool(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_tool_core(
     state: &AppState,
     state_arc: Option<std::sync::Arc<AppState>>,
@@ -493,6 +537,7 @@ async fn execute_tool_core(
     pinned_ws: Option<&str>,
     run_ctx: Option<&crate::agent_manager::RunContext>,
     session_id: Option<&str>,
+    execution_mode: crate::config::WebMcpExecutionMode,
 ) -> ToolOutput {
     let effective_source: &str = if source != "WebMCP"
         && run_ctx
@@ -518,6 +563,7 @@ async fn execute_tool_core(
         args,
         pinned_ws,
         run_ctx,
+        execution_mode,
     )
     .await;
 
@@ -576,20 +622,22 @@ async fn execute_tool_core(
             };
             state
                 .webmcp_harness
-                .after_tool_call(
+                .after_tool_call_with_mode(
                     state,
                     session_id,
                     ws_opt.as_ref(),
                     tool_name,
                     args_ref,
+                    execution_mode,
                     &mut out,
                 )
                 .await;
         }
     }
-    apply_webmcp_output_guard(state, source, tool_name, out).await
+    apply_webmcp_output_guard(state, source, tool_name, execution_mode, out).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_tool_core_inner(
     state: &AppState,
     state_arc: Option<std::sync::Arc<AppState>>,
@@ -598,6 +646,7 @@ async fn execute_tool_core_inner(
     args: Value,
     pinned_ws: Option<&str>,
     run_ctx: Option<&crate::agent_manager::RunContext>,
+    execution_mode: crate::config::WebMcpExecutionMode,
 ) -> ToolOutput {
     if !is_known_builtin_tool(tool_name) {
         let err = format!("Tool tidak dikenal: {tool_name}");
@@ -883,7 +932,16 @@ async fn execute_tool_core_inner(
                         .await
                 }
                 "batch_inspect" => {
-                    fs_tools::exec_batch_inspect(state, source, &ws, req_ws, pinned_ws, &args).await
+                    fs_tools::exec_batch_inspect_with_mode(
+                        state,
+                        source,
+                        &ws,
+                        req_ws,
+                        pinned_ws,
+                        &args,
+                        execution_mode,
+                    )
+                    .await
                 }
                 "surgical_edit" => fs_tools::exec_surgical_edit(state, source, &ws, &args).await,
                 "multi_surgical_edit" => {
@@ -912,7 +970,14 @@ async fn execute_tool_core_inner(
                     crate::lsp_bridge::exec_lsp_query(state, source, &ws, &args).await
                 }
                 "session_checkpoint" => {
-                    crate::checkpoints::exec_session_checkpoint(state, source, &ws, &args).await
+                    crate::checkpoints::exec_session_checkpoint_with_mode(
+                        state,
+                        source,
+                        &ws,
+                        &args,
+                        execution_mode,
+                    )
+                    .await
                 }
                 "delegate_local_agent" => {
                     if let Some(arc_st) = state_arc {

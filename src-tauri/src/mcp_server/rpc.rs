@@ -1,4 +1,4 @@
-use super::auth::McpToolProfile;
+use super::auth::{McpToolProfile, WebMcpExecutionMode};
 use crate::state::AppState;
 use crate::tools::mcp_tools_list_for_profile;
 use crate::workspace::{build_workspace_summaries, clean_path_string, default_alias_for_path};
@@ -10,6 +10,7 @@ use std::time::Duration;
 pub(crate) struct RpcRequestContext<'a> {
     pub pinned_ws: Option<&'a str>,
     pub tool_profile: McpToolProfile,
+    pub execution_mode: WebMcpExecutionMode,
     pub source: &'a str,
     pub session_id: Option<&'a str>,
 }
@@ -17,6 +18,7 @@ pub(crate) struct RpcRequestContext<'a> {
 async fn build_mcp_initialize_instructions(
     state: &AppState,
     profile: McpToolProfile,
+    execution_mode: WebMcpExecutionMode,
     pinned_ws: Option<&str>,
     enable_delegation: bool,
     expose_skills: bool,
@@ -89,10 +91,21 @@ async fn build_mcp_initialize_instructions(
         )
     };
 
-    let handoff_clause = "Use skill 'airlock-blueprint-workflow' (1 blueprint/turn, end active turns with 2-4 choices); save `session_checkpoint(op='save', stage=...)` & copy `WEBMCP_NEXT_SESSION_PROMPT` + `ANTIGRAVITY_HANDOFF_PROMPT` verbatim.";
+    let handoff_clause = match execution_mode {
+        WebMcpExecutionMode::Chat => {
+            "Use skill 'airlock-blueprint-workflow' (1 blueprint/turn, end active turns with 2-4 choices); save `session_checkpoint(op='save', stage=...)` & copy `WEBMCP_NEXT_SESSION_PROMPT` + `ANTIGRAVITY_HANDOFF_PROMPT` verbatim."
+        }
+        WebMcpExecutionMode::Task => {
+            "Use skill 'airlock-task-workflow' (autonomous milestone execution: finish full research+blueprint, hostile review, or implement+verify before stopping; pause only on design ambiguity or destructive risk); save `session_checkpoint(op='save', stage=...)` at milestone end to refresh `.airlock/HANDOFF.md`."
+        }
+    };
+    let mode_tag = match execution_mode {
+        WebMcpExecutionMode::Chat => "",
+        WebMcpExecutionMode::Task => ", Mode: task",
+    };
     let body = match profile {
         McpToolProfile::Compact => format!(
-            "AIRLOCK WEBMCP PROTOCOL (Profile: compact):\n\
+            "AIRLOCK WEBMCP PROTOCOL (Profile: compact{mode_tag}):\n\
             Active workspace(s): {ws_summary}.\n\
             1. BATCH INSPECT: Start with `batch_inspect` (overview, find_patterns, outline_paths, searches, read_slices, symbol_reads). Issue independent read-only calls in parallel.\n\
             2. ATOMIC EDITS: Use `multi_surgical_edit` (with `post_check_lsp: true` and/or `verify_command` when verifying); avoid re-reading edited files.\n\
@@ -100,7 +113,7 @@ async fn build_mcp_initialize_instructions(
             4. CHECKPOINTS & HANDOFF: Use `session_checkpoint` (`op='save'|'load'`) across turns. {handoff_clause}{delegate_line}{skills_rules_line}"
         ),
         McpToolProfile::Full => format!(
-            "AIRLOCK MCP PROTOCOL (Profile: full):\n\
+            "AIRLOCK MCP PROTOCOL (Profile: full{mode_tag}):\n\
             Active workspace(s): {ws_summary}.\n\
             1. MINIMIZE ROUND-TRIPS: Prefer `batch_inspect` (with `read_slices`/`symbol_reads`) and issue independent read-only calls in parallel.\n\
             2. ATOMIC EDITS: Prefer `multi_surgical_edit` (`post_check_lsp: true`, `verify_command`) or `surgical_edit`; avoid re-reading edited files.\n\
@@ -170,6 +183,7 @@ pub(crate) async fn handle_single_rpc(state: &Arc<AppState>, msg: &Value) -> Opt
         RpcRequestContext {
             pinned_ws: None,
             tool_profile: McpToolProfile::Full,
+            execution_mode: WebMcpExecutionMode::Chat,
             source: "Stdio",
             session_id: None,
         },
@@ -189,6 +203,7 @@ pub(crate) async fn handle_single_rpc_with_context(
         RpcRequestContext {
             pinned_ws,
             tool_profile: McpToolProfile::Full,
+            execution_mode: WebMcpExecutionMode::Chat,
             source: "WebMCP",
             session_id: None,
         },
@@ -224,6 +239,7 @@ pub(crate) async fn handle_single_rpc_with_request_context(
             let instructions = build_mcp_initialize_instructions(
                 state,
                 ctx.tool_profile,
+                ctx.execution_mode,
                 pinned_ws,
                 enable_delegation,
                 expose_skills,
@@ -544,7 +560,7 @@ pub(crate) async fn handle_single_rpc_with_request_context(
                             .call_downstream_tool(state, ctx.source, tool_name, args)
                             .await
                     } else {
-                        crate::tools::execute_tool_with_session_context(
+                        crate::tools::execute_tool_with_webmcp_context(
                             Arc::clone(state),
                             ctx.source,
                             tool_name,
@@ -552,6 +568,7 @@ pub(crate) async fn handle_single_rpc_with_request_context(
                             pinned_ws,
                             None,
                             ctx.session_id,
+                            ctx.execution_mode,
                         )
                         .await
                     }
@@ -661,6 +678,7 @@ mod init_instructions_tests {
         let instr = build_mcp_initialize_instructions(
             &state,
             McpToolProfile::Compact,
+            WebMcpExecutionMode::Chat,
             None,
             true,
             true,
@@ -674,6 +692,48 @@ mod init_instructions_tests {
             "Expected Active workspace(s) on line 2, got:\n{instr}"
         );
         assert!(instr.chars().count() <= 1200);
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[tokio::test]
+    async fn test_initialize_instructions_differentiates_chat_and_task_modes() {
+        let base_dir = std::env::temp_dir().join("smart_mcp_init_instr_dual_mode_test");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&base_dir).unwrap();
+
+        let state = AppState::new(base_dir.clone());
+        let chat_instr = build_mcp_initialize_instructions(
+            &state,
+            McpToolProfile::Compact,
+            WebMcpExecutionMode::Chat,
+            None,
+            true,
+            true,
+        )
+        .await;
+        let task_instr = build_mcp_initialize_instructions(
+            &state,
+            McpToolProfile::Compact,
+            WebMcpExecutionMode::Task,
+            None,
+            true,
+            true,
+        )
+        .await;
+
+        assert!(chat_instr.contains("airlock-blueprint-workflow"));
+        assert!(chat_instr.contains("1 blueprint/turn"));
+        assert!(chat_instr.chars().count() <= 1200);
+
+        assert!(task_instr.contains("Mode: task"));
+        assert!(task_instr.contains("airlock-task-workflow"));
+        assert!(!task_instr.contains("1 blueprint/turn"));
+        assert!(
+            task_instr.chars().count() <= 1200,
+            "Task instructions exceeded 1200 chars ({}):\n{task_instr}",
+            task_instr.chars().count()
+        );
 
         let _ = std::fs::remove_dir_all(&base_dir);
     }

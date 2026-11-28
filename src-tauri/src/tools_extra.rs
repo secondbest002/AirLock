@@ -10,10 +10,8 @@ use ignore::WalkBuilder;
 use regex::Regex;
 use serde_json::Value;
 use std::fs;
-use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
-use tokio::process::Command;
 
 static OUTLINE_RE_RS: OnceLock<Regex> = OnceLock::new();
 static OUTLINE_RE_JS: OnceLock<Regex> = OnceLock::new();
@@ -566,22 +564,9 @@ pub async fn exec_git_ops(
                 git_args.push("commit".to_string());
                 git_args.push("-m".to_string());
                 git_args.push(msg.to_string());
-                let mut cmd = Command::new("git");
-                cmd.args(&git_args)
-                    .current_dir(root)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .kill_on_drop(true);
-                #[cfg(target_os = "windows")]
-                cmd.creation_flags(0x08000000);
-                let out = tokio::time::timeout(Duration::from_secs(15), cmd.output())
-                    .await
-                    .map_err(|_| "Perintah git timeout setelah 15 detik.".to_string())?
-                    .map_err(|e| format!("Gagal menjalankan git: {e}"))?;
-                let exit_code = out.status.code().unwrap_or(-1);
-                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                let arg_refs: Vec<&str> = git_args.iter().map(String::as_str).collect();
+                let (exit_code, stdout, stderr) =
+                    crate::process_util::run_git_command_bounded(root, &arg_refs, false, 15).await?;
                 let (compressed, saved_bytes) = compress_output(&stdout, &stderr, 80);
                 state
                     .record_audit(
@@ -618,24 +603,10 @@ pub async fn exec_git_ops(
         other => return Err(format!("Operasi git_ops tidak dikenal: {other}")),
     }
 
-    let mut cmd = Command::new("git");
-    cmd.args(&git_args)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(0x08000000);
-
-    let out = tokio::time::timeout(Duration::from_secs(15), cmd.output())
-        .await
-        .map_err(|_| "Perintah git timeout setelah 15 detik.".to_string())?
-        .map_err(|e| format!("Gagal menjalankan git: {e}"))?;
-
-    let exit_code = out.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let is_ro_git = !matches!(op, "add" | "commit");
+    let arg_refs: Vec<&str> = git_args.iter().map(String::as_str).collect();
+    let (exit_code, stdout, stderr) =
+        crate::process_util::run_git_command_bounded(root, &arg_refs, is_ro_git, 15).await?;
     let (compressed, saved_bytes) = compress_output(&stdout, &stderr, 80);
     let tokens_saved = saved_bytes / 4;
 

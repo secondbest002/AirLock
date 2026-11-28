@@ -107,6 +107,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             HeaderName::from_static("mcp-name"),
             HeaderName::from_static("x-airlock-workspace"),
             HeaderName::from_static("x-airlock-profile"),
+            HeaderName::from_static("x-airlock-mode"),
         ])
         .expose_headers([
             HeaderName::from_static("mcp-session-id"),

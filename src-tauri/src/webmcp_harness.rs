@@ -1,3 +1,4 @@
+use crate::config::WebMcpExecutionMode;
 use crate::state::AppState;
 use crate::tools::ToolOutput;
 use crate::workspace::ResolvedWorkspace;
@@ -10,6 +11,8 @@ const MAX_HARNESS_SESSIONS: usize = 16;
 const HARNESS_SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 const CONTEXT_ROT_CALL_THRESHOLD: u32 = 12;
 const CONTEXT_ROT_BYTE_THRESHOLD: usize = 45_000;
+const TASK_CONTEXT_ROT_CALL_THRESHOLD: u32 = 30;
+const TASK_CONTEXT_ROT_BYTE_THRESHOLD: usize = 120_000;
 const MAX_HINTS_PER_CALL: usize = 2;
 const MAX_TOTAL_HINT_CHARS: usize = 320;
 
@@ -251,6 +254,29 @@ impl WebMcpHarnessManager {
         args: &Value,
         out: &mut ToolOutput,
     ) {
+        self.after_tool_call_with_mode(
+            state,
+            session_id,
+            ws,
+            tool_name,
+            args,
+            WebMcpExecutionMode::Chat,
+            out,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn after_tool_call_with_mode(
+        &self,
+        state: &AppState,
+        session_id: Option<&str>,
+        ws: Option<&ResolvedWorkspace>,
+        tool_name: &str,
+        args: &Value,
+        mode: WebMcpExecutionMode,
+        out: &mut ToolOutput,
+    ) {
         let enabled = state.config.read().await.webmcp_session_harness;
         if !enabled {
             return;
@@ -435,21 +461,33 @@ impl WebMcpHarnessManager {
             let blueprint_nudge: Option<String> = if !is_failure {
                 detect_blueprint_target(tool_name, args).map(|bp_path| {
                     let clipped_bp = single_line_clip(&bp_path, 48);
-                    format!(
-                        "[HARNESS_HINT: Blueprint '{clipped_bp}' saved (1/turn). Call session_checkpoint(op=\"save\", stage=\"blueprint\"), output WEBMCP_NEXT_SESSION_PROMPT & ANTIGRAVITY_HANDOFF_PROMPT verbatim, & offer 2-4 choices.]"
-                    )
+                    match mode {
+                        WebMcpExecutionMode::Chat => format!(
+                            "[HARNESS_HINT: Blueprint '{clipped_bp}' saved (1/turn). Call session_checkpoint(op=\"save\", stage=\"blueprint\"), output WEBMCP_NEXT_SESSION_PROMPT & ANTIGRAVITY_HANDOFF_PROMPT verbatim, & offer 2-4 choices.]"
+                        ),
+                        WebMcpExecutionMode::Task => format!(
+                            "[HARNESS_HINT: Blueprint '{clipped_bp}' saved. When the milestone finishes, call session_checkpoint(op=\"save\", stage=\"blueprint\") to update .airlock/HANDOFF.md.]"
+                        ),
+                    }
                 })
             } else {
                 None
             };
 
             // Check context-rot checkpoint threshold per workspace
+            let (rot_call_threshold, rot_byte_threshold) = match mode {
+                WebMcpExecutionMode::Chat => (CONTEXT_ROT_CALL_THRESHOLD, CONTEXT_ROT_BYTE_THRESHOLD),
+                WebMcpExecutionMode::Task => (
+                    TASK_CONTEXT_ROT_CALL_THRESHOLD,
+                    TASK_CONTEXT_ROT_BYTE_THRESHOLD,
+                ),
+            };
             let rot_nudge: Option<String> = {
                 let ws_state = sess.workspaces.entry(ws_key.to_string()).or_default();
                 if ws.is_some()
                     && !ws_state.checkpoint_nudge_emitted
-                    && (ws_state.calls_since_checkpoint >= CONTEXT_ROT_CALL_THRESHOLD
-                        || ws_state.bytes_since_checkpoint >= CONTEXT_ROT_BYTE_THRESHOLD)
+                    && (ws_state.calls_since_checkpoint >= rot_call_threshold
+                        || ws_state.bytes_since_checkpoint >= rot_byte_threshold)
                 {
                     ws_state.checkpoint_nudge_emitted = true;
                     Some(
@@ -900,5 +938,142 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[tokio::test]
+    async fn test_task_mode_uses_relaxed_rot_threshold_and_milestone_blueprint_nudge() {
+        let temp_dir = std::env::temp_dir().join("smart_mcp_harness_task_mode_test");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let state = AppState::new(temp_dir.clone());
+        let ws = crate::workspace::resolve_workspace(&state, None, None)
+            .await
+            .unwrap();
+        let mgr = WebMcpHarnessManager::default();
+
+        for i in 0..29 {
+            let mut out = ToolOutput {
+                text: format!("ok_{i}"),
+                is_error: false,
+            };
+            mgr.after_tool_call_with_mode(
+                &state,
+                Some("sess-task-rot"),
+                Some(&ws),
+                "list_workspaces",
+                &json!({}),
+                WebMcpExecutionMode::Task,
+                &mut out,
+            )
+            .await;
+            assert!(
+                !out.text.contains("session_checkpoint(op=\"save\")"),
+                "Task mode must not nudge before 30 calls (at call {i})"
+            );
+        }
+
+        let mut thirtieth = ToolOutput {
+            text: "ok_30".to_string(),
+            is_error: false,
+        };
+        mgr.after_tool_call_with_mode(
+            &state,
+            Some("sess-task-rot"),
+            Some(&ws),
+            "list_workspaces",
+            &json!({}),
+            WebMcpExecutionMode::Task,
+            &mut thirtieth,
+        )
+        .await;
+        assert!(thirtieth.text.contains("session_checkpoint(op=\"save\")"));
+
+        let mut bp_out = ToolOutput {
+            text: "Wrote .gemini/blueprints/01-task.md".to_string(),
+            is_error: false,
+        };
+        mgr.after_tool_call_with_mode(
+            &state,
+            Some("sess-task-bp"),
+            Some(&ws),
+            "write_file_jailed",
+            &json!({ "path": ".gemini/blueprints/01-task.md", "content": "# Task BP" }),
+            WebMcpExecutionMode::Task,
+            &mut bp_out,
+        )
+        .await;
+        assert!(bp_out.text.contains(".airlock/HANDOFF.md"));
+        assert!(!bp_out.text.contains("(1/turn)"));
+        assert!(!bp_out.text.contains("2-4 choices"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_task_mode_keeps_read_and_error_loop_guards_active() {
+        let temp_dir = std::env::temp_dir().join("smart_mcp_harness_task_loops_test");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let state = AppState::new(temp_dir.clone());
+        let ws = crate::workspace::resolve_workspace(&state, None, None)
+            .await
+            .unwrap();
+        let mgr = WebMcpHarnessManager::default();
+
+        let read_args = json!({ "path": "src/main.rs", "start_line": 1, "end_line": 40 });
+        for _ in 0..2 {
+            let mut r_out = ToolOutput {
+                text: "fn main() {}".to_string(),
+                is_error: false,
+            };
+            mgr.after_tool_call_with_mode(
+                &state,
+                Some("sess-task-loops"),
+                Some(&ws),
+                "read_file_range",
+                &read_args,
+                WebMcpExecutionMode::Task,
+                &mut r_out,
+            )
+            .await;
+            if r_out.text.contains("[HARNESS_HINT:") {
+                assert!(r_out.text.contains("2x with no edit"));
+            }
+        }
+
+        let err_args = json!({ "action": "run", "command": "cargo check" });
+        let mut e1 = ToolOutput {
+            text: "error[E0425]: cannot find value".to_string(),
+            is_error: true,
+        };
+        mgr.after_tool_call_with_mode(
+            &state,
+            Some("sess-task-loops"),
+            Some(&ws),
+            "run_command",
+            &err_args,
+            WebMcpExecutionMode::Task,
+            &mut e1,
+        )
+        .await;
+        let mut e2 = ToolOutput {
+            text: "error[E0425]: cannot find value".to_string(),
+            is_error: true,
+        };
+        mgr.after_tool_call_with_mode(
+            &state,
+            Some("sess-task-loops"),
+            Some(&ws),
+            "run_command",
+            &err_args,
+            WebMcpExecutionMode::Task,
+            &mut e2,
+        )
+        .await;
+        assert!(e2.text.contains("Repeated failure (2x)"), "got:\n{}", e2.text);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

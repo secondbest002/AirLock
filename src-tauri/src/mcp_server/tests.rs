@@ -621,7 +621,7 @@ async fn test_mcp_oauth2_pkce_flow_end_to_end() {
         .json()
         .await
         .unwrap();
-    assert_eq!(prm_list["result"]["prompts"].as_array().unwrap().len(), 5);
+    assert_eq!(prm_list["result"]["prompts"].as_array().unwrap().len(), 6);
 
     // 9. Revoking the OAuth client must immediately return 401 on subsequent /mcp calls
     oauth::revoke_oauth_client(&state, &client_id)
@@ -1464,7 +1464,7 @@ async fn test_mcp_skills_over_mcp_rpc_and_resource_read() {
         .await
         .unwrap();
     let skills_arr = list_val["result"]["skills"].as_array().unwrap();
-    assert_eq!(skills_arr.len(), 2);
+    assert_eq!(skills_arr.len(), 3);
     let rust_skill = skills_arr
         .iter()
         .find(|s| s["name"] == "rust-check")
@@ -2466,6 +2466,230 @@ async fn test_mcp_post_notification_echoes_session_id_and_sse_headers() {
         "SSE response must include X-Accel-Buffering: no"
     );
     let _ = slow_resp.text().await.unwrap();
+
+    handle.abort();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_execution_mode_precedence_and_invalid_fallback() {
+    let temp_dir = std::env::temp_dir().join("smart_mcp_exec_mode_precedence_test");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let state = Arc::new(AppState::new(temp_dir.clone()));
+    let token = state.auth_token.read().await.clone();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state.clone());
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}/mcp");
+
+    // 1. Default config = chat -> initialize includes airlock-blueprint-workflow
+    let r_def: Value = client
+        .post(&base)
+        .bearer_auth(&token)
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let instr_def = r_def["result"]["instructions"].as_str().unwrap();
+    assert!(instr_def.contains("airlock-blueprint-workflow"), "got:\n{instr_def}");
+
+    // 2. Config default = task -> initialize includes airlock-task-workflow
+    state.config.write().await.webmcp_execution_mode = "task".to_string();
+    let r_cfg_task: Value = client
+        .post(&base)
+        .bearer_auth(&token)
+        .json(&json!({"jsonrpc":"2.0","id":2,"method":"initialize"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let instr_cfg = r_cfg_task["result"]["instructions"].as_str().unwrap();
+    assert!(instr_cfg.contains("airlock-task-workflow"), "got:\n{instr_cfg}");
+
+    // 3. Header x-airlock-mode: chat overrides config default task
+    let r_hdr_chat: Value = client
+        .post(&base)
+        .bearer_auth(&token)
+        .header("x-airlock-mode", "chat")
+        .json(&json!({"jsonrpc":"2.0","id":3,"method":"initialize"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        r_hdr_chat["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("airlock-blueprint-workflow")
+    );
+
+    // 4. Query ?mode=task overrides header x-airlock-mode: chat
+    let r_qry_task: Value = client
+        .post(format!("{base}?mode=task"))
+        .bearer_auth(&token)
+        .header("x-airlock-mode", "chat")
+        .json(&json!({"jsonrpc":"2.0","id":4,"method":"initialize"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        r_qry_task["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("airlock-task-workflow")
+    );
+
+    // 5. Invalid ?mode=bogus falls back cleanly to header -> config -> chat
+    state.config.write().await.webmcp_execution_mode = "invalid_cfg".to_string();
+    let r_bogus: Value = client
+        .post(format!("{base}?mode=bogus"))
+        .bearer_auth(&token)
+        .header("x-airlock-mode", "invalid_hdr")
+        .json(&json!({"jsonrpc":"2.0","id":5,"method":"initialize"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        r_bogus["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("airlock-blueprint-workflow")
+    );
+
+    handle.abort();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_oauth_401_preserves_mode_query_without_token() {
+    let temp_dir = std::env::temp_dir().join("smart_mcp_oauth_401_mode_test");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let state = Arc::new(AppState::new(temp_dir.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state);
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let client = reqwest::Client::new();
+    let unauth = client
+        .post(format!("http://{addr}/mcp?profile=compact&mode=task&token=wrongsecret"))
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+    let www_auth = unauth
+        .headers()
+        .get("www-authenticate")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(www_auth.contains("profile=compact"), "got: {www_auth}");
+    assert!(www_auth.contains("mode=task"), "got: {www_auth}");
+    assert!(!www_auth.contains("wrongsecret"), "token leaked: {www_auth}");
+
+    handle.abort();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_task_mode_auto_enables_sse_keepalive_only_when_accepted() {
+    let temp_dir = std::env::temp_dir().join("smart_mcp_task_auto_sse_test");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let state = Arc::new(AppState::new(temp_dir.clone()));
+    state.config.write().await.webmcp_sse_keepalive = false;
+    let token = state.auth_token.read().await.clone();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state);
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/mcp?mode=task");
+
+    // 1. JSON-only client receives application/json even in mode=task
+    let json_resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .header("Accept", "application/json")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "list_workspaces", "arguments": {} }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(json_resp.status(), StatusCode::OK);
+    let ct_json = json_resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(ct_json.contains("application/json"), "expected JSON, got {ct_json}");
+
+    // 2. Client with Accept: text/event-stream triggers SSE keepalive on >3s call even when global toggle=false
+    let slow_cmd = if cfg!(target_os = "windows") {
+        "ping -n 5 127.0.0.1 >NUL && echo task_sse_ok"
+    } else {
+        "sleep 4 && echo task_sse_ok"
+    };
+    let sse_resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "run_command",
+                "arguments": { "action": "run", "command": slow_cmd }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sse_resp.status(), StatusCode::OK);
+    assert_eq!(
+        sse_resp
+            .headers()
+            .get("x-accel-buffering")
+            .and_then(|v| v.to_str().ok()),
+        Some("no")
+    );
+    let _ = sse_resp.text().await.unwrap();
 
     handle.abort();
     let _ = fs::remove_dir_all(&temp_dir);

@@ -1,3 +1,4 @@
+use crate::config::WebMcpExecutionMode;
 use crate::jobs::{self, JobStatus};
 use crate::state::{AppState, AuditEntry};
 use crate::workspace::ResolvedWorkspace;
@@ -6,9 +7,6 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::time::Duration;
-use tokio::process::Command;
 
 const MAX_CHECKPOINT_JSON_BYTES: usize = 8192;
 
@@ -127,6 +125,13 @@ fn format_skills_hint(cp: &SessionCheckpoint) -> String {
 }
 
 pub(crate) fn build_webmcp_next_session_prompt(cp: &SessionCheckpoint) -> String {
+    build_webmcp_next_session_prompt_for_mode(cp, WebMcpExecutionMode::Chat)
+}
+
+pub(crate) fn build_webmcp_next_session_prompt_for_mode(
+    cp: &SessionCheckpoint,
+    mode: WebMcpExecutionMode,
+) -> String {
     let stage = effective_checkpoint_stage(cp);
     let bps = collected_blueprint_paths(cp);
     let bp_ref = bps.first().cloned().unwrap_or_default();
@@ -138,8 +143,48 @@ pub(crate) fn build_webmcp_next_session_prompt(cp: &SessionCheckpoint) -> String
     let skills_hint = format_skills_hint(cp);
     let details = format_checkpoint_metadata_lines(cp);
 
-    let body = match stage.as_str() {
-        "inspect" => format!(
+    let body = match (mode, stage.as_str()) {
+        (WebMcpExecutionMode::Task, "inspect") => format!(
+            "At workspace '@{}', resume Task Mode from checkpoint (`session_checkpoint(op=\"load\", workspace=\"{}\")` or `airlock://workspace/checkpoint`) and read `.airlock/HANDOFF.md`.\n\
+             1. SKILLS: Call `list_skills`, load `airlock-task-workflow`, and {skills_hint}.\n\
+             2. PRE-FLIGHT CHECKUP: Verify inspected files/symbols against the live codebase via `batch_inspect` + `lsp_query`.\n\
+             3. AUTONOMOUS MILESTONE: Complete the research & full blueprint deliverable under `.gemini/blueprints/` (or complete the adversarial review) in this run without pausing per file.\n\
+             4. CHECKPOINT: Save `session_checkpoint(op=\"save\", stage=\"blueprint\"|\"inspect\", ...)` at milestone completion so `.airlock/HANDOFF.md` stays ready for Antigravity.",
+            cp.workspace_alias,
+            cp.workspace_alias,
+        ),
+        (WebMcpExecutionMode::Task, "blueprint") => {
+            let bp_target = if bp_ref.is_empty() {
+                "the target blueprint in '.gemini/blueprints/'".to_string()
+            } else {
+                format!("blueprint '{bp_ref}'{bp_list_note}")
+            };
+            format!(
+                "At workspace '@{}', execute Task Mode autonomous milestone: read `.airlock/HANDOFF.md`, {bp_target}, and `airlock://workspace/checkpoint` (or `session_checkpoint(op=\"load\", workspace=\"{}\")`).\n\
+                 1. SKILLS: Call `list_skills`, load `airlock-task-workflow`, and {skills_hint}.\n\
+                 2. PRE-FLIGHT CHECKUP: Run `batch_inspect` to verify target files, symbols, and invariants in {bp_target} match the live codebase BEFORE editing.\n\
+                 3. CLOSED-LOOP EXECUTION: Implement {bp_target} and run verification (`multi_surgical_edit` with `post_check_lsp: true` + `run_command` tests/build) until green; pause only on design ambiguity or destructive risk.\n\
+                 4. CHECKPOINT: Save `session_checkpoint(op=\"save\", stage=\"implement\", ...)` when the milestone finishes.",
+                cp.workspace_alias,
+                cp.workspace_alias,
+            )
+        }
+        (WebMcpExecutionMode::Task, _) => {
+            let bp_clause = if bp_ref.is_empty() {
+                String::new()
+            } else {
+                format!(" and blueprint '{bp_ref}'{bp_list_note}")
+            };
+            format!(
+                "At workspace '@{}', continue Task Mode autonomous execution: read `.airlock/HANDOFF.md`{bp_clause} and `airlock://workspace/checkpoint` (or `session_checkpoint(op=\"load\", workspace=\"{}\")`).\n\
+                 1. SKILLS: Ensure `airlock-task-workflow` is loaded via `list_skills` and {skills_hint}.\n\
+                 2. PRE-FLIGHT CHECKUP: Inspect live drift vs remaining work via `batch_inspect` before editing.\n\
+                 3. FINISH & VERIFY: Complete remaining milestone steps, iterate on diagnostics/test failures until green, then save `session_checkpoint(op=\"save\", stage=\"implement\", ...)`.",
+                cp.workspace_alias,
+                cp.workspace_alias,
+            )
+        }
+        (WebMcpExecutionMode::Chat, "inspect") => format!(
             "At workspace '@{}', resume from checkpoint (`session_checkpoint(op=\"load\", workspace=\"{}\")` or `airlock://workspace/checkpoint`) and read `.airlock/HANDOFF.md`.\n\
              1. SKILLS: Call `list_skills`, load `airlock-blueprint-workflow`, and {skills_hint}.\n\
              2. PRE-FLIGHT CHECKUP: Verify the inspected files/symbols and `.airlock/HANDOFF.md` against the live codebase via `batch_inspect` before drafting.\n\
@@ -148,7 +193,7 @@ pub(crate) fn build_webmcp_next_session_prompt(cp: &SessionCheckpoint) -> String
             cp.workspace_alias,
             cp.workspace_alias,
         ),
-        "blueprint" => {
+        (WebMcpExecutionMode::Chat, "blueprint") => {
             let bp_target = if bp_ref.is_empty() {
                 "the target blueprint in '.gemini/blueprints/'".to_string()
             } else {
@@ -164,7 +209,7 @@ pub(crate) fn build_webmcp_next_session_prompt(cp: &SessionCheckpoint) -> String
                 cp.workspace_alias,
             )
         }
-        _ => {
+        (WebMcpExecutionMode::Chat, _) => {
             let bp_clause = if bp_ref.is_empty() {
                 String::new()
             } else {
@@ -183,6 +228,15 @@ pub(crate) fn build_webmcp_next_session_prompt(cp: &SessionCheckpoint) -> String
     };
 
     format!("{body}\n{}", details.join("\n"))
+}
+
+pub(crate) fn build_fallback_antigravity_handoff_prompt(ws_alias: &str) -> String {
+    format!(
+        "At workspace '@{ws_alias}', read '.airlock/HANDOFF.md' (and any files under '.airlock/handoff/' or '.gemini/blueprints/').\n\
+         1. SKILLS: Call `list_skills` and load matching task/architecture/verification skills via `load_skill`.\n\
+         2. PRE-FLIGHT & FIELD AUDIT: Inspect live codebase state and recent diffs against the handoff summary before editing.\n\
+         3. EXECUTE & VERIFY: Continue/implement remaining steps and run full tests/build to verify."
+    )
 }
 
 pub(crate) fn is_blueprint_doc_path(path: &str) -> bool {
@@ -318,23 +372,10 @@ pub(crate) fn peek_checkpoint_next_step(
 }
 
 async fn run_git_capture(root: &Path, args: &[&str]) -> Option<(i32, String)> {
-    let mut cmd = Command::new("git");
-    cmd.args(args)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(0x08000000);
-
-    let out = tokio::time::timeout(Duration::from_secs(5), cmd.output())
+    crate::process_util::run_git_command_bounded(root, args, true, 6)
         .await
-        .ok()?
-        .ok()?;
-    let code = out.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    Some((code, stdout))
+        .ok()
+        .map(|(code, stdout, _)| (code, stdout))
 }
 
 async fn collect_git_state(root: &Path) -> (Option<String>, Vec<String>) {
@@ -577,6 +618,16 @@ pub(crate) async fn exec_session_checkpoint(
     ws: &ResolvedWorkspace,
     args: &Value,
 ) -> Result<String, String> {
+    exec_session_checkpoint_with_mode(state, source, ws, args, WebMcpExecutionMode::Chat).await
+}
+
+pub(crate) async fn exec_session_checkpoint_with_mode(
+    state: &AppState,
+    source: &str,
+    ws: &ResolvedWorkspace,
+    args: &Value,
+    mode: WebMcpExecutionMode,
+) -> Result<String, String> {
     let op = args
         .get("op")
         .and_then(|v| v.as_str())
@@ -782,7 +833,7 @@ pub(crate) async fn exec_session_checkpoint(
                 }
             }
 
-            let webmcp_prompt = build_webmcp_next_session_prompt(&cp);
+            let webmcp_prompt = build_webmcp_next_session_prompt_for_mode(&cp, mode);
             let handoff_prompt = build_antigravity_handoff_prompt(&cp);
             Ok(format!(
                 "CHECKPOINT_SAVED: workspace=@{} stage={} updated_at={} git_head={} touched={} running_jobs={}{}\nResume in any new chat with: session_checkpoint(op=\"load\", workspace=\"{}\") or resource airlock://workspace/checkpoint.\nWEBMCP_NEXT_SESSION_PROMPT:\n```text\n{}\n```\nANTIGRAVITY_HANDOFF_PROMPT:\n```text\n{}\n```",
@@ -1260,5 +1311,48 @@ mod tests {
         assert!(build_webmcp_next_session_prompt(&legacy_cp).contains("legacy.md"));
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_task_mode_next_session_prompt_omits_single_phase_cap() {
+        let cp = SessionCheckpoint {
+            workspace_id: "ws1".to_string(),
+            workspace_alias: "repo".to_string(),
+            updated_at: "2026-11-28 00:00:00".to_string(),
+            goal: "Ship dual mode".to_string(),
+            status: None,
+            decisions: vec!["Keep Chat mode intact".to_string()],
+            completed: vec![],
+            next_steps: vec!["Verify tests".to_string()],
+            open_issues: vec![],
+            model_notes: String::new(),
+            git_head_short: None,
+            git_status_short: vec![],
+            recent_touched_files: vec![],
+            running_job_ids: vec![],
+            last_audit_group_id: None,
+            blueprint_path: Some(".gemini/blueprints/01-dual.md".to_string()),
+            stage: Some("blueprint".to_string()),
+            blueprint_paths: vec![".gemini/blueprints/01-dual.md".to_string()],
+            recommended_skills: vec!["test-driven-development".to_string()],
+        };
+
+        let chat_prompt = build_webmcp_next_session_prompt_for_mode(&cp, WebMcpExecutionMode::Chat);
+        assert!(chat_prompt.contains("airlock-blueprint-workflow"));
+        assert!(chat_prompt.contains("ONLY ONE phase"));
+        assert!(chat_prompt.contains("2-4 concise choices"));
+
+        let task_prompt = build_webmcp_next_session_prompt_for_mode(&cp, WebMcpExecutionMode::Task);
+        assert!(task_prompt.contains("airlock-task-workflow"));
+        assert!(!task_prompt.contains("ONLY ONE phase"));
+        assert!(!task_prompt.contains("2-4 concise choices"));
+    }
+
+    #[test]
+    fn test_fallback_antigravity_handoff_prompt_references_workspace_and_handoff_md() {
+        let prompt = build_fallback_antigravity_handoff_prompt("my-app");
+        assert!(prompt.contains("@my-app"));
+        assert!(prompt.contains(".airlock/HANDOFF.md"));
+        assert!(prompt.contains("list_skills"));
     }
 }

@@ -10,10 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::process::Command;
 use tokio::sync::{Mutex, RwLock};
 
 pub(crate) const HANDOFF_MD_REL: &str = ".airlock/HANDOFF.md";
@@ -86,6 +83,7 @@ struct CachedHandoffContext {
     artifacts: Vec<ArtifactDocument>,
     checkpoint: Option<SessionCheckpoint>,
     delegated: Option<DelegatedRunResult>,
+    execution_mode: crate::config::WebMcpExecutionMode,
 }
 
 #[derive(Default)]
@@ -155,23 +153,10 @@ fn write_text_atomic(path: &Path, content: &str) -> Result<(), String> {
 }
 
 async fn run_git_bounded(root: &Path, args: &[&str], timeout_secs: u64) -> Option<(i32, String)> {
-    let mut cmd = Command::new("git");
-    cmd.args(args)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(0x08000000);
-
-    let out = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output())
+    crate::process_util::run_git_command_bounded(root, args, true, timeout_secs)
         .await
-        .ok()?
-        .ok()?;
-    let code = out.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    Some((code, stdout))
+        .ok()
+        .map(|(code, stdout, _)| (code, stdout))
 }
 
 async fn collect_secrets_to_redact(state: &AppState) -> Vec<String> {
@@ -255,7 +240,7 @@ async fn ensure_git_info_exclude(
         dot_git.join("info").join("exclude")
     } else if dot_git.is_file() {
         let Some((0, rel_or_abs)) =
-            run_git_bounded(ws_canon_root, &["rev-parse", "--git-path", "info/exclude"], 2).await
+            run_git_bounded(ws_canon_root, &["rev-parse", "--git-path", "info/exclude"], 6).await
         else {
             return Ok(());
         };
@@ -359,7 +344,7 @@ async fn collect_git_snapshot(root: &Path) -> (bool, Option<String>, Option<Stri
         return (false, AppState::read_git_branch(root), None, Vec::new(), false);
     }
     let branch = AppState::read_git_branch(root);
-    let has_head_res = run_git_bounded(root, &["rev-parse", "--short", "HEAD"], 2).await;
+    let has_head_res = run_git_bounded(root, &["rev-parse", "--short", "HEAD"], 6).await;
     let (has_head, head_short) = match has_head_res {
         Some((0, txt)) => {
             let t = txt.trim().to_string();
@@ -372,7 +357,7 @@ async fn collect_git_snapshot(root: &Path) -> (bool, Option<String>, Option<Stri
         _ => (false, None),
     };
 
-    let status_lines = match run_git_bounded(root, &["status", "--porcelain", "--untracked-files=all"], 2).await {
+    let status_lines = match run_git_bounded(root, &["status", "--porcelain", "--untracked-files=all"], 6).await {
         Some((0, txt)) => txt
             .lines()
             .map(|l| l.trim_end().to_string())
@@ -449,7 +434,7 @@ async fn collect_latest_diff(
                     ":(exclude).airlock/HANDOFF.md",
                     ":(exclude).airlock/handoff",
                 ],
-                2,
+                6,
             )
             .await
             {
@@ -479,7 +464,7 @@ async fn collect_latest_diff(
                     ":(exclude).airlock/handoff",
                 ],
             ] {
-                if let Some((0, txt)) = run_git_bounded(&ws.canon_root, &args, 2).await {
+                if let Some((0, txt)) = run_git_bounded(&ws.canon_root, &args, 6).await {
                     let trimmed = txt.trim_end();
                     if !trimmed.is_empty() {
                         total_bytes += trimmed.len();
@@ -1012,6 +997,7 @@ fn render_progress_md(
     out.join("\n\n")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_handoff_bundle(
     ws: &ResolvedWorkspace,
     updated_at: &str,
@@ -1029,6 +1015,7 @@ async fn write_handoff_bundle(
     delegated: Option<&DelegatedRunResult>,
     latest_diff: &str,
     secrets: &[String],
+    execution_mode: crate::config::WebMcpExecutionMode,
 ) -> Result<String, String> {
     let cp_path = resolve_jailed_path(&ws.canon_root, &format!("{HANDOFF_DIR_REL}/checkpoint.json"))?;
     let prompts_path = resolve_jailed_path(&ws.canon_root, &format!("{HANDOFF_DIR_REL}/prompts.md"))?;
@@ -1038,12 +1025,21 @@ async fn write_handoff_bundle(
         write_text_atomic(&cp_path, &redact_secrets(secrets, &cp_json))?;
 
         let stage = crate::checkpoints::effective_checkpoint_stage(cp);
-        let webmcp_prompt = crate::checkpoints::build_webmcp_next_session_prompt(cp);
+        let webmcp_prompt =
+            crate::checkpoints::build_webmcp_next_session_prompt_for_mode(cp, execution_mode);
+        let webmcp_heading = match execution_mode {
+            crate::config::WebMcpExecutionMode::Chat => {
+                "Option 1: Continue in Gemini WebMCP (Multi-Turn Self-Pacing)"
+            }
+            crate::config::WebMcpExecutionMode::Task => {
+                "Option 1: Continue in Gemini Task Mode (Autonomous Milestone)"
+            }
+        };
         let antigravity_prompt = crate::checkpoints::build_antigravity_handoff_prompt(cp);
         let prompts_md = format!(
             "# Next-Session Handoff Prompts — @{}\n\n\
              Updated: `{updated_at}` | Stage: `{stage}`\n\n\
-             ## Option 1: Continue in Gemini WebMCP (Multi-Turn Self-Pacing)\n\n\
+             ## {webmcp_heading}\n\n\
              ```text\n{}\n```\n\n\
              ## Option 2: Handoff to Google Antigravity (Field Audit + Full Execution)\n\n\
              ```text\n{}\n```\n",
@@ -1249,6 +1245,10 @@ pub(crate) async fn prime_job_handoff_context(state: &AppState, ws: &ResolvedWor
         .cloned();
     let (touched_files_status, last_group_id) =
         build_touched_files_status(checkpoint.as_ref(), &audit_records);
+    let execution_mode = crate::config::WebMcpExecutionMode::parse(
+        &state.config.read().await.webmcp_execution_mode,
+    )
+    .unwrap_or_default();
 
     let ctx = CachedHandoffContext {
         secrets_to_redact: secrets,
@@ -1258,6 +1258,7 @@ pub(crate) async fn prime_job_handoff_context(state: &AppState, ws: &ResolvedWor
         artifacts,
         checkpoint,
         delegated,
+        execution_mode,
     };
     state
         .handoff_manager
@@ -1325,6 +1326,11 @@ pub(crate) async fn sync_from_state(
         None
     };
 
+    let execution_mode = crate::config::WebMcpExecutionMode::parse(
+        &state.config.read().await.webmcp_execution_mode,
+    )
+    .unwrap_or_default();
+
     coord.cached_ctx.write().await.insert(
         ws.id.clone(),
         CachedHandoffContext {
@@ -1335,6 +1341,7 @@ pub(crate) async fn sync_from_state(
             artifacts: artifacts.clone(),
             checkpoint: checkpoint.clone(),
             delegated: delegated.clone(),
+            execution_mode,
         },
     );
 
@@ -1355,6 +1362,7 @@ pub(crate) async fn sync_from_state(
         delegated.as_ref(),
         &latest_diff,
         &secrets,
+        execution_mode,
     )
     .await
 }
@@ -1380,27 +1388,37 @@ pub(crate) async fn sync_after_job_finished(
     }
 
     let cached_opt = coordinator.cached_ctx.read().await.get(&ws.id).cloned();
-    let (secrets, audit_records, touched_files, last_group_id, artifacts, checkpoint, delegated) =
-        match cached_opt {
-            Some(c) => (
-                c.secrets_to_redact,
-                c.audit_records,
-                c.touched_files_status,
-                c.last_group_id,
-                c.artifacts,
-                c.checkpoint,
-                c.delegated,
-            ),
-            None => (
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                None,
-                Vec::new(),
-                None,
-                None,
-            ),
-        };
+    let (
+        secrets,
+        audit_records,
+        touched_files,
+        last_group_id,
+        artifacts,
+        checkpoint,
+        delegated,
+        execution_mode,
+    ) = match cached_opt {
+        Some(c) => (
+            c.secrets_to_redact,
+            c.audit_records,
+            c.touched_files_status,
+            c.last_group_id,
+            c.artifacts,
+            c.checkpoint,
+            c.delegated,
+            c.execution_mode,
+        ),
+        None => (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+            None,
+            None,
+            crate::config::WebMcpExecutionMode::Chat,
+        ),
+    };
 
     let jobs = collect_webmcp_job_snapshots(&jobs_map, &ws.alias, &secrets, 5, 30).await;
     let (is_git, branch, head_short, status_lines, has_head) =
@@ -1431,6 +1449,7 @@ pub(crate) async fn sync_after_job_finished(
         delegated.as_ref(),
         &latest_diff,
         &secrets,
+        execution_mode,
     )
     .await;
 }
