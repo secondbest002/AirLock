@@ -507,6 +507,11 @@ export function renderPluginsView(
   snap: DashboardSnapshot,
   onSnapshot: (snap: DashboardSnapshot) => void
 ): void {
+  const pluginsCount = document.getElementById("hub-plugins-count");
+  if (pluginsCount) pluginsCount.textContent = String((snap.plugins ?? []).length);
+  const skillsCount = document.getElementById("hub-skills-count");
+  if (skillsCount) skillsCount.textContent = String((snap.skills ?? []).length);
+
   renderPluginsTable(snap.plugins ?? [], onSnapshot);
   renderSkillsTable(snap.skills ?? [], onSnapshot);
 }

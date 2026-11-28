@@ -3,11 +3,200 @@ import { $, setToast } from "../dom";
 import type { AuditAddedPayload, AuditEntry, DashboardSnapshot } from "../types";
 import { openRevertConflictModal } from "./modals";
 
+type DiffViewMode = "unified" | "split";
+
+interface UnifiedRow {
+  kind: "hunk" | "meta" | "ctx" | "add" | "del";
+  oldLn: number | null;
+  newLn: number | null;
+  text: string;
+}
+
+interface SplitCell {
+  kind: "ctx" | "add" | "del" | "empty";
+  ln: number | null;
+  text: string;
+}
+
+interface SplitRow {
+  kind: "hunk" | "meta" | "pair";
+  bannerText?: string;
+  left?: SplitCell;
+  right?: SplitCell;
+}
+
+interface ParsedDiffData {
+  added: number;
+  removed: number;
+  unified: UnifiedRow[];
+  split: SplitRow[];
+}
+
+const DIFF_MODE_KEY = "airlock_diff_mode";
+const narrowDiffQuery = window.matchMedia("(max-width: 1040px)");
+
 let selectedAuditId: string | null = null;
 let auditSearchQuery = "";
 let auditSourceFilter = "ALL";
 let auditRevertableOnly = false;
 let snapGetterRef: (() => DashboardSnapshot | null) | null = null;
+let diffViewMode: DiffViewMode = (() => {
+  try {
+    return localStorage.getItem(DIFF_MODE_KEY) === "split" ? "split" : "unified";
+  } catch {
+    return "unified";
+  }
+})();
+
+function parseUnifiedDiffRows(diffText: string): ParsedDiffData {
+  const lines = diffText.split("\n");
+  const unified: UnifiedRow[] = [];
+  const split: SplitRow[] = [];
+  const hunkRe = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
+
+  let oldLine = 1;
+  let newLine = 1;
+  let hasSeenHunk = false;
+  let added = 0;
+  let removed = 0;
+  let pendingDels: Array<{ ln: number; text: string }> = [];
+  let pendingAdds: Array<{ ln: number; text: string }> = [];
+
+  const flushPending = (): void => {
+    const count = Math.max(pendingDels.length, pendingAdds.length);
+    for (let i = 0; i < count; i++) {
+      const delItem = pendingDels[i];
+      const addItem = pendingAdds[i];
+      split.push({
+        kind: "pair",
+        left: delItem
+          ? { kind: "del", ln: delItem.ln, text: delItem.text }
+          : { kind: "empty", ln: null, text: "" },
+        right: addItem
+          ? { kind: "add", ln: addItem.ln, text: addItem.text }
+          : { kind: "empty", ln: null, text: "" },
+      });
+    }
+    pendingDels = [];
+    pendingAdds = [];
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    const hunkMatch = hunkRe.exec(line);
+    if (hunkMatch) {
+      flushPending();
+      hasSeenHunk = true;
+      oldLine = Number.parseInt(hunkMatch[1], 10) || 1;
+      newLine = Number.parseInt(hunkMatch[2], 10) || 1;
+      unified.push({ kind: "hunk", oldLn: null, newLn: null, text: line });
+      split.push({ kind: "hunk", bannerText: line });
+      continue;
+    }
+
+    if (
+      line.startsWith("diff --git") ||
+      line.startsWith("index ") ||
+      line.startsWith("--- ") ||
+      line.startsWith("+++ ")
+    ) {
+      flushPending();
+      unified.push({ kind: "meta", oldLn: null, newLn: null, text: line });
+      split.push({ kind: "meta", bannerText: line });
+      continue;
+    }
+
+    if (line.startsWith("+")) {
+      added += 1;
+      const ln = newLine++;
+      unified.push({ kind: "add", oldLn: null, newLn: ln, text: line });
+      pendingAdds.push({ ln, text: line });
+      continue;
+    }
+
+    if (line.startsWith("-")) {
+      removed += 1;
+      const ln = oldLine++;
+      unified.push({ kind: "del", oldLn: ln, newLn: null, text: line });
+      pendingDels.push({ ln, text: line });
+      continue;
+    }
+
+    flushPending();
+    if (!hasSeenHunk && line === "\\ No newline at end of file") {
+      unified.push({ kind: "meta", oldLn: null, newLn: null, text: line });
+      split.push({ kind: "meta", bannerText: line });
+      continue;
+    }
+
+    const oLn = oldLine++;
+    const nLn = newLine++;
+    unified.push({ kind: "ctx", oldLn: oLn, newLn: nLn, text: line });
+    split.push({
+      kind: "pair",
+      left: { kind: "ctx", ln: oLn, text: line },
+      right: { kind: "ctx", ln: nLn, text: line },
+    });
+  }
+
+  flushPending();
+  return { added, removed, unified, split };
+}
+
+function syncDiffModeButtons(): void {
+  const uniBtn = document.getElementById("btn-diff-unified");
+  const splitBtn = document.getElementById("btn-diff-split");
+  const isSplit = diffViewMode === "split";
+  if (uniBtn) {
+    uniBtn.classList.toggle("active", !isSplit);
+    uniBtn.setAttribute("aria-pressed", isSplit ? "false" : "true");
+  }
+  if (splitBtn) {
+    splitBtn.classList.toggle("active", isSplit);
+    splitBtn.setAttribute("aria-pressed", isSplit ? "true" : "false");
+  }
+}
+
+function renderDiffStats(added: number, removed: number): void {
+  const statsEl = document.getElementById("diff-stats");
+  if (!statsEl) return;
+  if (added === 0 && removed === 0) {
+    statsEl.hidden = true;
+    statsEl.replaceChildren();
+    return;
+  }
+
+  statsEl.hidden = false;
+  const addSpan = document.createElement("span");
+  addSpan.className = "diffstat-add";
+  addSpan.textContent = `+${added}`;
+
+  const delSpan = document.createElement("span");
+  delSpan.className = "diffstat-del";
+  delSpan.textContent = `-${removed}`;
+
+  const blocksWrap = document.createElement("span");
+  blocksWrap.className = "diffstat-blocks";
+  blocksWrap.setAttribute("aria-hidden", "true");
+
+  const total = added + removed;
+  const addBlocks = total > 0 ? Math.round((added / total) * 5) : 0;
+  const clampedAdd = added > 0 && addBlocks === 0 ? 1 : added === 0 ? 0 : Math.min(5, addBlocks);
+  const delBlocks = removed > 0 ? Math.max(1, Math.min(5 - clampedAdd, 5)) : 0;
+
+  for (let i = 0; i < 5; i++) {
+    const blk = document.createElement("span");
+    blk.className =
+      i < clampedAdd
+        ? "diffstat-block is-add"
+        : i < clampedAdd + delBlocks
+          ? "diffstat-block is-del"
+          : "diffstat-block is-neutral";
+    blocksWrap.appendChild(blk);
+  }
+
+  statsEl.replaceChildren(addSpan, delSpan, blocksWrap);
+}
 
 function matchesAuditFilter(entry: AuditEntry): boolean {
   if (auditSourceFilter !== "ALL" && entry.source !== auditSourceFilter) {
@@ -40,6 +229,13 @@ function buildAuditItem(
     renderDiffInspector(found);
   });
 
+  const dot = document.createElement("span");
+  dot.className = `audit-timeline-dot ${
+    entry.reverted ? "is-reverted" : entry.can_revert ? "is-revertable" : "is-info"
+  }`;
+  dot.setAttribute("aria-hidden", "true");
+  btn.appendChild(dot);
+
   const top = document.createElement("div");
   top.className = "audit-item-top";
 
@@ -57,7 +253,7 @@ function buildAuditItem(
   summary.textContent = entry.target_path ? `${entry.target_path} — ${entry.summary}` : entry.summary;
 
   btn.append(top, summary);
-  if (entry.workspace_alias || entry.group_id) {
+  if (entry.workspace_alias || entry.group_id || entry.tokens_saved > 0) {
     const pillsRow = document.createElement("div");
     pillsRow.className = "audit-pills-row";
     if (entry.workspace_alias) {
@@ -71,6 +267,12 @@ function buildAuditItem(
       pill.className = "group-pill";
       pill.textContent = entry.group_id;
       pillsRow.appendChild(pill);
+    }
+    if (entry.tokens_saved > 0) {
+      const tokPill = document.createElement("span");
+      tokPill.className = "audit-tok-pill";
+      tokPill.textContent = `-${entry.tokens_saved} tok`;
+      pillsRow.appendChild(tokPill);
     }
     btn.appendChild(pillsRow);
   }
@@ -92,6 +294,7 @@ export function renderDiffInspector(entry: AuditEntry | null): void {
     titleEl.textContent = "Visual Diff Inspector";
     metaEl.textContent =
       "Pilih entri log di sebelah kiri untuk melihat detail atau melakukan 1-Click Revert.";
+    renderDiffStats(0, 0);
     revertBtn.disabled = true;
     groupBtn.hidden = true;
     groupBtn.disabled = true;
@@ -130,6 +333,7 @@ export function renderDiffInspector(entry: AuditEntry | null): void {
   explorerBtn.disabled = !hasTargetPath;
 
   if (!entry.diff_text) {
+    renderDiffStats(0, 0);
     const pre = document.createElement("div");
     pre.className = "diff-line";
     pre.textContent = entry.summary;
@@ -137,25 +341,82 @@ export function renderDiffInspector(entry: AuditEntry | null): void {
     return;
   }
 
-  const lines = entry.diff_text.split("\n");
-  lines.forEach((line, idx) => {
-    const div = document.createElement("div");
-    div.className = "diff-line";
-    if (line.startsWith("+") && !line.startsWith("+++")) {
-      div.classList.add("diff-add");
-    } else if (line.startsWith("-") && !line.startsWith("---")) {
-      div.classList.add("diff-del");
-    } else if (line.startsWith("@@")) {
-      div.classList.add("diff-hunk");
+  const parsed = parseUnifiedDiffRows(entry.diff_text);
+  renderDiffStats(parsed.added, parsed.removed);
+
+  const effectiveMode: DiffViewMode =
+    diffViewMode === "split" && !narrowDiffQuery.matches ? "split" : "unified";
+
+  if (effectiveMode === "split") {
+    const grid = document.createElement("div");
+    grid.className = "diff-split-grid";
+    for (const row of parsed.split) {
+      if (row.kind !== "pair") {
+        const banner = document.createElement("div");
+        banner.className = `diff-split-banner ${row.kind === "hunk" ? "diff-hunk" : "diff-meta-line"}`;
+        banner.textContent = row.bannerText ?? "";
+        grid.appendChild(banner);
+        continue;
+      }
+
+      const makeCell = (cell: SplitCell | undefined, sideClass: string): HTMLDivElement => {
+        const el = document.createElement("div");
+        el.className = `diff-split-cell ${sideClass} ${
+          cell?.kind === "add"
+            ? "diff-add"
+            : cell?.kind === "del"
+              ? "diff-del"
+              : cell?.kind === "empty"
+                ? "diff-cell-empty"
+                : ""
+        }`.trim();
+        const ln = document.createElement("span");
+        ln.className = "diff-ln";
+        ln.textContent = cell?.ln !== null && cell?.ln !== undefined ? String(cell.ln) : "";
+        const code = document.createElement("span");
+        code.className = "diff-code";
+        code.textContent = cell?.text ?? "";
+        el.append(ln, code);
+        return el;
+      };
+
+      grid.append(makeCell(row.left, "diff-split-left"), makeCell(row.right, "diff-split-right"));
     }
-    const ln = document.createElement("span");
-    ln.className = "diff-ln";
-    ln.textContent = line.startsWith("@@") ? "..." : String(idx + 1);
+    viewerEl.appendChild(grid);
+    return;
+  }
+
+  for (const row of parsed.unified) {
+    const div = document.createElement("div");
+    div.className = `diff-line diff-unified-row ${
+      row.kind === "add"
+        ? "diff-add"
+        : row.kind === "del"
+          ? "diff-del"
+          : row.kind === "hunk"
+            ? "diff-hunk"
+            : row.kind === "meta"
+              ? "diff-meta-line"
+              : ""
+    }`.trim();
+
+    const oldLn = document.createElement("span");
+    oldLn.className = "diff-ln";
+    oldLn.textContent =
+      row.kind === "hunk" ? "..." : row.oldLn !== null ? String(row.oldLn) : "";
+
+    const newLn = document.createElement("span");
+    newLn.className = "diff-ln";
+    newLn.textContent =
+      row.kind === "hunk" ? "..." : row.newLn !== null ? String(row.newLn) : "";
+
     const code = document.createElement("span");
-    code.textContent = line;
-    div.append(ln, code);
+    code.className = "diff-code";
+    code.textContent = row.text;
+
+    div.append(oldLn, newLn, code);
     viewerEl.appendChild(div);
-  });
+  }
 }
 
 export function renderAuditList(
@@ -244,6 +505,33 @@ export function initAuditView(
   onRefresh: () => Promise<void>
 ): void {
   snapGetterRef = getSnap;
+  syncDiffModeButtons();
+
+  const setMode = (mode: DiffViewMode): void => {
+    diffViewMode = mode;
+    try {
+      localStorage.setItem(DIFF_MODE_KEY, mode);
+    } catch {
+      // ignore storage errors
+    }
+    syncDiffModeButtons();
+    const snap = getSnap();
+    const selected = snap?.audit_logs.find((e) => e.id === selectedAuditId) ?? null;
+    if (selected) {
+      renderDiffInspector(selected);
+    }
+  };
+
+  $("btn-diff-unified").addEventListener("click", () => setMode("unified"));
+  $("btn-diff-split").addEventListener("click", () => setMode("split"));
+  narrowDiffQuery.addEventListener("change", () => {
+    const snap = getSnap();
+    const selected = snap?.audit_logs.find((e) => e.id === selectedAuditId) ?? null;
+    if (selected && diffViewMode === "split") {
+      renderDiffInspector(selected);
+    }
+  });
+
   $("btn-refresh-audit").addEventListener("click", () => void onRefresh());
 
   $("audit-search-input").addEventListener("input", (e) => {

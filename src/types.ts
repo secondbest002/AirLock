@@ -1,5 +1,6 @@
 export type GuardrailMode = "read_only" | "safe_edit" | "autonomous";
 export type CommandExecutionPolicy = "guarded" | "allowlist" | "hitl";
+export type WebMcpExecutionMode = "chat" | "task";
 export type AgentProvider = "gemini" | "openai_compat" | "anthropic";
 export type GeminiThinkingMode = "auto" | "off" | "low" | "medium" | "high";
 export type ExecutionMode = "direct" | "plan_first";
@@ -411,6 +412,7 @@ export interface DashboardSnapshot {
   hooks_status?: HooksStatusSummary | null;
   active_lsp_servers?: LspServerSummary[];
   webmcp_default_profile: "compact" | "full";
+  webmcp_execution_mode: WebMcpExecutionMode;
   webmcp_rpc_timeout_secs: number;
   webmcp_auto_promote_secs: number;
   webmcp_poll_wait_secs: number;

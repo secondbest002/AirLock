@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { $, setToast } from "../dom";
+import { $, setToast, switchTab } from "../dom";
 import { renderMarkdownInto } from "../markdown";
 import type {
   AgentAttachment,
@@ -31,6 +31,77 @@ const LEGACY_STORAGE_KEYS = [
   "smart_mcp_hub_gemini_model",
   "smart_mcp_hub_gemini_custom_model",
 ];
+
+const DRAWER_STORAGE_KEY = "airlock_agent_drawer_open";
+
+const STARTER_PROMPTS: ReadonlyArray<{ title: string; subtitle: string; prompt: string }> = [
+  {
+    title: "Overview Proyek",
+    subtitle: "Peta arsitektur & entry point",
+    prompt:
+      "Lakukan project_overview pada workspace ini dan jelaskan arsitektur serta entry point utamanya secara ringkas.",
+  },
+  {
+    title: "Review Git Diff",
+    subtitle: "Cek potensi bug & edge case",
+    prompt:
+      "Jalankan git_ops status dan diff lalu review potensi bug serta edge case pada perubahan terbaru.",
+  },
+  {
+    title: "Audit Bug",
+    subtitle: "Inspeksi file, AST & search",
+    prompt:
+      "Audit folder kode utama di workspace ini menggunakan find_files, code_outline, dan read_file_range untuk mencari bug.",
+  },
+  {
+    title: "Tulis Unit Test",
+    subtitle: "Perkuat cakupan modul kritis",
+    prompt:
+      "Identifikasi modul kritis yang belum memiliki cakupan unit test memadai dan usulkan atau tambahkan unit test-nya.",
+  },
+];
+
+function classifyToolStep(toolName: string): "read" | "edit" | "exec" {
+  switch (toolName) {
+    case "surgical_edit":
+    case "multi_surgical_edit":
+    case "patch_and_verify":
+    case "write_file_jailed":
+    case "file_ops":
+    case "upsert_artifact":
+      return "edit";
+    case "run_command":
+    case "run_command_compressed":
+    case "start_command_job":
+    case "poll_command_job":
+    case "stop_command_job":
+    case "git_ops":
+    case "spawn_subagent":
+    case "delegate_local_agent":
+      return "exec";
+    default:
+      return "read";
+  }
+}
+
+function setAgentDrawerOpen(open: boolean, persist = true): void {
+  const shell = $("agent-shell");
+  const toggleBtn = $("btn-toggle-drawer");
+  const drawer = $("agent-drawer");
+  if (open && isArtifactsPanelOpen()) {
+    toggleArtifactsPanel(false);
+  }
+  shell.classList.toggle("drawer-open", open);
+  toggleBtn.setAttribute("aria-expanded", open ? "true" : "false");
+  drawer.toggleAttribute("inert", !open);
+  if (persist) {
+    try {
+      localStorage.setItem(DRAWER_STORAGE_KEY, open ? "1" : "0");
+    } catch {
+      // ignore storage errors
+    }
+  }
+}
 
 const DEFAULT_MODELS: Record<AgentProvider, Array<{ id: string; label: string }>> = {
   gemini: [
@@ -70,6 +141,7 @@ let workspaceWorkflows: WorkflowSummary[] = [];
 let currentSessionId: string = generateSessionId();
 let currentSessionCreatedAt: string | null = null;
 let lastRenderedProvider: AgentProvider | null = null;
+let drawerAutoInitialized = false;
 let activeExecutionMode: ExecutionMode = "direct";
 let activeTurnSessionId: string | null = null;
 let activeTurnRunId: string | null = null;
@@ -394,16 +466,74 @@ async function addImageFileAttachment(file: File): Promise<void> {
   setToast(`Gambar '${file.name || "clipboard"}' dilampirkan.`);
 }
 
+function createStudioLaunchpad(): HTMLElement {
+  const wrap = document.createElement("div");
+  wrap.className = "studio-launchpad chat-empty";
+
+  const pills = document.createElement("div");
+  pills.className = "launchpad-pills";
+
+  const defWs =
+    lastSnap?.workspaces?.find((w) => w.is_default) ?? lastSnap?.workspaces?.[0] ?? null;
+  const wsPill = document.createElement("span");
+  wsPill.className = "ws-alias-pill";
+  wsPill.textContent = defWs ? `@${defWs.alias}` : "@workspace";
+  pills.appendChild(wsPill);
+
+  const sealPill = document.createElement("span");
+  sealPill.className = "airlock-seal-badge";
+  const mode = lastSnap?.guardrail_mode ?? "autonomous";
+  sealPill.textContent =
+    mode === "read_only"
+      ? "LOCKED · READ"
+      : mode === "safe_edit"
+        ? "GATED · SAFE"
+        : "SEALED · AUTO";
+  pills.appendChild(sealPill);
+
+  const title = document.createElement("h2");
+  title.className = "launchpad-title";
+  title.textContent = "Airlock Agent Studio";
+
+  const desc = document.createElement("p");
+  desc.className = "launchpad-desc";
+  desc.textContent =
+    "Konfigurasi provider AI melalui tombol config di kanan atas (tersimpan aman di Windows DPAPI), lalu pilih workflow atau ketik tugas coding.";
+
+  const grid = document.createElement("div");
+  grid.className = "launchpad-grid";
+  for (const item of STARTER_PROMPTS) {
+    const cardBtn = document.createElement("button");
+    cardBtn.type = "button";
+    cardBtn.className = "launchpad-card";
+
+    const cardTitle = document.createElement("span");
+    cardTitle.className = "launchpad-card-title";
+    cardTitle.textContent = item.title;
+
+    const cardSub = document.createElement("span");
+    cardSub.className = "launchpad-card-sub";
+    cardSub.textContent = item.subtitle;
+
+    cardBtn.append(cardTitle, cardSub);
+    cardBtn.addEventListener("click", () => {
+      const input = $("chat-input") as HTMLTextAreaElement;
+      input.value = item.prompt;
+      input.focus();
+    });
+    grid.appendChild(cardBtn);
+  }
+
+  wrap.append(pills, title, desc, grid);
+  return wrap;
+}
+
 function renderChat(): void {
   const container = $("chat-messages");
   container.innerHTML = "";
 
   if (chatHistory.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "chat-empty";
-    empty.textContent =
-      "Konfigurasi provider AI melalui tombol config di kanan atas (disimpan aman dengan Windows DPAPI), lalu ketik tugas coding untuk workspace aktif.";
-    container.appendChild(empty);
+    container.appendChild(createStudioLaunchpad());
     return;
   }
 
@@ -448,9 +578,10 @@ function renderChat(): void {
 
     if (msg.role === "assistant" && msg.thought && msg.thought.trim()) {
       const details = document.createElement("details");
-      details.className = "thought-box";
+      details.className = "thought-box thought-accordion";
       const sum = document.createElement("summary");
-      sum.textContent = "Thinking Process";
+      const wordCount = msg.thought.trim().split(/\s+/).filter(Boolean).length;
+      sum.textContent = `Thinking Process · ${wordCount} words`;
       const pre = document.createElement("pre");
       pre.className = "thought-pre";
       pre.textContent = msg.thought;
@@ -471,11 +602,33 @@ function renderChat(): void {
       const stepsWrap = document.createElement("div");
       stepsWrap.className = "step-badges";
       for (const s of msg.steps) {
-        const badge = document.createElement("span");
-        badge.className = "step-badge";
-        badge.textContent = `${s.tool_name} (-${s.tokens_saved} tok)`;
-        badge.title = s.summary;
-        stepsWrap.appendChild(badge);
+        const cat = classifyToolStep(s.tool_name);
+        const stepCard = document.createElement("details");
+        stepCard.className = `tool-step-card tool-cat-${cat}`;
+
+        const summaryEl = document.createElement("summary");
+        summaryEl.className = "tool-step-summary";
+
+        const catDot = document.createElement("span");
+        catDot.className = "tool-cat-dot";
+        catDot.setAttribute("aria-hidden", "true");
+
+        const nameCode = document.createElement("code");
+        nameCode.className = "tool-step-name";
+        nameCode.textContent = s.tool_name;
+
+        const tokSpan = document.createElement("span");
+        tokSpan.className = "tool-step-tok";
+        tokSpan.textContent = `-${s.tokens_saved} tok`;
+
+        summaryEl.append(catDot, nameCode, tokSpan);
+
+        const stepBody = document.createElement("div");
+        stepBody.className = "tool-step-body";
+        stepBody.textContent = s.summary;
+
+        stepCard.append(summaryEl, stepBody);
+        stepsWrap.appendChild(stepCard);
       }
       card.appendChild(stepsWrap);
     }
@@ -484,6 +637,32 @@ function renderChat(): void {
   }
 
   container.scrollTop = container.scrollHeight;
+}
+
+async function selectChatSession(targetId: string): Promise<void> {
+  if (!targetId) {
+    await startNewChatSession();
+    return;
+  }
+  const found = workspaceSessions.find((s) => s.id === targetId);
+  if (!found) return;
+  currentSessionId = found.id;
+  currentSessionCreatedAt = found.created_at;
+  chatHistory.length = 0;
+  for (const m of found.messages) {
+    chatHistory.push({
+      role: m.role === "user" ? "user" : "assistant",
+      content: m.content,
+      thought: m.thought ?? undefined,
+      steps: m.steps,
+      usage: m.usage ?? undefined,
+      cancelled: m.cancelled,
+      timestamp: m.timestamp,
+    });
+  }
+  renderChat();
+  renderSessionSelector();
+  await loadSessionArtifacts(currentSessionId);
 }
 
 function renderSessionSelector(): void {
@@ -503,12 +682,55 @@ function renderSessionSelector(): void {
     sel.appendChild(opt);
   }
 
-  if (currentSessionId && workspaceSessions.some((s) => s.id === currentSessionId)) {
+  const activeSession = workspaceSessions.find((s) => s.id === currentSessionId) ?? null;
+  if (activeSession) {
     sel.value = currentSessionId;
     delBtn.disabled = false;
   } else {
     sel.value = "";
     delBtn.disabled = true;
+  }
+
+  const headingEl = document.getElementById("heading-agent");
+  const metaEl = document.getElementById("agent-session-meta");
+  if (headingEl) {
+    headingEl.textContent = activeSession ? activeSession.title : "Local Agent";
+  }
+  if (metaEl) {
+    metaEl.textContent = activeSession ? `${activeSession.messages.length} msg` : "Sesi Baru";
+  }
+
+  const railList = document.getElementById("rail-sessions-list");
+  if (railList) {
+    if (workspaceSessions.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "rail-session-empty";
+      empty.textContent = "Belum ada riwayat";
+      railList.replaceChildren(empty);
+    } else {
+      const items = workspaceSessions.slice(0, 6).map((s) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = `rail-session-btn ${s.id === currentSessionId ? "active" : ""}`.trim();
+        btn.title = `${s.title} (${s.messages.length} msg)`;
+
+        const titleSpan = document.createElement("span");
+        titleSpan.className = "rail-session-title";
+        titleSpan.textContent = s.title;
+
+        const countSpan = document.createElement("span");
+        countSpan.className = "rail-session-count";
+        countSpan.textContent = String(s.messages.length);
+
+        btn.append(titleSpan, countSpan);
+        btn.addEventListener("click", () => {
+          switchTab("agent");
+          void selectChatSession(s.id);
+        });
+        return btn;
+      });
+      railList.replaceChildren(...items);
+    }
   }
 }
 
@@ -661,6 +883,15 @@ export function renderAgentView(snap: DashboardSnapshot): void {
   syncProviderFieldsUi(activeProv, snap);
   syncProviderPill(snap);
 
+  if (!drawerAutoInitialized) {
+    drawerAutoInitialized = true;
+    const needsFirstRunSetup =
+      !hasSavedKeyForProvider(snap, activeProv) && activeProv !== "openai_compat";
+    if (needsFirstRunSetup) {
+      setAgentDrawerOpen(true, false);
+    }
+  }
+
   if (loadedWorkspaceForSessions !== snap.workspace_root) {
     const switchedFromAnother = loadedWorkspaceForSessions !== null;
     loadedWorkspaceForSessions = snap.workspace_root;
@@ -699,10 +930,15 @@ function createStreamingCard(): void {
   hdr.append(roleSpan, rightWrap);
 
   const thoughtBox = document.createElement("details");
-  thoughtBox.className = "thought-box";
+  thoughtBox.className = "thought-box thought-accordion is-streaming";
   thoughtBox.hidden = true;
   const sum = document.createElement("summary");
-  sum.textContent = "Thinking Process";
+  const pulseDot = document.createElement("span");
+  pulseDot.className = "thought-pulse-dot";
+  pulseDot.setAttribute("aria-hidden", "true");
+  const sumText = document.createElement("span");
+  sumText.textContent = "Thinking Process (streaming)";
+  sum.append(pulseDot, sumText);
   const thoughtPre = document.createElement("pre");
   thoughtPre.className = "thought-pre";
   thoughtBox.append(sum, thoughtPre);
@@ -759,14 +995,22 @@ export async function initAgentView(
   const modelSel = $("agent-model") as HTMLSelectElement;
 
   const toggleDrawerBtn = $("btn-toggle-drawer");
-  toggleDrawerBtn.addEventListener("click", () => {
-    const shell = $("agent-shell");
-    if (isArtifactsPanelOpen()) {
-      toggleArtifactsPanel(false);
+  try {
+    const savedDrawer = localStorage.getItem(DRAWER_STORAGE_KEY);
+    if (savedDrawer === "1") {
+      drawerAutoInitialized = true;
+      setAgentDrawerOpen(true, false);
+    } else if (savedDrawer === "0") {
+      drawerAutoInitialized = true;
+      setAgentDrawerOpen(false, false);
     }
-    const open = shell.classList.toggle("drawer-open");
-    toggleDrawerBtn.setAttribute("aria-expanded", open ? "true" : "false");
-    $("agent-drawer").toggleAttribute("inert", !open);
+  } catch {
+    // ignore storage errors
+  }
+
+  toggleDrawerBtn.addEventListener("click", () => {
+    const nextOpen = !$("agent-shell").classList.contains("drawer-open");
+    setAgentDrawerOpen(nextOpen, true);
   });
 
   $("btn-mode-direct").addEventListener("click", () => setExecutionMode("direct"));
@@ -893,29 +1137,7 @@ export async function initAgentView(
 
   ($("chat-session-select") as HTMLSelectElement).addEventListener("change", async (e) => {
     const targetId = (e.target as HTMLSelectElement).value;
-    if (!targetId) {
-      await startNewChatSession();
-      return;
-    }
-    const found = workspaceSessions.find((s) => s.id === targetId);
-    if (!found) return;
-    currentSessionId = found.id;
-    currentSessionCreatedAt = found.created_at;
-    chatHistory.length = 0;
-    for (const m of found.messages) {
-      chatHistory.push({
-        role: m.role === "user" ? "user" : "assistant",
-        content: m.content,
-        thought: m.thought ?? undefined,
-        steps: m.steps,
-        usage: m.usage ?? undefined,
-        cancelled: m.cancelled,
-        timestamp: m.timestamp,
-      });
-    }
-    renderChat();
-    renderSessionSelector();
-    await loadSessionArtifacts(currentSessionId);
+    await selectChatSession(targetId);
   });
 
   $("btn-delete-session").addEventListener("click", async () => {
@@ -931,6 +1153,28 @@ export async function initAgentView(
       setToast(`Gagal menghapus sesi: ${String(err)}`);
     }
   });
+
+  const attachPopover = document.getElementById("attach-file-popover");
+  const attachToggleBtn = document.getElementById("btn-toggle-attach-file");
+  const closeAttachPopover = (): void => {
+    if (!attachPopover || !attachToggleBtn) return;
+    attachPopover.hidden = true;
+    attachToggleBtn.setAttribute("aria-expanded", "false");
+  };
+
+  attachToggleBtn?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (!attachPopover) return;
+    const willOpen = attachPopover.hidden;
+    attachPopover.hidden = !willOpen;
+    attachToggleBtn.setAttribute("aria-expanded", willOpen ? "true" : "false");
+    if (willOpen) {
+      ($("attach-file-path") as HTMLInputElement).focus();
+    }
+  });
+
+  attachPopover?.addEventListener("click", (e) => e.stopPropagation());
+  document.addEventListener("click", () => closeAttachPopover());
 
   // File & Image Attachments
   const addPathAttachment = (): void => {
@@ -950,6 +1194,7 @@ export async function initAgentView(
     });
     input.value = "";
     renderAttachmentChips();
+    closeAttachPopover();
   };
 
   $("btn-attach-file").addEventListener("click", addPathAttachment);
@@ -958,7 +1203,21 @@ export async function initAgentView(
     if (e.key === "Enter") {
       e.preventDefault();
       addPathAttachment();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      closeAttachPopover();
+      attachToggleBtn?.focus();
     }
+  });
+
+  const slashBtn = document.getElementById("btn-insert-slash");
+  slashBtn?.addEventListener("click", () => {
+    const ta = $("chat-input") as HTMLTextAreaElement;
+    if (!ta.value.startsWith("/")) {
+      ta.value = `/${ta.value}`;
+    }
+    ta.focus();
+    ta.dispatchEvent(new Event("input", { bubbles: true }));
   });
 
   const imgInput = $("attach-image-input") as HTMLInputElement;
@@ -1165,6 +1424,7 @@ export async function initAgentView(
     const resumeBtn = $("btn-resume-checkpoint") as HTMLButtonElement;
     const discardBtn = $("btn-discard-checkpoint") as HTMLButtonElement;
     isTurnActive = true;
+    document.getElementById("app-shell")?.setAttribute("data-agent-streaming", "true");
     sendBtn.disabled = true;
     resumeBtn.disabled = true;
     discardBtn.disabled = true;
@@ -1230,6 +1490,7 @@ export async function initAgentView(
       await persistActiveChatSession();
       lastStepStatus = "Error";
     } finally {
+      document.getElementById("app-shell")?.removeAttribute("data-agent-streaming");
       if (turnTimerId !== null) {
         window.clearInterval(turnTimerId);
         turnTimerId = null;

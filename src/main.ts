@@ -1,12 +1,16 @@
-import "@fontsource-variable/plus-jakarta-sans";
+import "@fontsource-variable/space-grotesk";
+import "@fontsource-variable/geist";
 import "@fontsource-variable/jetbrains-mono";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   $,
+  activateSubTab,
   copyToClipboard,
   initAccentTheme,
+  nextAccentTheme,
   positionGuardrailGlider,
   setAccentTheme,
   setToast,
@@ -97,6 +101,17 @@ function renderStatusbarMeta(snap: DashboardSnapshot): void {
 
 function renderSnapshot(snap: DashboardSnapshot): void {
   currentSnapshot = snap;
+
+  document.documentElement.dataset.guardrail = snap.guardrail_mode;
+  const sealLabel = document.getElementById("airlock-seal-label");
+  if (sealLabel) {
+    sealLabel.textContent =
+      snap.guardrail_mode === "read_only"
+        ? "LOCKED · READ"
+        : snap.guardrail_mode === "safe_edit"
+          ? "GATED · SAFE"
+          : "SEALED · AUTO";
+  }
 
   const track = $("guardrail-track");
   track.dataset.mode = snap.guardrail_mode;
@@ -226,16 +241,28 @@ function buildPaletteActions(): CommandPaletteAction[] {
       run: () => toggleRail(),
     },
     {
+      id: "accent-blue",
+      label: "Accent Theme: Precision Blue",
+      hint: "Precision Studio",
+      run: () => setAccentTheme("blue"),
+    },
+    {
       id: "accent-mint",
       label: "Accent Theme: Electric Mint",
-      hint: "Obsidian",
+      hint: "Precision Studio",
       run: () => setAccentTheme("mint"),
     },
     {
-      id: "accent-cyan",
-      label: "Accent Theme: Ice Cyan",
-      hint: "Obsidian",
-      run: () => setAccentTheme("cyan"),
+      id: "accent-amber",
+      label: "Accent Theme: Solar Amber",
+      hint: "Precision Studio",
+      run: () => setAccentTheme("amber"),
+    },
+    {
+      id: "accent-mono",
+      label: "Accent Theme: Carbon Monochrome",
+      hint: "Precision Studio",
+      run: () => setAccentTheme("mono"),
     },
     {
       id: "toggle-server",
@@ -347,6 +374,7 @@ function buildPaletteActions(): CommandPaletteAction[] {
       hint: "Hub & Tools",
       run: () => {
         switchTab("hub");
+        activateSubTab("hub", "aggregator");
         openAddMcpModal();
       },
     },
@@ -356,6 +384,7 @@ function buildPaletteActions(): CommandPaletteAction[] {
       hint: "Hub & Plugins",
       run: () => {
         switchTab("hub");
+        activateSubTab("hub", "plugins");
         openInstallPluginModal();
       },
     },
@@ -366,6 +395,8 @@ function buildPaletteActions(): CommandPaletteAction[] {
       run: async () => {
         const next = await invoke<DashboardSnapshot>("rescan_skills");
         renderSnapshot(next);
+        switchTab("hub");
+        activateSubTab("hub", "skills");
         setToast(`Skills dipindai ulang (${next.skills.length} ditemukan).`);
       },
     },
@@ -375,6 +406,7 @@ function buildPaletteActions(): CommandPaletteAction[] {
       hint: "Skills Catalog",
       run: () => {
         switchTab("hub");
+        activateSubTab("hub", "skills");
         openCreateSkillModal();
       },
     },
@@ -480,8 +512,86 @@ function buildPaletteActions(): CommandPaletteAction[] {
   return actions;
 }
 
+function buildWindowMaxIcon(maximized: boolean): SVGSVGElement {
+  const svgNs = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(svgNs, "svg");
+  svg.setAttribute("width", "11");
+  svg.setAttribute("height", "11");
+  svg.setAttribute("viewBox", "0 0 12 12");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "1.2");
+  svg.setAttribute("aria-hidden", "true");
+
+  if (maximized) {
+    const front = document.createElementNS(svgNs, "rect");
+    front.setAttribute("x", "2");
+    front.setAttribute("y", "4");
+    front.setAttribute("width", "6");
+    front.setAttribute("height", "6");
+    front.setAttribute("rx", "0.8");
+    const back = document.createElementNS(svgNs, "path");
+    back.setAttribute("d", "M4 4V2.5a.5.5 0 0 1 .5-.5H9.5a.5.5 0 0 1 .5.5V7.5a.5.5 0 0 1-.5.5H8");
+    svg.append(back, front);
+  } else {
+    const rect = document.createElementNS(svgNs, "rect");
+    rect.setAttribute("x", "2");
+    rect.setAttribute("y", "2");
+    rect.setAttribute("width", "8");
+    rect.setAttribute("height", "8");
+    rect.setAttribute("rx", "1");
+    svg.appendChild(rect);
+  }
+  return svg;
+}
+
+function initFramelessWindowControls(): void {
+  const controls = document.getElementById("window-controls");
+  const isTauri = Boolean(
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__
+  );
+  if (!controls || !isTauri) return;
+
+  controls.hidden = false;
+  const win = getCurrentWindow();
+  const minBtn = $("win-btn-min");
+  const maxBtn = $("win-btn-max");
+  const closeBtn = $("win-btn-close");
+  const spacer = document.querySelector<HTMLElement>(".cmdbar-spacer");
+
+  const syncMaxState = async (): Promise<void> => {
+    try {
+      const max = await win.isMaximized();
+      maxBtn.setAttribute("aria-label", max ? "Restore window" : "Maximize window");
+      maxBtn.title = max ? "Restore" : "Maximize";
+      maxBtn.replaceChildren(buildWindowMaxIcon(max));
+    } catch {
+      // ignore outside native window context
+    }
+  };
+
+  minBtn.addEventListener("click", () => {
+    void win.minimize().catch(() => {});
+  });
+  maxBtn.addEventListener("click", () => {
+    void win.toggleMaximize().then(() => syncMaxState()).catch(() => {});
+  });
+  closeBtn.addEventListener("click", () => {
+    void win.close().catch(() => {});
+  });
+  spacer?.addEventListener("dblclick", () => {
+    void win.toggleMaximize().then(() => syncMaxState()).catch(() => {});
+  });
+
+  void syncMaxState();
+  void win.onResized(() => {
+    void syncMaxState();
+  });
+}
+
 async function init(): Promise<void> {
   initAccentTheme();
+  initFramelessWindowControls();
 
   try {
     if (localStorage.getItem("airlock_rail_collapsed") === "1") {
@@ -495,8 +605,7 @@ async function init(): Promise<void> {
   $("btn-toggle-rail").addEventListener("click", toggleRail);
 
   $("btn-toggle-accent").addEventListener("click", () => {
-    const cur = document.documentElement.dataset.accent === "cyan" ? "cyan" : "mint";
-    setAccentTheme(cur === "cyan" ? "mint" : "cyan");
+    setAccentTheme(nextAccentTheme(document.documentElement.dataset.accent));
   });
 
   $("statusbar-jobs-pill").addEventListener("click", () => {
@@ -524,13 +633,10 @@ async function init(): Promise<void> {
     }
   });
 
-  // Delegated card spotlight sheen
-  document.addEventListener("pointermove", (e) => {
-    const card = e.target instanceof Element ? e.target.closest<HTMLElement>(".card") : null;
-    if (!card) return;
-    const rect = card.getBoundingClientRect();
-    card.style.setProperty("--spot-x", `${e.clientX - rect.left}px`);
-    card.style.setProperty("--spot-y", `${e.clientY - rect.top}px`);
+  const railNewChat = document.getElementById("btn-rail-new-chat");
+  railNewChat?.addEventListener("click", async () => {
+    switchTab("agent");
+    await startNewChatSession();
   });
 
   document.querySelectorAll<HTMLButtonElement>(".rail-btn").forEach((btn) => {
@@ -628,83 +734,89 @@ async function init(): Promise<void> {
     syncRailIndicator();
   });
 
-  await listen<DashboardSnapshot>("dashboard-updated", (event) => {
-    renderSnapshot(event.payload);
-  });
+  const isTauri = Boolean(
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__
+  );
 
-  await listen<HttpTrafficEntry>("http-traffic-added", (event) => {
-    appendTrafficIncremental(currentSnapshot, event.payload);
-  });
+  if (isTauri) {
+    await listen<DashboardSnapshot>("dashboard-updated", (event) => {
+      renderSnapshot(event.payload);
+    });
 
-  await listen<AuditAddedPayload>("audit-added", (event) => {
-    appendAuditIncremental(currentSnapshot, event.payload, getSnap);
-  });
+    await listen<HttpTrafficEntry>("http-traffic-added", (event) => {
+      appendTrafficIncremental(currentSnapshot, event.payload);
+    });
 
-  await listen<string>("tunnel-log-added", (event) => {
-    appendTunnelLogIncremental(currentSnapshot, event.payload);
-  });
+    await listen<AuditAddedPayload>("audit-added", (event) => {
+      appendAuditIncremental(currentSnapshot, event.payload, getSnap);
+    });
 
-  await listen<PendingOAuthInfo>("oauth-consent-request", (event) => {
-    enqueueOAuthConsent(event.payload);
-  });
+    await listen<string>("tunnel-log-added", (event) => {
+      appendTunnelLogIncremental(currentSnapshot, event.payload);
+    });
 
-  await listen<string>("oauth-consent-resolved", (event) => {
-    handleOAuthResolvedEvent(event.payload);
-  });
+    await listen<PendingOAuthInfo>("oauth-consent-request", (event) => {
+      enqueueOAuthConsent(event.payload);
+    });
 
-  await listen<PendingToolApproval>("tool-approval-request", (event) => {
-    enqueueToolApproval(event.payload);
-  });
+    await listen<string>("oauth-consent-resolved", (event) => {
+      handleOAuthResolvedEvent(event.payload);
+    });
 
-  await listen<string>("tool-approval-resolved", (event) => {
-    handleToolApprovalResolvedEvent(event.payload);
-  });
+    await listen<PendingToolApproval>("tool-approval-request", (event) => {
+      enqueueToolApproval(event.payload);
+    });
 
-  await listen<PendingElicitation>("mcp-elicitation-request", (event) => {
-    enqueueMcpElicitation(event.payload);
-  });
+    await listen<string>("tool-approval-resolved", (event) => {
+      handleToolApprovalResolvedEvent(event.payload);
+    });
 
-  await listen<string>("mcp-elicitation-resolved", (event) => {
-    handleMcpElicitationResolvedEvent(event.payload);
-  });
+    await listen<PendingElicitation>("mcp-elicitation-request", (event) => {
+      enqueueMcpElicitation(event.payload);
+    });
 
-  await listen<JobSummary>("job-updated", (event) => {
-    updateJobIncremental(currentSnapshot, event.payload, renderSnapshot);
-    handleJobUpdatedForModal(event.payload);
-  });
+    await listen<string>("mcp-elicitation-resolved", (event) => {
+      handleMcpElicitationResolvedEvent(event.payload);
+    });
 
-  await listen<AgentStepV2Payload>("agent-step-v2", (event) => {
-    updateAgentStepStatusV2(event.payload);
-  });
+    await listen<JobSummary>("job-updated", (event) => {
+      updateJobIncremental(currentSnapshot, event.payload, renderSnapshot);
+      handleJobUpdatedForModal(event.payload);
+    });
 
-  await listen<AgentThoughtV2Payload>("agent-thought-v2", (event) => {
-    appendAgentThoughtChunkV2(event.payload);
-  });
+    await listen<AgentStepV2Payload>("agent-step-v2", (event) => {
+      updateAgentStepStatusV2(event.payload);
+    });
 
-  await listen<AgentChunkV2Payload>("agent-chunk-v2", (event) => {
-    appendAgentTextChunkV2(event.payload);
-  });
+    await listen<AgentThoughtV2Payload>("agent-thought-v2", (event) => {
+      appendAgentThoughtChunkV2(event.payload);
+    });
 
-  await listen<ArtifactDocument>("artifact-updated", (event) => {
-    handleArtifactUpdatedEvent(event.payload);
-  });
+    await listen<AgentChunkV2Payload>("agent-chunk-v2", (event) => {
+      appendAgentTextChunkV2(event.payload);
+    });
 
-  await listen<AgentRunSummary[]>("agent-runs-updated", (event) => {
-    renderRunsStrip(event.payload);
-    renderRunsTab(event.payload);
-  });
+    await listen<ArtifactDocument>("artifact-updated", (event) => {
+      handleArtifactUpdatedEvent(event.payload);
+    });
 
-  await listen<HooksStatusSummary>("hooks-trust-required", (event) => {
-    const hooksBtn = $("btn-hooks-trust") as HTMLButtonElement;
-    hooksBtn.hidden = false;
-    hooksBtn.textContent = event.payload.hash_changed ? "Hooks: Changed" : "Hooks: Untrusted";
-    setToast(
-      `Hooks @${event.payload.workspace_alias} belum di-trust. Klik tombol Hooks untuk inspeksi.`,
-      "warn"
-    );
-  });
+    await listen<AgentRunSummary[]>("agent-runs-updated", (event) => {
+      renderRunsStrip(event.payload);
+      renderRunsTab(event.payload);
+    });
 
-  await refreshDashboard();
+    await listen<HooksStatusSummary>("hooks-trust-required", (event) => {
+      const hooksBtn = $("btn-hooks-trust") as HTMLButtonElement;
+      hooksBtn.hidden = false;
+      hooksBtn.textContent = event.payload.hash_changed ? "Hooks: Changed" : "Hooks: Untrusted";
+      setToast(
+        `Hooks @${event.payload.workspace_alias} belum di-trust. Klik tombol Hooks untuk inspeksi.`,
+        "warn"
+      );
+    });
+
+    await refreshDashboard();
+  }
   requestAnimationFrame(() => {
     positionGuardrailGlider();
     syncRailIndicator();

@@ -1,5 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
-import { $, copyToClipboard, formatDurationCompact, maskToken, setToast } from "../dom";
+import {
+  $,
+  activateSubTab,
+  copyToClipboard,
+  formatDurationCompact,
+  initSubTabs,
+  maskToken,
+  setToast,
+} from "../dom";
 import { generateClientPreset, MCP_CLIENT_PRESETS } from "../presets";
 import type {
   DashboardSnapshot,
@@ -132,6 +140,191 @@ const SIM_DEFAULTS: Record<string, string> = {
 let secretsVisible = false;
 let trafficSearchQuery = "";
 let trafficStatusFilter = "all";
+let lastPulseAt = 0;
+let pulseClearTimer: number | null = null;
+const MIN_PULSE_GAP_MS = 180;
+
+function renderSignalPipeline(snap: DashboardSnapshot): void {
+  const pill = document.getElementById("pipeline-live-pill");
+  if (pill) {
+    pill.textContent = snap.server_running ? `ONLINE · :${snap.server_port}` : "OFFLINE";
+    pill.className = `badge ${snap.server_running ? "badge-ok" : "badge-muted"}`;
+  }
+
+  const reqCount = (snap.http_traffic ?? []).length;
+  const oauthCount = (snap.oauth_clients ?? []).length;
+  const downstreamCount = (snap.downstream_mcps ?? []).length;
+  const tunnelLabel = snap.tunnel_running
+    ? snap.tunnel_url
+      ? "Tunnel ONLINE"
+      : "Tunnel STARTING"
+    : "Local Only";
+
+  const mounted = snap.workspaces ?? [];
+  const enabledWs = mounted.filter((w) => w.enabled);
+  const defWs = mounted.find((w) => w.is_default) ?? enabledWs[0] ?? null;
+  const defAlias = defWs ? defWs.alias : "workspace";
+  const lspCount = (snap.active_lsp_servers ?? []).length;
+
+  const clientVal = document.getElementById("pipe-client-val");
+  const clientSub = document.getElementById("pipe-client-sub");
+  if (clientVal) clientVal.textContent = `${reqCount} reqs`;
+  if (clientSub) clientSub.textContent = `${oauthCount} OAuth · ${downstreamCount} downstream`;
+
+  const transVal = document.getElementById("pipe-transport-val");
+  const transSub = document.getElementById("pipe-transport-sub");
+  if (transVal) transVal.textContent = `127.0.0.1:${snap.server_port}`;
+  if (transSub) transSub.textContent = tunnelLabel;
+
+  const sealVal = document.getElementById("pipe-seal-val");
+  const sealSub = document.getElementById("pipe-seal-sub");
+  if (sealVal) sealVal.textContent = snap.guardrail_mode.toUpperCase();
+  if (sealSub) {
+    sealSub.textContent = snap.allow_sensitive_reads
+      ? "Bearer + OAuth 2.1"
+      : "Bearer + OAuth · Guard ON";
+  }
+
+  const wsVal = document.getElementById("pipe-ws-val");
+  const wsSub = document.getElementById("pipe-ws-sub");
+  if (wsVal) wsVal.textContent = `@${defAlias}`;
+  if (wsSub) wsSub.textContent = `${enabledWs.length || 1} mounted · ${lspCount} LSP`;
+
+  const monSrv = document.getElementById("mon-pipe-server");
+  const monTun = document.getElementById("mon-pipe-tunnel");
+  const monSeal = document.getElementById("mon-pipe-seal");
+  const monWs = document.getElementById("mon-pipe-ws");
+  const monDot = document.getElementById("monitor-pulse-dot");
+  if (monSrv) monSrv.textContent = snap.server_running ? `:${snap.server_port} ONLINE` : "OFFLINE";
+  if (monTun) monTun.textContent = tunnelLabel;
+  if (monSeal) monSeal.textContent = snap.guardrail_mode.toUpperCase();
+  if (monWs) monWs.textContent = `@${defAlias} (${enabledWs.length || 1})`;
+  if (monDot) {
+    monDot.className = `live-dot ${snap.server_running ? "online" : "offline"}`;
+  }
+}
+
+function renderTrafficSparkline(traffic: HttpTrafficEntry[]): void {
+  const svg = document.getElementById("traffic-sparkline");
+  if (!svg) return;
+
+  const bucketCount = 24;
+  const buckets = new Array<number>(bucketCount).fill(0);
+  const recent = traffic.slice(-60);
+
+  if (recent.length > 0 && recent.length <= bucketCount) {
+    const startIdx = bucketCount - recent.length;
+    for (let i = 0; i < recent.length; i++) {
+      buckets[startIdx + i] = 1;
+    }
+  } else if (recent.length > bucketCount) {
+    for (let i = 0; i < recent.length; i++) {
+      const b = Math.min(bucketCount - 1, Math.floor((i * bucketCount) / recent.length));
+      buckets[b] += 1;
+    }
+  }
+
+  const peak = Math.max(0, ...buckets);
+  const avgMs =
+    recent.length > 0
+      ? Math.round(recent.reduce((sum, item) => sum + item.duration_ms, 0) / recent.length)
+      : 0;
+  const errCount = recent.filter((item) => item.status >= 400).length;
+
+  const peakEl = document.getElementById("spark-peak-label");
+  const avgEl = document.getElementById("spark-avg-ms-label");
+  const errEl = document.getElementById("spark-err-rate-label");
+  if (peakEl) peakEl.textContent = `Peak ${peak}`;
+  if (avgEl) avgEl.textContent = `Avg ${avgMs}ms`;
+  if (errEl) errEl.textContent = `${errCount} err`;
+
+  const svgNs = "http://www.w3.org/2000/svg";
+  const width = 240;
+  const height = 36;
+  const padY = 4;
+  const usableH = height - padY * 2;
+  const maxVal = Math.max(1, peak);
+
+  const slotW = width / bucketCount;
+  const barW = Number((slotW * 0.62).toFixed(1));
+  const nodes: SVGElement[] = [];
+
+  buckets.forEach((val, idx) => {
+    const ratio = val > 0 ? Math.max(0.18, val / maxVal) : 0.08;
+    const barH = Number((ratio * usableH).toFixed(1));
+    const x = Number((idx * slotW + (slotW - barW) / 2).toFixed(1));
+    const y = Number((height - padY - barH).toFixed(1));
+
+    const rect = document.createElementNS(svgNs, "rect");
+    rect.setAttribute("x", String(x));
+    rect.setAttribute("y", String(y));
+    rect.setAttribute("width", String(barW));
+    rect.setAttribute("height", String(barH));
+    rect.setAttribute("rx", "1.5");
+    if (val === 0) {
+      rect.setAttribute("fill", "var(--border-default)");
+      rect.setAttribute("opacity", "0.55");
+    } else if (idx >= bucketCount - 4) {
+      rect.setAttribute("fill", errCount > 0 && idx === bucketCount - 1 ? "var(--status-danger)" : "var(--accent)");
+    } else {
+      rect.setAttribute("fill", "var(--status-ok)");
+      rect.setAttribute("opacity", "0.85");
+    }
+    nodes.push(rect);
+  });
+  svg.replaceChildren(...nodes);
+}
+
+function triggerPipelinePulse(entry: HttpTrafficEntry): void {
+  const now = performance.now();
+  if (now - lastPulseAt < MIN_PULSE_GAP_MS) return;
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  lastPulseAt = now;
+
+  const preview = entry.response_preview ?? "";
+  const pulseColor =
+    entry.status >= 400
+      ? "var(--status-danger)"
+      : preview.includes("AUTO_PROMOTED_TO_BACKGROUND_JOB") || preview.includes("[HARNESS_HINT:")
+        ? "var(--status-warn)"
+        : "var(--accent-fg)";
+
+  const pipelineEl = document.getElementById("airlock-signal-pipeline");
+  if (pipelineEl && pipelineEl.getBoundingClientRect().width > 0) {
+    const packetIds = ["conduit-packet-1", "conduit-packet-2", "conduit-packet-3"];
+    packetIds.forEach((id, idx) => {
+      const circle = document.getElementById(id);
+      if (!circle || typeof circle.animate !== "function") return;
+      circle.setAttribute("fill", pulseColor);
+      circle.animate(
+        [
+          { transform: "translateX(0px)", opacity: 0 },
+          { opacity: 1, offset: 0.16 },
+          { transform: "translateX(225px)", opacity: 0.95, offset: 0.84 },
+          { transform: "translateX(225px)", opacity: 0 },
+        ],
+        {
+          duration: 420,
+          delay: idx * 105,
+          easing: "cubic-bezier(0.16, 1, 0.3, 1)",
+          fill: "none",
+        }
+      );
+    });
+  }
+
+  const pipeNodes = document.querySelectorAll<HTMLElement>(".pipeline-node, .conduit-node");
+  pipeNodes.forEach((n) => n.classList.add("is-pulsing"));
+  const monDot = document.getElementById("monitor-pulse-dot");
+  monDot?.classList.add("is-pulsing");
+  if (pulseClearTimer !== null) {
+    window.clearTimeout(pulseClearTimer);
+  }
+  pulseClearTimer = window.setTimeout(() => {
+    pipeNodes.forEach((n) => n.classList.remove("is-pulsing"));
+    monDot?.classList.remove("is-pulsing");
+  }, 520);
+}
 
 function renderSecrets(snap: DashboardSnapshot): void {
   const tokenEl = $("mcp-auth-token");
@@ -253,6 +446,8 @@ function renderOAuthClients(
 
   const revokeAllBtn = $("btn-revoke-all-oauth") as HTMLButtonElement;
   revokeAllBtn.disabled = clients.length === 0;
+  const oauthCountEl = document.getElementById("bridge-oauth-count");
+  if (oauthCountEl) oauthCountEl.textContent = String(clients.length);
 
   if (clients.length === 0) {
     const tr = document.createElement("tr");
@@ -316,6 +511,7 @@ function renderOAuthClients(
 }
 
 export function renderHttpTraffic(traffic: HttpTrafficEntry[]): void {
+  renderTrafficSparkline(traffic);
   const tbody = $("http-traffic-body") as HTMLTableSectionElement;
   const filtered = [...traffic].reverse().filter(matchesTrafficFilter);
   $("traffic-count-label").textContent =
@@ -362,7 +558,12 @@ export function appendTrafficIncremental(
         : `${visibleCount} / ${snap.http_traffic.length} requests`;
     const railMon = document.getElementById("rail-monitor-count");
     if (railMon) railMon.textContent = String(snap.http_traffic.length);
+    const pipeClientVal = document.getElementById("pipe-client-val");
+    if (pipeClientVal) pipeClientVal.textContent = `${snap.http_traffic.length} reqs`;
   }
+
+  renderTrafficSparkline(snap ? snap.http_traffic : [entry]);
+  triggerPipelinePulse(entry);
 
   if (!matchesTrafficFilter(entry)) {
     return;
@@ -763,6 +964,9 @@ function renderDownstreamMcps(
   servers: DownstreamMcpSummary[],
   onSnapshot: (snap: DashboardSnapshot) => void
 ): void {
+  const aggCountEl = document.getElementById("hub-agg-count");
+  if (aggCountEl) aggCountEl.textContent = String(servers.length);
+
   const tbody = $("mcp-hub-body") as HTMLTableSectionElement;
   tbody.innerHTML = "";
   if (servers.length === 0) {
@@ -902,15 +1106,21 @@ export function renderBridgeView(
 
   const webmcpBadge = $("bridge-webmcp-profile-badge");
   const isCompact = (snap.webmcp_default_profile ?? "compact") === "compact";
+  const execMode = snap.webmcp_execution_mode === "task" ? "task" : "chat";
+  const modeTag = execMode.toUpperCase();
   const compactCount = 9 + (snap.webmcp_expose_skills ? 3 : 0) + (snap.has_api_key ? 1 : 0);
   webmcpBadge.textContent = isCompact
-    ? `COMPACT (${compactCount} TOOLS)`
-    : "FULL PROFILE";
-  webmcpBadge.className = `badge ${isCompact ? "badge-online" : "badge-muted"}`;
+    ? `COMPACT · ${modeTag} (${compactCount} TOOLS)`
+    : `FULL · ${modeTag}`;
+  webmcpBadge.className = `badge ${isCompact ? "badge-ok" : "badge-muted"}`;
 
   const webmcpProfileSel = $("webmcp-profile-select") as HTMLSelectElement;
   if (document.activeElement !== webmcpProfileSel) {
     webmcpProfileSel.value = snap.webmcp_default_profile ?? "compact";
+  }
+  const webmcpModeSel = $("webmcp-mode-select") as HTMLSelectElement;
+  if (document.activeElement !== webmcpModeSel) {
+    webmcpModeSel.value = execMode;
   }
   const promoteInput = $("webmcp-promote-input") as HTMLInputElement;
   if (document.activeElement !== promoteInput) {
@@ -990,6 +1200,14 @@ export function renderBridgeView(
   renderBackgroundJobs(snap.background_jobs ?? [], onSnapshot);
   renderDownstreamMcps(snap.downstream_mcps ?? [], onSnapshot);
   renderHttpTraffic(snap.http_traffic ?? []);
+  renderSignalPipeline(snap);
+
+  const presetPreviewEl = document.getElementById("bridge-preset-inline-preview");
+  const presetSelEl = document.getElementById("mcp-preset-select") as HTMLSelectElement | null;
+  if (presetPreviewEl && presetSelEl && presetSelEl.value) {
+    const preset = generateClientPreset(presetSelEl.value, snap, Boolean(snap.tunnel_url));
+    presetPreviewEl.textContent = preset.content;
+  }
 }
 
 export function initBridgeView(
@@ -997,6 +1215,9 @@ export function initBridgeView(
   onSnapshot: (snap: DashboardSnapshot) => void,
   onRefresh: () => Promise<void>
 ): void {
+  initSubTabs("bridge");
+  initSubTabs("hub");
+
   const presetSel = $("mcp-preset-select") as HTMLSelectElement;
   presetSel.innerHTML = "";
   for (const opt of MCP_CLIENT_PRESETS) {
@@ -1005,6 +1226,42 @@ export function initBridgeView(
     el.textContent = opt.label;
     presetSel.appendChild(el);
   }
+  presetSel.addEventListener("change", () => {
+    const snap = getSnap();
+    const previewEl = document.getElementById("bridge-preset-inline-preview");
+    if (snap && previewEl) {
+      previewEl.textContent = generateClientPreset(presetSel.value, snap, Boolean(snap.tunnel_url)).content;
+    }
+  });
+
+  document.querySelectorAll<HTMLButtonElement>(".pipeline-node[data-pipeline-target], .conduit-node[data-pipeline-target]").forEach((node) => {
+    node.addEventListener("click", () => {
+      const target = node.dataset.pipelineTarget;
+      if (target === "client") {
+        activateSubTab("bridge", "oauth");
+        document.getElementById("oauth-clients-body")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        return;
+      }
+      if (target === "transport") {
+        activateSubTab("bridge", "connection");
+        const portEl = document.getElementById("server-port-input");
+        portEl?.scrollIntoView({ behavior: "smooth", block: "center" });
+        portEl?.focus({ preventScroll: true });
+        return;
+      }
+      if (target === "seal") {
+        activateSubTab("bridge", "security");
+        const policyEl = document.getElementById("command-policy-select");
+        policyEl?.scrollIntoView({ behavior: "smooth", block: "center" });
+        policyEl?.focus({ preventScroll: true });
+        return;
+      }
+      if (target === "workspace") {
+        const wsBtn = document.getElementById("btn-recent-workspaces");
+        wsBtn?.click();
+      }
+    });
+  });
 
   $("btn-toggle-server").addEventListener("click", async () => {
     try {
@@ -1202,6 +1459,26 @@ export function initBridgeView(
     );
   });
 
+  $("webmcp-mode-select").addEventListener("change", async (e) => {
+    const mode = (e.target as HTMLSelectElement).value;
+    await saveWebmcpSettings(
+      { webmcpExecutionMode: mode },
+      mode === "task"
+        ? "WebMCP Execution Mode: Task Mode (autonomous milestone, 30 calls / 10k floor, auto-SSE)."
+        : "WebMCP Execution Mode: Chat Mode (multi-turn self-pacing)."
+    );
+  });
+
+  $("btn-copy-antigravity-handoff").addEventListener("click", async () => {
+    try {
+      const prompt = await invoke<string>("get_antigravity_handoff_prompt", {});
+      await copyToClipboard(prompt, "Antigravity Handoff Prompt");
+      setToast("Prompt handoff Antigravity disalin & .airlock/HANDOFF.md disinkronkan.", "info");
+    } catch (err) {
+      setToast(`Gagal menyalin handoff Antigravity: ${String(err)}`, "warn");
+    }
+  });
+
   $("toggle-webmcp-sse").addEventListener("change", async (e) => {
     const enabled = (e.target as HTMLInputElement).checked;
     await saveWebmcpSettings(
@@ -1262,6 +1539,7 @@ export function initBridgeView(
 
   $("btn-save-webmcp").addEventListener("click", async () => {
     const profile = ($("webmcp-profile-select") as HTMLSelectElement).value;
+    const mode = ($("webmcp-mode-select") as HTMLSelectElement).value;
     const autoPromoteSecs = Number(($("webmcp-promote-input") as HTMLInputElement).value) || 18;
     const pollWaitSecs = Number(($("webmcp-poll-input") as HTMLInputElement).value) || 22;
     const rpcTimeoutSecs = Number(($("webmcp-rpc-timeout-input") as HTMLInputElement).value) || 32;
@@ -1269,6 +1547,7 @@ export function initBridgeView(
     await saveWebmcpSettings(
       {
         webmcpDefaultProfile: profile,
+        webmcpExecutionMode: mode,
         webmcpAutoPromoteSecs: autoPromoteSecs,
         webmcpPollWaitSecs: pollWaitSecs,
         webmcpRpcTimeoutSecs: rpcTimeoutSecs,
@@ -1385,6 +1664,15 @@ export function initBridgeView(
 
   simSelect.addEventListener("change", () => {
     simArgs.value = SIM_DEFAULTS[simSelect.value] ?? "{}";
+  });
+
+  document.querySelectorAll<HTMLButtonElement>(".sim-preset-pill[data-sim-tool]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const toolName = btn.dataset.simTool;
+      if (!toolName) return;
+      simSelect.value = toolName;
+      simSelect.dispatchEvent(new Event("change"));
+    });
   });
 
   $("btn-run-sim").addEventListener("click", async () => {

@@ -20,7 +20,7 @@ function renderWorkspaceDropdown(
   snap: DashboardSnapshot,
   onSnapshot: (snap: DashboardSnapshot) => void
 ): void {
-  const dropdown = $("workspace-dropdown");
+  const dropdown = $("workspace-dropdown-list");
   dropdown.replaceChildren();
 
   const mounted = snap.workspaces ?? [];
@@ -439,6 +439,10 @@ export function initWorkspaceView(
     if (snap) renderWorkspaceDropdown(snap, onSnapshot);
     dropdown.hidden = !dropdown.hidden;
     toggleBtn.setAttribute("aria-expanded", dropdown.hidden ? "false" : "true");
+    if (!dropdown.hidden) {
+      const wsInput = document.getElementById("workspace-input") as HTMLInputElement | null;
+      wsInput?.focus();
+    }
   });
 
   document.addEventListener("click", (e) => {

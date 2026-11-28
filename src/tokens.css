@@ -1,46 +1,55 @@
 /* ==========================================================================
-   Airlock — Obsidian Studio Design Tokens
-   Dark-first neutral graphite surfaces, dual accent variants (Electric Mint
-   default + Ice Cyan via [data-accent="cyan"]), concentric radii, and
-   compositor-friendly motion timings.
+   Airlock — Precision Studio v3 Design Tokens (Linear Split + Zed Inspector)
+   Quiet dark charcoal/graphite surfaces, Precision Blue (#3B82F6) primary
+   accent, strictly separated semantic statuses, concentric ROUND_EIGHT radii,
+   Space Grotesk + Geist + JetBrains Mono typography, and OKLAB color-mix().
    ========================================================================== */
 
 :root {
   color-scheme: dark;
 
-  /* --- Surfaces (Obsidian Graphite Hierarchy) --- */
-  --bg-canvas: #09090B;
-  --bg-rail: #0D0E12;
-  --bg-surface: #121318;
-  --bg-elevated: #191B22;
-  --bg-code: #0B0C10;
+  /* --- Surfaces (Canvas Charcoal -> Workspace -> Elevated Control) --- */
+  --bg-canvas: #0C0D10;
+  --bg-rail: #0C0D10;
+  --bg-surface: #13151A;
+  --bg-elevated: #1A1D24;
+  --bg-code: #0A0B0E;
 
-  /* --- Hairline & Interactive Borders --- */
-  --border-subtle: #20232D;
-  --border-default: #2D3140;
-  --border-strong: #3E4458;
+  /* --- Overlays (Solid-first tonal surfaces with subtle translucency) --- */
+  --bg-glass: rgba(19, 21, 26, 0.94);
+  --bg-glass-elevated: rgba(26, 29, 36, 0.97);
 
-  /* --- Text Hierarchy (WCAG AA+ on #09090B, #121318, and #191B22) --- */
-  --text-primary: #F4F5F7;
-  --text-secondary: #A1A6B4;
-  --text-muted: #858B9E;
+  /* --- Hairline Structural Borders --- */
+  --border-subtle: #1E212B;
+  --border-default: #242833;
+  --border-strong: #323846;
 
-  /* --- Primary Accent: Electric Mint (Default) --- */
-  --accent: #10B981;
-  --accent-hover: #059669;
-  --accent-fg: #34D399;
-  --on-accent: #031A12;
+  /* --- Text Hierarchy (WCAG AA+ on #0C0D10 and #13151A) --- */
+  --text-primary: #F3F4F6;
+  --text-secondary: #9CA3AF;
+  --text-muted: #8A93A2;
+
+  /* --- Primary Accent: Precision Blue (Default) --- */
+  --accent: #3B82F6;
+  --accent-hover: #2563EB;
+  --accent-fg: #60A5FA;
+  --on-accent: #F8FAFC;
   --accent-tint: color-mix(in oklab, var(--accent) 14%, transparent);
-  --accent-border: color-mix(in oklab, var(--accent) 34%, transparent);
-  --accent-spotlight: color-mix(in oklab, var(--accent) 10%, transparent);
+  --accent-border: color-mix(in oklab, var(--accent) 36%, transparent);
+  --accent-spotlight: color-mix(in oklab, var(--accent) 9%, transparent);
 
-  /* --- Semantic Status Tokens --- */
+  /* --- Guardrail Dynamic Seal Tokens --- */
+  --seal-color: var(--status-ok);
+  --seal-bg: var(--status-ok-bg);
+  --seal-border: var(--status-ok-border);
+
+  /* --- Semantic Status Tokens (Strictly Separated from Primary Accent) --- */
   --status-ok: #34D399;
-  --status-ok-bg: color-mix(in oklab, #10B981 14%, transparent);
-  --status-ok-border: color-mix(in oklab, #10B981 34%, transparent);
+  --status-ok-bg: color-mix(in oklab, #34D399 13%, transparent);
+  --status-ok-border: color-mix(in oklab, #34D399 32%, transparent);
 
-  --status-warn: #FBBF24;
-  --status-warn-bg: color-mix(in oklab, #F59E0B 14%, transparent);
+  --status-warn: #F59E0B;
+  --status-warn-bg: color-mix(in oklab, #F59E0B 13%, transparent);
   --status-warn-border: color-mix(in oklab, #F59E0B 34%, transparent);
 
   --status-info: #60A5FA;
@@ -48,18 +57,19 @@
   --status-info-border: color-mix(in oklab, #3B82F6 34%, transparent);
 
   --status-danger: #F87171;
-  --status-danger-bg: color-mix(in oklab, #EF4444 15%, transparent);
-  --status-danger-border: color-mix(in oklab, #EF4444 38%, transparent);
+  --status-danger-bg: color-mix(in oklab, #F87171 14%, transparent);
+  --status-danger-border: color-mix(in oklab, #F87171 36%, transparent);
 
   /* --- Diff Viewer Tokens --- */
-  --diff-add-bg: color-mix(in oklab, #10B981 14%, transparent);
+  --diff-add-bg: color-mix(in oklab, #34D399 12%, transparent);
   --diff-add-fg: #6EE7B7;
-  --diff-del-bg: color-mix(in oklab, #EF4444 14%, transparent);
+  --diff-del-bg: color-mix(in oklab, #F87171 12%, transparent);
   --diff-del-fg: #FCA5A5;
-  --diff-hunk-fg: #FBBF24;
+  --diff-hunk-fg: #60A5FA;
 
   /* --- Typography --- */
-  --font-ui: "Plus Jakarta Sans Variable", "Plus Jakarta Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-display: "Space Grotesk Variable", "Space Grotesk", "Segoe UI", system-ui, sans-serif;
+  --font-ui: "Geist Variable", "Geist", "Segoe UI", system-ui, -apple-system, sans-serif;
   --font-mono: "JetBrains Mono Variable", "JetBrains Mono", "Cascadia Code", Consolas, monospace;
 
   /* --- Spacing Scale (4px / 8px Rhythm) --- */
@@ -72,39 +82,69 @@
   --space-7: 28px;
   --space-8: 32px;
 
-  /* --- Concentric Border Radii (Outer = Inner + Padding) --- */
-  --radius-xl: 14px;
-  --radius-lg: 12px;
-  --radius-md: 8px;
-  --radius-sm: 6px;
+  /* --- Concentric Border Radii (ROUND_EIGHT System) --- */
+  --radius-xl: 10px;
+  --radius-lg: 8px;
+  --radius-md: 6px;
+  --radius-sm: 4px;
   --radius-pill: 999px;
 
-  /* --- Layered Dark Elevation & Specular Rim --- */
+  /* --- Layered Dark Elevation & Subtle Specular Rim --- */
   --shadow-card:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.055),
-    0 1px 2px rgba(0, 0, 0, 0.45),
-    0 4px 12px rgba(0, 0, 0, 0.25);
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.04),
+    0 1px 2px rgba(0, 0, 0, 0.35);
   --shadow-elevated:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.08),
-    0 4px 12px rgba(0, 0, 0, 0.5),
-    0 16px 36px rgba(0, 0, 0, 0.55);
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.06),
+    0 4px 12px rgba(0, 0, 0, 0.45),
+    0 16px 36px rgba(0, 0, 0, 0.5);
 
   /* --- Motion Curves & Durations --- */
   --ease-out-expo: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-spring: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-snappy: cubic-bezier(0.2, 0, 0, 1);
   --dur-fast: 120ms;
-  --dur-med: 220ms;
-  --dur-slow: 280ms;
+  --dur-med: 200ms;
+  --dur-slow: 260ms;
 
   /* --- Focus Ring --- */
   --focus-ring: 2px solid var(--accent-fg);
 }
 
-/* --- Accent Variant: Ice Cyan --- */
-:root[data-accent="cyan"] {
-  --accent: #0EA5E9;
-  --accent-hover: #0284C7;
-  --accent-fg: #38BDF8;
-  --on-accent: #041521;
+/* --- Accent Variant: Electric Mint --- */
+:root[data-accent="mint"] {
+  --accent: #10B981;
+  --accent-hover: #059669;
+  --accent-fg: #34D399;
+  --on-accent: #031A12;
+}
+
+/* --- Accent Variant: Solar Amber --- */
+:root[data-accent="amber"] {
+  --accent: #F59E0B;
+  --accent-hover: #D97706;
+  --accent-fg: #FBBF24;
+  --on-accent: #1C1002;
+}
+
+/* --- Accent Variant: Carbon Monochrome --- */
+:root[data-accent="mono"] {
+  --accent: #E4E4E7;
+  --accent-hover: #D4D4D8;
+  --accent-fg: #FAFAFA;
+  --on-accent: #0C0D10;
+}
+
+/* --- Guardrail Dynamic Seal Tokens --- */
+:root[data-guardrail="safe_edit"] {
+  --seal-color: var(--status-warn);
+  --seal-bg: var(--status-warn-bg);
+  --seal-border: var(--status-warn-border);
+}
+
+:root[data-guardrail="read_only"] {
+  --seal-color: var(--status-info);
+  --seal-bg: var(--status-info-bg);
+  --seal-border: var(--status-info-border);
 }
 
 /* --- Forced Colors / Windows High Contrast Fallbacks --- */

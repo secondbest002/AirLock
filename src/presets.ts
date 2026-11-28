@@ -71,23 +71,31 @@ export function generateClientPreset(
 
   if (presetId === "gemini-web") {
     const remoteBase = tunnelBase ?? "https://<TUNNEL-BELUM-AKTIF>";
-    const oauthCompactUrl = `${remoteBase}/mcp?profile=compact`;
+    const singleCompactUrl = `${remoteBase}/mcp?profile=compact`;
+    const taskCompactUrl = `${remoteBase}/mcp?profile=compact&mode=task`;
+    const chatCompactUrl = `${remoteBase}/mcp?profile=compact&mode=chat`;
     const oauthFullUrl = `${remoteBase}/mcp?profile=full`;
     const pathTokenCompactUrl = `${remoteBase}/mcp/${snap.auth_token}?profile=compact`;
     return {
-      title: "Gemini Web — Custom MCP Connector",
-      filename: "Gemini Web Connected Apps",
+      title: "Gemini Web — Custom MCP Connector (Dual-Mode)",
+      filename: "Gemini Web Connected Apps (Tailscale Funnel)",
       instructions: tunnelBase
-        ? "Tempelkan Endpoint OAuth Compact Profile (direkomendasikan: <=10 Super-Tools hemat konteks & anti-timeout) di Gemini Web -> Apps -> Add Custom MCP, lalu setujui popup OAuth di Airlock. Gunakan ?profile=full hanya jika membutuhkan seluruh tool granular."
-        : "Aktifkan Remote Tunnel (Tailscale Funnel atau Cloudflare) terlebih dahulu untuk mendapatkan URL HTTPS publik.",
+        ? "Rekomendasi Tailscale Funnel: pasang 1 URL permanen (?profile=compact) dan atur App actions -> Always allow di gemini.google.com/customize/connectors, lalu ubah Chat/Task langsung dari dropdown Airlock UI — ATAU daftarkan URL khusus &mode=task / &mode=chat secara terpisah. Untuk Task Mode unattended, aktifkan Expose Skills, Guardrail Autonomous, dan Command Policy Strict Allowlist."
+        : "Aktifkan Remote Tunnel (Tailscale Funnel atau Cloudflare) terlebih dahulu untuk mendapatkan URL HTTPS permanen.",
       content: [
-        `# Endpoint OAuth 2.1 — Compact Profile (Direkomendasikan, <=10 Super-Tools):`,
-        oauthCompactUrl,
+        `# 1. Single Permanent Connector (Mengikuti switch UI Chat/Task Airlock — Direkomendasikan untuk Tailscale Funnel):`,
+        singleCompactUrl,
         ``,
-        `# Alternatif OAuth 2.1 — Full Profile (Semua Tool Granular):`,
+        `# 2. Dedicated Gemini Task Mode Connector (Autonomous Milestone, 30 calls / 10k floor, Auto-SSE):`,
+        taskCompactUrl,
+        ``,
+        `# 3. Dedicated Gemini Chat Mode Connector (Multi-Turn Self-Pacing):`,
+        chatCompactUrl,
+        ``,
+        `# 4. Alternatif OAuth 2.1 — Full Profile (Semua Tool Granular):`,
         oauthFullUrl,
         ``,
-        `# Alternatif Bearer Token di Path URL (Non-OAuth, Compact):`,
+        `# 5. Alternatif Bearer Token di Path URL (Non-OAuth, Compact):`,
         pathTokenCompactUrl,
         ``,
         `# Bearer Header (opsional):`,

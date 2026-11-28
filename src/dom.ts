@@ -1,7 +1,21 @@
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 
 export type ToastKind = "info" | "warn" | "offline";
-export type AccentTheme = "mint" | "cyan";
+export type AccentTheme = "blue" | "mint" | "amber" | "mono";
+
+export const ACCENT_ORDER: readonly AccentTheme[] = ["blue", "mint", "amber", "mono"];
+
+export const ACCENT_LABELS: Record<AccentTheme, string> = {
+  blue: "Precision Blue",
+  mint: "Electric Mint",
+  amber: "Solar Amber",
+  mono: "Carbon Mono",
+};
+
+export function nextAccentTheme(current?: string): AccentTheme {
+  const idx = ACCENT_ORDER.indexOf((current ?? "blue") as AccentTheme);
+  return ACCENT_ORDER[(idx + 1) % ACCENT_ORDER.length];
+}
 
 const ACCENT_STORAGE_KEY = "airlock_accent";
 
@@ -114,19 +128,28 @@ export function switchTab(tabName: string): void {
 
   const targetHeading = document.getElementById(`heading-${tabName}`);
   const doc = document as Document & {
-    startViewTransition?: (cb: () => void) => { finished: Promise<void> };
+    startViewTransition?: (cb: () => void) => {
+      ready?: Promise<void>;
+      finished: Promise<void>;
+    };
   };
+  const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
 
-  if (!doc.startViewTransition) {
+  if (!doc.startViewTransition || reducedMotion) {
     applySwitch();
     targetHeading?.focus({ preventScroll: true });
     return;
   }
 
   const transition = doc.startViewTransition(applySwitch);
-  void transition.finished.finally(() => {
-    targetHeading?.focus({ preventScroll: true });
-  });
+  void transition.ready?.catch(() => {});
+  void transition.finished
+    .catch(() => {
+      // Ignore skipped/aborted view transitions on rapid tab switches or viewport resizes
+    })
+    .finally(() => {
+      targetHeading?.focus({ preventScroll: true });
+    });
 }
 
 let supportsDisplayTransition: boolean | undefined;
@@ -202,12 +225,17 @@ export function setAccentTheme(accent: AccentTheme, announce = true): void {
   } catch {
     // ignore storage errors
   }
+  const display = ACCENT_LABELS[accent];
   const label = document.getElementById("accent-name-label");
   if (label) {
-    label.textContent = accent === "cyan" ? "Ice Cyan" : "Electric Mint";
+    label.textContent = display;
+  }
+  const btn = document.getElementById("btn-toggle-accent");
+  if (btn) {
+    btn.title = `Accent: ${display} — klik untuk ganti`;
   }
   if (announce) {
-    setToast(`Accent Obsidian Studio: ${accent === "cyan" ? "Ice Cyan" : "Electric Mint"}`);
+    setToast(`Accent Obsidian Studio: ${display}`);
   }
 }
 
@@ -218,7 +246,64 @@ export function initAccentTheme(): AccentTheme {
   } catch {
     stored = null;
   }
-  const accent: AccentTheme = stored === "cyan" ? "cyan" : "mint";
+  const normalized = stored === "cyan" ? "blue" : stored;
+  const accent: AccentTheme = ACCENT_ORDER.includes(normalized as AccentTheme)
+    ? (normalized as AccentTheme)
+    : "blue";
   setAccentTheme(accent, false);
   return accent;
+}
+
+export function activateSubTab(groupName: string, key: string): void {
+  const tabs = Array.from(
+    document.querySelectorAll<HTMLButtonElement>(`[data-subtab-group="${groupName}"]`)
+  );
+  const panels = Array.from(
+    document.querySelectorAll<HTMLElement>(`[data-subpanel-group="${groupName}"]`)
+  );
+  if (tabs.length === 0) return;
+
+  for (const tab of tabs) {
+    const active = tab.dataset.subtabKey === key;
+    tab.classList.toggle("active", active);
+    tab.setAttribute("aria-selected", active ? "true" : "false");
+    tab.setAttribute("tabindex", active ? "0" : "-1");
+  }
+  for (const panel of panels) {
+    panel.hidden = panel.dataset.subpanelKey !== key;
+  }
+}
+
+export function initSubTabs(groupName: string): void {
+  const tabs = Array.from(
+    document.querySelectorAll<HTMLButtonElement>(`[data-subtab-group="${groupName}"]`)
+  );
+  if (tabs.length === 0) return;
+
+  tabs.forEach((tab, idx) => {
+    tab.addEventListener("click", () => {
+      const key = tab.dataset.subtabKey;
+      if (key) activateSubTab(groupName, key);
+    });
+    tab.addEventListener("keydown", (e) => {
+      let nextIdx: number | null = null;
+      if (e.key === "ArrowRight") nextIdx = (idx + 1) % tabs.length;
+      else if (e.key === "ArrowLeft") nextIdx = (idx - 1 + tabs.length) % tabs.length;
+      else if (e.key === "Home") nextIdx = 0;
+      else if (e.key === "End") nextIdx = tabs.length - 1;
+      if (nextIdx === null) return;
+      e.preventDefault();
+      const target = tabs[nextIdx];
+      const key = target?.dataset.subtabKey;
+      if (target && key) {
+        activateSubTab(groupName, key);
+        target.focus();
+      }
+    });
+  });
+
+  const initial = tabs.find((t) => t.getAttribute("aria-selected") === "true") ?? tabs[0];
+  if (initial?.dataset.subtabKey) {
+    activateSubTab(groupName, initial.dataset.subtabKey);
+  }
 }
