@@ -31,3 +31,6 @@ pnpm-debug.log*
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# Design mockups / local assets
+.stitch/
