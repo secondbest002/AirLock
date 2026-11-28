@@ -1,0 +1,53 @@
+name: Release Windows (NSIS)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_draft:
+        description: 'Buat sebagai Draft Release (bisa direview sebelum dipublikasikan)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows NSIS Installer
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build & Upload NSIS Installer to GitHub Release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: 'Airlock v__VERSION__'
+          releaseBody: 'Installer Windows (NSIS) untuk **Airlock v__VERSION__**. Unduh file `*-setup.exe` di bagian Assets di bawah.'
+          releaseDraft: ${{ github.event_name != 'workflow_dispatch' || inputs.release_draft }}
+          prerelease: false
+          args: '--bundles nsis'
